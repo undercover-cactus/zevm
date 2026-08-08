@@ -1,0 +1,9 @@
+# Zig files/folders
+.zig-cache
+zig-out
+
+# Rust ffi demo
+rzevm/target
+
+# Downloaded chain data (see `make download-era1` in the Makefile)
+/data

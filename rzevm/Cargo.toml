@@ -1,0 +1,17 @@
+[package]
+name = "rzevm"
+edition = "2024"
+description = "Rust ffi demo for calling zevm (Zig Ethereum Vitual Machine) and benchmark with Reth's revm."
+
+[[bin]]
+name = "rzevm"
+path = "src/main.rs"
+
+[dependencies]
+hex = "0.4.3"
+revm = { version = "42.0.1", features = ["optional_balance_check"] }
+serde_json = "1.0.151"
+snap = "1.1.1"
+rlp = "0.6.1"
+sha3 = "0.10.8"
+secp256k1 = { version = "0.28.1", features = ["recovery", "global-context", "rand-std", "hashes"] }
