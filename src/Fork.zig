@@ -2,8 +2,9 @@
 //! protocol-defined set, hence a plain enum rather than something
 //! extensible.
 //!
-//! Only `frontier` has any actual behavior modeled (see `Evm.processBlock`'s
-//! guard); the rest exists so the block-to-fork mapping is complete.
+//! Only `frontier` through `byzantium` have any actual behavior modeled
+//! (see `Evm.processBlock`'s guard); the rest exists so the block-to-fork
+//! mapping is complete.
 
 const std = @import("std");
 
@@ -56,6 +57,13 @@ pub const Fork = enum {
         }
         return result;
     }
+
+    /// Whether this fork activated at or before `other` (forks are declared
+    /// in chronological order above, so enum ordinal order matches
+    /// activation order).
+    pub fn atLeast(self: Fork, other: Fork) bool {
+        return @intFromEnum(self) >= @intFromEnum(other);
+    }
 };
 
 test "before Homestead is Frontier" {
@@ -68,4 +76,10 @@ test "Homestead's own activation block is already Homestead" {
 
 test "far in the future resolves to the latest known fork" {
     try std.testing.expectEqual(Fork.cancun, Fork.at(30_000_000));
+}
+
+test "atLeast compares chronological order, inclusive of equal forks" {
+    try std.testing.expect(Fork.tangerine_whistle.atLeast(.homestead));
+    try std.testing.expect(Fork.tangerine_whistle.atLeast(.tangerine_whistle));
+    try std.testing.expect(!Fork.homestead.atLeast(.tangerine_whistle));
 }

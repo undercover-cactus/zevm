@@ -51,7 +51,7 @@ zig build example -- basic
 `sync_era1` and the `rzevm/examples/*_era1.rs` benchmarks below read `.era1` files — [Portal Network](https://github.com/ethereum/portal-network-specs)'s archival format for pre-merge mainnet history (RLP-encoded blocks, Snappy-compressed, in e2store containers, 8,192 blocks per file). Download them with:
 
 ```sh
-make download-era1   # blocks 0..1,000,000
+make download-era1   # blocks 0..7,274,495
 ```
 
 It skips files already present.
@@ -76,6 +76,8 @@ All three print a `decode`/`execute` breakdown, so EVM-execution speed and every
 | **zevm (pure Zig)** | **74.11s** | **58.40s** | **13.92s** |
 
 For a quick sanity check instead of the full 1M-block run, `make bench` runs a smaller (46,300-block, pre-parsed-JSON) version.
+
+Both sides' final state has been checked against real chain data, but their own account-touched counters aren't directly comparable: zevm's counts only accounts that were actually written (balance/nonce/code/storage change), while revm's `cache.accounts.len()` also includes every account merely *read* (e.g. a `BALANCE`/`EXTCODESIZE`/`EXTCODEHASH` check, or a `DELEGATECALL`/`STATICCALL`/`CALLCODE` target resolution) via its read-through `CacheDB`, regardless of whether that read ever gets materialized in the real state trie. zevm's number is the one that matches real consensus-relevant state.
 
 ## Calling zevm from Rust via FFI
 

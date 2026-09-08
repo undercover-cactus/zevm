@@ -10,11 +10,13 @@ test:
 check:
 	zig build check --summary all
 
-# Downloads real pre-merge mainnet history (blocks 0..1,000,000) as .era1
-# files into data/era1/. Safe to re-run: skips files already downloaded.
+# Downloads real pre-merge mainnet history (blocks 0..7,274,495, the last
+# full file before Constantinople at block 7,280,000 — this Evm implements
+# up to Byzantium) as .era1 files into data/era1/. Safe to re-run: skips
+# files already downloaded.
 download-era1:
 	@mkdir -p $(ERA1_DEST)
-	@max_index=$$(( 1000000 / $(BLOCKS_PER_FILE) )); \
+	@max_index=$$(( 7274495 / $(BLOCKS_PER_FILE) )); \
 	echo "Fetching directory listing..."; \
 	listing="$$(curl -sL $(ERA1_HOST)/)"; \
 	for i in $$(seq 0 $$max_index); do \
@@ -43,7 +45,7 @@ bench:
 	@echo "=== revm (release) ==="
 	@cd rzevm && cargo run --release --example sync 2>/dev/null | tail -1
 
-# The real comparison: 1,007,616 real historical mainnet blocks. Run `make download-era1` first.
+# The real comparison: 4,366,336 real historical mainnet blocks. Run `make download-era1` first.
 bench-era1:
 	@echo "=== zevm (ReleaseFast) ==="
 	@zig build -Doptimize=ReleaseFast

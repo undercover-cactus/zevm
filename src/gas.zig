@@ -19,18 +19,22 @@ pub const keccak256_word: u64 = 6;
 pub const exp_base: u64 = 10;
 /// Pre-EIP-160 (Spurious Dragon) value; that fork later raised this to 50.
 pub const exp_byte: u64 = 10;
+pub const exp_byte_160: u64 = 50;
 
 pub const copy_word: u64 = 3;
 
+/// Pre-EIP-150 value; that fork raised this to `sload_150`.
 pub const sload: u64 = 50;
+pub const sload_150: u64 = 200;
 /// Setting a zero slot to a nonzero value.
 pub const sstore_set: u64 = 20000;
 /// Any other SSTORE. Frontier's flat rule, not EIP-2200's net-metered successor.
 pub const sstore_reset: u64 = 5000;
 
-/// Pre-EIP-150 value; Tangerine Whistle raised this to 700 and added the
-/// 63/64ths gas-forwarding cap, not implemented here.
+/// Pre-EIP-150 value; that fork raised this to `call_base_150` and added the
+/// 63/64ths gas-forwarding cap (see `Interpreter.call`).
 pub const call_base: u64 = 40;
+pub const call_base_150: u64 = 700;
 pub const call_value: u64 = 9000;
 pub const call_new_account: u64 = 25000;
 /// Free gas granted to the callee on top of whatever was forwarded, only
@@ -41,23 +45,31 @@ pub const create_base: u64 = 32000;
 /// Per-byte cost of storing the code a CREATE/CREATE2's init code returns.
 pub const code_deposit_byte: u64 = 200;
 
-/// Flat pre-Berlin cost for reading another account's balance/code. Same
-/// caveat as `call_base`: EIP-2929 warm/cold pricing replaces this later.
+/// Pre-EIP-150 value; that fork raised this to `balance_150`. Both are
+/// superseded by EIP-2929 warm/cold pricing later still.
 pub const balance: u64 = 20;
+pub const balance_150: u64 = 400;
+/// Pre-EIP-150 value (`EXTCODESIZE`/`EXTCODECOPY`'s base cost); that fork
+/// raised this to `extcode_150`.
 pub const extcode: u64 = 20;
+pub const extcode_150: u64 = 700;
 pub const blockhash: u64 = 20;
 
 pub const log_base: u64 = 375;
 pub const log_topic: u64 = 375;
 pub const log_data_byte: u64 = 8;
 
-/// Pre-EIP-150 value; Tangerine Whistle raised this to 5000 and added a
-/// 25000 surcharge for destructing to a nonexistent beneficiary.
+/// Pre-EIP-150 value; that fork raised this to `selfdestruct_base_150` and
+/// added `selfdestruct_new_account`, a surcharge for destructing to a
+/// beneficiary that doesn't exist yet (mirrors `call_new_account`).
 pub const selfdestruct_base: u64 = 0;
-/// Refunded once per `SELFDESTRUCT` (removed entirely by EIP-3529/London).
-/// A destroyed account's code is wiped (`State.destroyAccount`), so it
-/// can't be destructed again within the same transaction, no separate
-/// "already destroyed" tracking needed.
+pub const selfdestruct_base_150: u64 = 5000;
+pub const selfdestruct_new_account: u64 = 25000;
+/// Refunded once per address `SELFDESTRUCT`ed per transaction (removed
+/// entirely by EIP-3529/London) — `State.isPendingDestruction` is what
+/// keeps a repeat `SELFDESTRUCT` of the same still-live address (real
+/// Ethereum only deletes an account at the end of its transaction, so this
+/// can legitimately happen) from earning it twice.
 pub const selfdestruct_refund: u64 = 24000;
 
 /// Frontier's flat refund for `SSTORE` clearing a slot from nonzero to
@@ -93,8 +105,9 @@ pub fn byteLength(value: u256) u64 {
 }
 
 /// EIP-160 EXP gas: a base cost plus a per-byte cost for the exponent's significant bytes.
-pub fn expCost(exponent: u256) u64 {
-    return exp_base + exp_byte * byteLength(exponent);
+pub fn expCost(exponent: u256, is_spurious_dragon: bool) u64 {
+    const per_byte = if (is_spurious_dragon) exp_byte_160 else exp_byte;
+    return exp_base + per_byte * byteLength(exponent);
 }
 
 fn memoryWordCost(words: u64) u64 {

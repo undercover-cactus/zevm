@@ -16,6 +16,7 @@ const State = @import("State.zig");
 const Rlp = @import("Rlp.zig");
 const gas = @import("gas.zig");
 const Precompiles = @import("Precompiles.zig");
+const Fork = @import("Fork.zig").Fork;
 
 pub const Status = enum {
     running,
@@ -45,6 +46,10 @@ pub const BlockContext = struct {
     /// looks up into. Real Ethereum only ever makes the last 256 available,
     /// so a shorter (or empty) slice just reads as 0 further back.
     recent_hashes: []const Hash = &.{},
+    /// Which fork's rules apply to this block, for the few opcode/gas
+    /// behaviors that differ across forks (e.g. `DELEGATECALL`'s
+    /// availability, `CREATE`'s code-deposit-OOG behavior).
+    fork: Fork = .frontier,
 };
 
 /// The transaction currently executing, constant across every nested call
@@ -62,8 +67,14 @@ const max_memory_bytes: usize = 1 << 32;
 const max_call_depth: u16 = 1024;
 
 /// EIP-170: a CREATE/CREATE2 whose init code returns more than this many
-/// bytes of runtime code fails.
-const max_code_size: usize = 24576;
+/// bytes of runtime code fails. Also used by `Evm.create` for top-level
+/// contract-creation transactions.
+pub const max_code_size: usize = 24576;
+
+/// The RIPEMD160 precompile. In block 2,675,119, it was touched-and-cleared
+/// (EIP-161) despite the calling frame running out of gas — an obscure,
+/// real client bug preserved in consensus (see `call`'s use of this).
+const ripemd160_address: Address = 0x03;
 
 allocator: std.mem.Allocator,
 code: []const u8,
@@ -121,6 +132,12 @@ pub const CallParams = struct {
     depth: u16 = 0,
     state: ?*State = null,
     block: BlockContext = .{},
+    /// Already-analyzed jumpdests for `code`, when the caller has one on
+    /// hand (`State.getJumpdest`, for an existing on-chain contract) —
+    /// cloned rather than re-scanning `code` from scratch. `null` (the
+    /// default: every test, and `CREATE`'s one-shot init code) falls back
+    /// to analyzing `code` directly, same as always.
+    jumpdest: ?*const std.DynamicBitSetUnmanaged = null,
 };
 
 pub fn initCall(allocator: std.mem.Allocator, code: []const u8, gas_limit: u64, params: CallParams) !Interpreter {
@@ -129,7 +146,10 @@ pub fn initCall(allocator: std.mem.Allocator, code: []const u8, gas_limit: u64, 
         .code = code,
         .memory = Memory.init(allocator),
         .gas_remaining = gas_limit,
-        .jumpdest = try analyzeJumpdests(allocator, code),
+        .jumpdest = if (params.jumpdest) |precomputed|
+            try precomputed.clone(allocator)
+        else
+            try analyzeJumpdests(allocator, code),
         .stack = try Stack.init(allocator),
         .address = params.address,
         .caller = params.caller,
@@ -152,7 +172,13 @@ pub fn deinit(self: *Interpreter) void {
 }
 
 /// A byte is only a valid `JUMPDEST` if it's not inside a `PUSH`'s immediate data.
-fn analyzeJumpdests(allocator: std.mem.Allocator, code: []const u8) !std.DynamicBitSetUnmanaged {
+/// Scans `code` once for valid `JUMPDEST` positions. Pure function of the
+/// bytecode alone, so `State` caches the result per account (see
+/// `State.getJumpdest`) rather than this running again on every single
+/// `CALL` to the same already-deployed contract — a real, measured hot
+/// path (~60% of total CPU time replaying real mainnet history, since
+/// popular contracts get called over and over).
+pub fn analyzeJumpdests(allocator: std.mem.Allocator, code: []const u8) !std.DynamicBitSetUnmanaged {
     var set = try std.DynamicBitSetUnmanaged.initEmpty(allocator, code.len);
     var i: usize = 0;
     while (i < code.len) {
@@ -176,9 +202,82 @@ fn analyzeJumpdests(allocator: std.mem.Allocator, code: []const u8) !std.Dynamic
 // this way; everything EVM-level halts via `Status` instead.
 pub fn run(self: *Interpreter) std.mem.Allocator.Error!void {
     while (self.status == .running) {
-        try self.step();
+        if (step_trace_enabled) try self.stepTraced() else try self.step();
     }
 }
+
+// DEBUG: one-off single-transaction opcode tracer, for diffing zevm's
+// execution against revm's EIP-3155 trace of the same real historical
+// transaction (see `examples/rpc_compare.zig`) — built during the
+// investigation of a genuine balance divergence found deep into Byzantium
+// era1 validation (a real historical transaction under-crediting an
+// account relative to its real receipt). Deliberately a separate flag from
+// `debug_trace_enabled` above: that one is throttled (every 1000 steps) to
+// stay safe across a multi-million-block replay, whereas this prints every
+// single step unthrottled — fine for one transaction, not for a replay.
+pub var step_trace_enabled: bool = false;
+
+fn stepTraced(self: *Interpreter) !void {
+    const pc_before = self.pc;
+    const gas_before = self.gas_remaining;
+    const op_byte: u8 = if (pc_before < self.code.len) self.code[pc_before] else 0;
+    const op_name: []const u8 = if (pc_before >= self.code.len)
+        "STOP"
+    else if (op_byte >= @intFromEnum(OpCode.PUSH1) and op_byte <= @intFromEnum(OpCode.PUSH32))
+        "PUSH"
+    else if (op_byte >= @intFromEnum(OpCode.DUP1) and op_byte <= @intFromEnum(OpCode.DUP16))
+        "DUP"
+    else if (op_byte >= @intFromEnum(OpCode.SWAP1) and op_byte <= @intFromEnum(OpCode.SWAP16))
+        "SWAP"
+    else
+        @tagName(@as(OpCode, @enumFromInt(op_byte)));
+
+    std.debug.print("{{\"pc\":{d},\"depth\":{d},\"opName\":\"{s}\",\"op\":{d},\"gas\":\"0x{x}\",\"stack\":[", .{ pc_before, self.depth, op_name, op_byte, gas_before });
+    for (self.stack.items[0..self.stack.len], 0..) |v, i| {
+        if (i != 0) std.debug.print(",", .{});
+        std.debug.print("\"0x{x}\"", .{v});
+    }
+    std.debug.print("]}}\n", .{});
+
+    try self.step();
+}
+
+// DEBUG: era1-replay divergence hunt scaffolding, left in place per user
+// request. Set `debug_trace_address` and flip `debug_trace_enabled` to
+// `true`, then rebuild, to trace a specific frame's own opcode-by-opcode
+// execution (pc, opcode byte, gas_remaining) against a real/revm trace.
+// `debug_trace_enabled` gates every check below, so it's always a hard
+// no-op when off — no address value is a safe "definitely inactive"
+// sentinel to rely on instead (`0x0` looked inert but isn't, see
+// `State.zig`'s `debug_enabled`); leaving this pointed at a stale address
+// from an earlier hunt (enabled or not) silently reintroduces a per-opcode
+// `std.debug.print` that dominates wall time over a multi-million-block
+// replay (confirmed: ~13x slower, 23M+ lines for one prior run) without
+// anyone noticing until the run looks "stuck."
+const debug_trace_enabled = false;
+const debug_trace_address: Address = 0x0;
+// DEBUG: gates the `is_new_account` trace in `call()` — see its own
+// comment there.
+const debug_is_new_account_enabled = false;
+// Retargeted at the "fromshanghaiwithlove" DoS contract's 256-call loop in
+// block 2,327,528, where zevm charges two fewer 25,000 new-account fees
+// than real chain.
+const debug_is_new_account_block: u64 = 2_327_528;
+const debug_is_new_account_caller: Address = 0xe53c52acf5f396d978e84ab48f16c13fb03eeffe;
+// DEBUG: temporary safety valve for a genuine multi-hour stall found around
+// block 2,707,868 during Spurious Dragon validation. Unlike
+// `debug_trace_address` (which only fires for one specific address, and
+// turned out to be the wrong culprit to chase — a prior guess based on it
+// panicked at block 1,976,111, in already-validated pre-Spurious-Dragon
+// territory, just from legitimate cumulative activity across many
+// unrelated transactions), this counts *every* opcode step across *every*
+// address, reset at the start of each transaction by
+// `Evm.executeTransaction`. No real transaction can legitimately execute
+// anywhere near this many steps (even an all-zero-cost-opcode adversarial
+// sequence would need a code buffer this codebase can't hold), so tripping
+// it means a genuine unbounded loop within a single transaction.
+pub var debug_total_step_count: u64 = 0;
+const debug_total_step_limit: u64 = 20_000_000;
 
 fn step(self: *Interpreter) !void {
     if (self.pc >= self.code.len) {
@@ -187,6 +286,18 @@ fn step(self: *Interpreter) !void {
     }
 
     const byte = self.code[self.pc];
+    debug_total_step_count += 1;
+    if (debug_total_step_count > debug_total_step_limit) {
+        std.debug.panic(
+            "a single transaction exceeded {d} total opcode steps: block={d} address={x} pc={d} op={x} gas_remaining={d} depth={d}",
+            .{ debug_total_step_limit, self.block.number, self.address, self.pc, byte, self.gas_remaining, self.depth },
+        );
+    }
+    if (debug_trace_enabled and self.address == debug_trace_address) {
+        if (debug_total_step_count % 1000 == 0) {
+            std.debug.print("DEBUG step: block={d} pc={d} op={x} gas={d} step_count={d}\n", .{ self.block.number, self.pc, byte, self.gas_remaining, debug_total_step_count });
+        }
+    }
 
     if (byte >= @intFromEnum(OpCode.PUSH1) and byte <= @intFromEnum(OpCode.PUSH32)) {
         self.pushN(byte - @intFromEnum(OpCode.PUSH1) + 1);
@@ -231,9 +342,28 @@ fn step(self: *Interpreter) !void {
         .XOR => self.binaryOp(gas.verylow, bitXor),
         .NOT => self.unaryOp(gas.verylow, bitNot),
         .BYTE => self.binaryOp(gas.verylow, byteOp),
-        .SHL => self.binaryOp(gas.verylow, shl),
-        .SHR => self.binaryOp(gas.verylow, shr),
-        .SAR => self.binaryOp(gas.verylow, sar),
+        .SHL => {
+            // EIP-145: not available before Constantinople.
+            if (!self.block.fork.atLeast(.constantinople)) {
+                self.status = .invalid_opcode;
+            } else {
+                self.binaryOp(gas.verylow, shl);
+            }
+        },
+        .SHR => {
+            if (!self.block.fork.atLeast(.constantinople)) {
+                self.status = .invalid_opcode;
+            } else {
+                self.binaryOp(gas.verylow, shr);
+            }
+        },
+        .SAR => {
+            if (!self.block.fork.atLeast(.constantinople)) {
+                self.status = .invalid_opcode;
+            } else {
+                self.binaryOp(gas.verylow, sar);
+            }
+        },
 
         .KECCAK256 => try self.keccak256Opcode(),
 
@@ -253,6 +383,11 @@ fn step(self: *Interpreter) !void {
         },
 
         .PUSH0 => {
+            // EIP-3855: not available before Shanghai.
+            if (!self.block.fork.atLeast(.shanghai)) {
+                self.status = .invalid_opcode;
+                return;
+            }
             if (!self.chargeGas(gas.verylow)) return;
             self.pushStack(0);
             self.pc += 1;
@@ -294,7 +429,7 @@ fn step(self: *Interpreter) !void {
             self.pc += 1;
         },
         .BALANCE => {
-            if (!self.chargeGas(gas.balance)) return;
+            if (!self.chargeGas(if (self.block.fork.atLeast(.tangerine_whistle)) gas.balance_150 else gas.balance)) return;
             const address256 = self.popStack() orelse return;
             const state = self.state orelse {
                 self.status = .invalid_opcode;
@@ -337,7 +472,7 @@ fn step(self: *Interpreter) !void {
             self.pc += 1;
         },
         .EXTCODESIZE => {
-            if (!self.chargeGas(gas.extcode)) return;
+            if (!self.chargeGas(if (self.block.fork.atLeast(.tangerine_whistle)) gas.extcode_150 else gas.extcode)) return;
             const address256 = self.popStack() orelse return;
             const state = self.state orelse {
                 self.status = .invalid_opcode;
@@ -348,12 +483,29 @@ fn step(self: *Interpreter) !void {
         },
         .EXTCODECOPY => try self.extcodecopy(),
         .RETURNDATASIZE => {
+            // EIP-211: not available before Byzantium.
+            if (!self.block.fork.atLeast(.byzantium)) {
+                self.status = .invalid_opcode;
+                return;
+            }
             if (!self.chargeGas(gas.base)) return;
             self.pushStack(@as(u256, self.last_return_data.len));
             self.pc += 1;
         },
-        .RETURNDATACOPY => try self.returndatacopy(),
+        .RETURNDATACOPY => {
+            // EIP-211: not available before Byzantium.
+            if (!self.block.fork.atLeast(.byzantium)) {
+                self.status = .invalid_opcode;
+                return;
+            }
+            try self.returndatacopy();
+        },
         .EXTCODEHASH => {
+            // EIP-1052: not available before Constantinople.
+            if (!self.block.fork.atLeast(.constantinople)) {
+                self.status = .invalid_opcode;
+                return;
+            }
             if (!self.chargeGas(gas.extcode)) return;
             const address256 = self.popStack() orelse return;
             const state = self.state orelse {
@@ -397,16 +549,31 @@ fn step(self: *Interpreter) !void {
             self.pc += 1;
         },
         .BASEFEE => {
+            // EIP-3198: not available before London.
+            if (!self.block.fork.atLeast(.london)) {
+                self.status = .invalid_opcode;
+                return;
+            }
             if (!self.chargeGas(gas.base)) return;
             self.pushStack(self.block.base_fee);
             self.pc += 1;
         },
         .CHAINID => {
+            // EIP-1344: not available before Istanbul.
+            if (!self.block.fork.atLeast(.istanbul)) {
+                self.status = .invalid_opcode;
+                return;
+            }
             if (!self.chargeGas(gas.base)) return;
             self.pushStack(self.block.chain_id);
             self.pc += 1;
         },
         .SELFBALANCE => {
+            // EIP-1884: not available before Istanbul.
+            if (!self.block.fork.atLeast(.istanbul)) {
+                self.status = .invalid_opcode;
+                return;
+            }
             if (!self.chargeGas(gas.low)) return;
             const state = self.state orelse {
                 self.status = .invalid_opcode;
@@ -420,15 +587,51 @@ fn step(self: *Interpreter) !void {
         .SSTORE => try self.sstore(),
 
         .RETURN => try self.haltWithOutput(.stopped),
-        .REVERT => try self.haltWithOutput(.reverted),
+        .REVERT => {
+            // EIP-140: not available before Byzantium. Real pre-Byzantium
+            // mainnet treats this byte as any other undefined opcode — an
+            // immediate exceptional halt forfeiting all remaining gas —
+            // not a graceful revert-with-output. A real contract can
+            // still contain this byte pre-Byzantium (e.g. a Solidity
+            // compiler already emitting REVERT for require()/assert()
+            // ahead of the fork that gives it meaning), so this isn't
+            // just a defensive check; real mainnet has already been
+            // observed hitting it.
+            if (self.block.fork.atLeast(.byzantium)) {
+                try self.haltWithOutput(.reverted);
+            } else {
+                self.status = .invalid_opcode;
+            }
+        },
 
         .CALL => try self.call(.call),
         .CALLCODE => try self.call(.callcode),
-        .STATICCALL => try self.call(.staticcall),
-        .DELEGATECALL => try self.call(.delegatecall),
+        .STATICCALL => {
+            // EIP-214: not available before Byzantium.
+            if (!self.block.fork.atLeast(.byzantium)) {
+                self.status = .invalid_opcode;
+            } else {
+                try self.call(.staticcall);
+            }
+        },
+        .DELEGATECALL => {
+            // EIP-7: not available before Homestead.
+            if (self.block.fork == .frontier) {
+                self.status = .invalid_opcode;
+            } else {
+                try self.call(.delegatecall);
+            }
+        },
 
         .CREATE => try self.createOp(.create),
-        .CREATE2 => try self.createOp(.create2),
+        .CREATE2 => {
+            // EIP-1014: not available before Constantinople.
+            if (!self.block.fork.atLeast(.constantinople)) {
+                self.status = .invalid_opcode;
+            } else {
+                try self.createOp(.create2);
+            }
+        },
 
         .LOG0 => try self.log(0),
         .LOG1 => try self.log(1),
@@ -537,7 +740,7 @@ fn jumpTo(self: *Interpreter, dest: u256) bool {
 fn expOpcode(self: *Interpreter) void {
     const base_val = self.popStack() orelse return;
     const exponent = self.popStack() orelse return;
-    if (!self.chargeGas(gas.expCost(exponent))) return;
+    if (!self.chargeGas(gas.expCost(exponent, self.block.fork.atLeast(.spurious_dragon)))) return;
     self.pushStack(expOp(base_val, exponent));
     self.pc += 1;
 }
@@ -554,6 +757,26 @@ fn toMemIndex(self: *Interpreter, value: u256) ?usize {
         return null;
     }
     return v;
+}
+
+/// Converts an `(offset, size)` memory-region pair, mirroring real
+/// Ethereum's rule that a zero-size region never touches memory at all —
+/// so `offset` isn't validated in that case either. Real bytecode routinely
+/// leaves a stale, arbitrarily large leftover value in the offset slot
+/// when size is 0 and expects it to be ignored: the standard Solidity
+/// `.transfer()`/`.send()` compiles to exactly this (`CALL` with
+/// `argsSize`/`retSize` both 0 and whatever the free-memory pointer
+/// happened to be sitting in the offset slots), so validating offset
+/// unconditionally makes an ordinary, successful real-mainnet call fail
+/// with a bogus out-of-gas — confirmed via a real historical transaction
+/// during Byzantium era1 validation (block 4,890,213, a CryptoKitties
+/// auction payout) that zevm rejected this way despite it succeeding on
+/// real mainnet with gas to spare.
+fn toMemRegion(self: *Interpreter, offset256: u256, size256: u256) ?struct { offset: usize, size: usize } {
+    const size = self.toMemIndex(size256) orelse return null;
+    if (size == 0) return .{ .offset = 0, .size = 0 };
+    const offset = self.toMemIndex(offset256) orelse return null;
+    return .{ .offset = offset, .size = size };
 }
 
 fn chargeMemoryExpansion(self: *Interpreter, offset: usize, size: usize) bool {
@@ -598,11 +821,10 @@ fn keccak256Opcode(self: *Interpreter) !void {
     if (!self.chargeGas(gas.keccak256_base)) return;
     const offset256 = self.popStack() orelse return;
     const size256 = self.popStack() orelse return;
-    const offset = self.toMemIndex(offset256) orelse return;
-    const size = self.toMemIndex(size256) orelse return;
-    if (!self.chargeMemoryExpansion(offset, size)) return;
-    if (!self.chargeGas(gas.keccak256_word * ((size + 31) / 32))) return;
-    const data = try self.memory.read(offset, size);
+    const region = self.toMemRegion(offset256, size256) orelse return;
+    if (!self.chargeMemoryExpansion(region.offset, region.size)) return;
+    if (!self.chargeGas(gas.keccak256_word * ((region.size + 31) / 32))) return;
+    const data = try self.memory.read(region.offset, region.size);
     self.pushStack(keccak256(data));
     self.pc += 1;
 }
@@ -645,23 +867,22 @@ fn calldataload(self: *Interpreter) void {
 /// some byte slice into memory with the same zero-padded semantics (see
 /// `readPadded`); only the source slice and the caller's own base gas differ.
 fn copyToMemory(self: *Interpreter, src: []const u8, dest256: u256, offset256: u256, size256: u256) !void {
-    const dest = self.toMemIndex(dest256) orelse return;
-    const size = self.toMemIndex(size256) orelse return;
-    if (!self.chargeMemoryExpansion(dest, size)) return;
-    if (!self.chargeGas(gas.copy_word * ((size + 31) / 32))) return;
-    if (size == 0) {
+    const region = self.toMemRegion(dest256, size256) orelse return;
+    if (!self.chargeMemoryExpansion(region.offset, region.size)) return;
+    if (!self.chargeGas(gas.copy_word * ((region.size + 31) / 32))) return;
+    if (region.size == 0) {
         self.pc += 1;
         return;
     }
 
     const src_offset = std.math.cast(usize, offset256) orelse std.math.maxInt(usize);
-    const buf = try self.allocator.alloc(u8, size);
+    const buf = try self.allocator.alloc(u8, region.size);
     defer self.allocator.free(buf);
     var i: usize = 0;
-    while (i < size) : (i += 1) {
+    while (i < region.size) : (i += 1) {
         buf[i] = readPadded(src, src_offset +| i);
     }
-    try self.memory.write(dest, buf);
+    try self.memory.write(region.offset, buf);
     self.pc += 1;
 }
 
@@ -682,7 +903,7 @@ fn codecopy(self: *Interpreter) !void {
 }
 
 fn extcodecopy(self: *Interpreter) !void {
-    if (!self.chargeGas(gas.extcode)) return;
+    if (!self.chargeGas(if (self.block.fork.atLeast(.tangerine_whistle)) gas.extcode_150 else gas.extcode)) return;
     const address256 = self.popStack() orelse return;
     const dest256 = self.popStack() orelse return;
     const offset256 = self.popStack() orelse return;
@@ -702,30 +923,28 @@ fn returndatacopy(self: *Interpreter) !void {
     const dest256 = self.popStack() orelse return;
     const offset256 = self.popStack() orelse return;
     const size256 = self.popStack() orelse return;
-    const dest = self.toMemIndex(dest256) orelse return;
-    const offset = self.toMemIndex(offset256) orelse return;
-    const size = self.toMemIndex(size256) orelse return;
-    if (offset + size > self.last_return_data.len) {
+    const src_region = self.toMemRegion(offset256, size256) orelse return;
+    if (src_region.offset + src_region.size > self.last_return_data.len) {
         self.status = .invalid_opcode;
         return;
     }
-    if (!self.chargeMemoryExpansion(dest, size)) return;
-    if (!self.chargeGas(gas.copy_word * ((size + 31) / 32))) return;
-    if (size == 0) {
+    const dest_region = self.toMemRegion(dest256, size256) orelse return;
+    if (!self.chargeMemoryExpansion(dest_region.offset, dest_region.size)) return;
+    if (!self.chargeGas(gas.copy_word * ((dest_region.size + 31) / 32))) return;
+    if (dest_region.size == 0) {
         self.pc += 1;
         return;
     }
-    try self.memory.write(dest, self.last_return_data[offset..][0..size]);
+    try self.memory.write(dest_region.offset, self.last_return_data[src_region.offset..][0..src_region.size]);
     self.pc += 1;
 }
 
 fn haltWithOutput(self: *Interpreter, status: Status) !void {
     const offset256 = self.popStack() orelse return;
     const size256 = self.popStack() orelse return;
-    const offset = self.toMemIndex(offset256) orelse return;
-    const size = self.toMemIndex(size256) orelse return;
-    if (!self.chargeMemoryExpansion(offset, size)) return;
-    const data = try self.memory.read(offset, size);
+    const region = self.toMemRegion(offset256, size256) orelse return;
+    if (!self.chargeMemoryExpansion(region.offset, region.size)) return;
+    const data = try self.memory.read(region.offset, region.size);
     self.return_data = try self.allocator.dupe(u8, data);
     self.status = status;
 }
@@ -739,7 +958,7 @@ fn haltWithOutput(self: *Interpreter, status: Status) !void {
 // re-set" bookkeeping, just a flat refund every time a slot clears.
 
 fn sload(self: *Interpreter) !void {
-    if (!self.chargeGas(gas.sload)) return;
+    if (!self.chargeGas(if (self.block.fork.atLeast(.tangerine_whistle)) gas.sload_150 else gas.sload)) return;
     const slot = self.popStack() orelse return;
     const state = self.state orelse {
         self.status = .invalid_opcode;
@@ -800,39 +1019,124 @@ fn call(self: *Interpreter, kind: CallKind) !void {
     }
 
     const target: Address = @truncate(target256);
-    const args_offset = self.toMemIndex(args_offset256) orelse return;
-    const args_size = self.toMemIndex(args_size256) orelse return;
-    const ret_offset = self.toMemIndex(ret_offset256) orelse return;
-    const ret_size = self.toMemIndex(ret_size256) orelse return;
+    const args_region = self.toMemRegion(args_offset256, args_size256) orelse return;
+    const ret_region = self.toMemRegion(ret_offset256, ret_size256) orelse return;
+    const args_offset = args_region.offset;
+    const args_size = args_region.size;
+    const ret_offset = ret_region.offset;
+    const ret_size = ret_region.size;
 
+    // Growing memory is part of charging for it, not something to leave to
+    // whoever reads the region later: the args are only read on the path
+    // where the call actually runs, so a call that exits early (depth
+    // limit, unaffordable value) would otherwise pay for growth that never
+    // happened and let the *next* opcode touching those bytes be billed for
+    // the very same growth a second time. Expanding between the two charges
+    // also makes them cumulative, so two overlapping regions cost what
+    // growing once to cover both costs, rather than each measuring from the
+    // original length.
     if (!self.chargeMemoryExpansion(args_offset, args_size)) return;
+    try self.memory.expand(args_offset, args_size);
     if (!self.chargeMemoryExpansion(ret_offset, ret_size)) return;
+    try self.memory.expand(ret_offset, ret_size);
 
     const state = self.state orelse {
         self.status = .invalid_opcode;
         return;
     };
 
-    var cost: u64 = gas.call_base;
+    const is_tangerine_whistle = self.block.fork.atLeast(.tangerine_whistle);
+    const is_spurious_dragon = self.block.fork.atLeast(.spurious_dragon);
+    var cost: u64 = if (is_tangerine_whistle) gas.call_base_150 else gas.call_base;
     if (value != 0) cost += gas.call_value;
-    // Only a plain CALL can bring a not-yet-touched account into being by
-    // sending it value; CALLCODE/DELEGATECALL never move value to `target`
-    // (see below), just borrow its code.
-    const is_new_account = kind == .call and value != 0 and !state.exists(target);
+    // Pre-Spurious-Dragon, the new-account surcharge and the value-transfer
+    // surcharge are independent (execution-specs' `calculate_message_call_gas`):
+    // a zero-value CALL to a not-yet-existing address still pays it. From
+    // Spurious Dragon on (EIP-161), an existing-but-empty target is *also*
+    // treated as "not really there" (`isAlive`, not `exists`), but only a
+    // value-transferring call can "create" an account this way — a
+    // zero-value call no longer pays the surcharge at all. Only a plain
+    // CALL can create an account this way; CALLCODE/DELEGATECALL check
+    // `self.address` here instead (via `to = self` in the real spec's
+    // callcode), which always already exists.
+    const is_new_account = if (is_spurious_dragon)
+        kind == .call and value != 0 and !state.isAlive(target)
+    else
+        kind == .call and !state.exists(target);
     if (is_new_account) cost += gas.call_new_account;
-    if (!self.chargeGas(cost)) return;
+    // DEBUG: era1-replay divergence hunt scaffolding from an earlier
+    // investigation, left in place per user request. `debug_is_new_account_enabled`
+    // gates this — flip it to `true` (and retarget the two hardcoded
+    // addresses below) to trace a specific CALL's new-account gas
+    // decision. Confirmed to fire often enough on real mainnet history to
+    // dominate wall time over a multi-million-block replay when left on
+    // (this is what several "is the replay stuck?" false alarms earlier
+    // this session actually traced back to — not the other debug hooks).
+    if (debug_is_new_account_enabled and
+        self.block.number == debug_is_new_account_block and
+        self.address == debug_is_new_account_caller)
+    {
+        std.debug.print(
+            "DEBUG is_new_account check: block={d} depth={d} kind={s} target={x} exists={} is_new_account={} value={d} requested_gas={d}\n",
+            .{ self.block.number, self.depth, @tagName(kind), target, state.exists(target), is_new_account, value, requested_gas },
+        );
+    }
 
-    // Pre-EIP-150 geth rejects a requested-gas value that doesn't fit in a
-    // u64 (`ErrGasUintOverflow`) rather than capping it. A contract
-    // computing this via unchecked subtraction can easily push a value
-    // near 2^256, and real Ethereum treats that as an immediate
-    // out-of-gas, not "forward everything remaining".
-    const forwarded_requested = std.math.cast(u64, requested_gas) orelse {
-        self.status = .out_of_gas;
-        return;
-    };
+    var forwarded: u64 = undefined;
+    if (is_tangerine_whistle) {
+        // EIP-150: charge only the static cost, hard-failing if even that
+        // can't be afforded (same as the pre-150 branch below). Once that's
+        // paid, cap the forwarded amount to 63/64ths of what's left rather
+        // than failing outright just because the *request* was large —
+        // the callee gets "as much as we can spare," not "exactly what it
+        // asked for or nothing." execution-specs' `min(gas,
+        // max_message_call_gas(...))` uses Python's arbitrary-precision
+        // integers, so a requested value too big to fit in a u64 (a
+        // contract computing it via unchecked subtraction can easily wrap
+        // near 2^256 — a real, observed mainnet pattern) is just another
+        // oversized request the cap reduces to something affordable, not a
+        // hard failure the way it is pre-150.
+        if (!self.chargeGas(cost)) return;
+        const max_forwardable = self.gas_remaining - self.gas_remaining / 64;
+        const requested = std.math.cast(u64, requested_gas) orelse std.math.maxInt(u64);
+        forwarded = @min(requested, max_forwardable);
+        self.gas_remaining -= forwarded;
+    } else {
+        // Pre-EIP-150 geth rejects a requested-gas value that doesn't fit
+        // in a u64 (`ErrGasUintOverflow`) rather than capping it, treating
+        // it as an immediate out-of-gas rather than "forward everything
+        // remaining". execution-specs' `calculate_message_call_gas` folds
+        // that *entire* requested-gas value (straight off the stack,
+        // uncapped) into this opcode's own static cost: `cost = base +
+        // gas + surcharges`, charged as one unit via `charge_gas`. If the
+        // caller can't afford that, the whole CALL fails outright (this
+        // frame goes out-of-gas) rather than silently forwarding whatever
+        // happens to be left over.
+        const forwarded_requested = std.math.cast(u64, requested_gas) orelse {
+            self.status = .out_of_gas;
+            return;
+        };
+        const total_cost = std.math.add(u64, cost, forwarded_requested) catch {
+            self.status = .out_of_gas;
+            return;
+        };
+        if (!self.chargeGas(total_cost)) return;
+        forwarded = forwarded_requested;
+    }
 
+    const stipend: u64 = if (value != 0) gas.call_stipend else 0;
+    const child_gas_limit = forwarded + stipend;
+
+    // Real Ethereum resets RETURNDATASIZE/RETURNDATACOPY to empty for any
+    // CALL variant that never actually reaches a callee (depth limit,
+    // insufficient balance): there's no call to have returned data. Found
+    // via a real ~18 gwei era1 divergence at block 5,529,623 — this early
+    // return used to leave `last_return_data` stale from an earlier call
+    // in the same transaction, making a later RETURNDATACOPY over-copy.
     if (self.depth >= max_call_depth) {
+        self.gas_remaining += child_gas_limit;
+        if (self.last_return_data.len != 0) self.allocator.free(self.last_return_data);
+        self.last_return_data = &.{};
         self.pushStack(0);
         self.pc += 1;
         return;
@@ -840,23 +1144,16 @@ fn call(self: *Interpreter, kind: CallKind) !void {
 
     const cp = state.checkpoint();
 
-    // Pre-EIP-150: forward up to whatever's available, uncapped by the
-    // 63/64ths rule that fork later introduced. Real EVM reserves this
-    // (plus the stipend) before checking whether `value` can be afforded,
-    // so a failed check below returns the whole reservation untouched.
-    var forwarded = forwarded_requested;
-    if (forwarded > self.gas_remaining) forwarded = self.gas_remaining;
-    self.gas_remaining -= forwarded;
-    const stipend: u64 = if (value != 0) gas.call_stipend else 0;
-    const child_gas_limit = forwarded + stipend;
-
-    if (value != 0) {
+    if (kind == .call or kind == .callcode) {
         // CALLCODE never leaves its own storage context, so `value`
         // "moves" from this account to itself: a no-op balance-wise, but
-        // it still has to afford it.
+        // it still has to afford it. Always calls `transfer`, even for
+        // value == 0, since it still has to touch the recipient.
         const recipient = if (kind == .callcode) self.address else target;
         if (!try state.transfer(self.address, recipient, value)) {
             self.gas_remaining += child_gas_limit;
+            if (self.last_return_data.len != 0) self.allocator.free(self.last_return_data);
+            self.last_return_data = &.{};
             self.pushStack(0);
             self.pc += 1;
             return;
@@ -869,7 +1166,13 @@ fn call(self: *Interpreter, kind: CallKind) !void {
     // return empty, so it's checked first, before creating a child `Interpreter`.
     const target_code = state.getCode(target);
 
-    const outcome: CallOutcome = if (try Precompiles.call(self.allocator, target, args, child_gas_limit)) |result|
+    // The address the callee executes *as*: DELEGATECALL/CALLCODE run
+    // target's code but keep this frame's own address/storage, so from
+    // EIP-161's perspective it's `self.address`, not `target`, that gets
+    // touched.
+    const callee_address = if (kind == .delegatecall or kind == .callcode) self.address else target;
+
+    const outcome: CallOutcome = if (try Precompiles.call(self.allocator, target, args, child_gas_limit, self.block.fork)) |result|
         .{
             .status = if (result.success) .stopped else .out_of_gas,
             .gas_remaining = result.gas_remaining,
@@ -887,7 +1190,7 @@ fn call(self: *Interpreter, kind: CallKind) !void {
         // preserving the grandparent's: "run target's code as my own,"
         // not "run target's code as if I weren't here."
         var child = try Interpreter.initCall(self.allocator, target_code, child_gas_limit, .{
-            .address = if (kind == .delegatecall or kind == .callcode) self.address else target,
+            .address = callee_address,
             .caller = if (kind == .delegatecall) self.caller else self.address,
             .value = if (kind == .delegatecall) self.value else value,
             .calldata = args,
@@ -896,6 +1199,7 @@ fn call(self: *Interpreter, kind: CallKind) !void {
             .depth = self.depth + 1,
             .state = state,
             .block = self.block,
+            .jumpdest = state.getJumpdest(target),
         });
         defer child.deinit();
         try child.run();
@@ -909,7 +1213,21 @@ fn call(self: *Interpreter, kind: CallKind) !void {
     defer self.allocator.free(outcome.return_data);
 
     const success = outcome.status == .stopped;
-    if (!success) state.revertTo(cp);
+    // EIP-161, from Spurious Dragon on: mark the callee touched regardless
+    // of whether this call ends up succeeding — `markTouchedIfEmpty` is
+    // journaled, so a revert below automatically discards it, matching
+    // real Ethereum's "a reverted call's touches never happened" rule.
+    if (is_spurious_dragon) try state.markTouchedIfEmpty(callee_address);
+    if (!success) {
+        state.revertTo(cp);
+        if (is_spurious_dragon and callee_address == ripemd160_address) {
+            // Real client bug, preserved in consensus: RIPEMD160 stays
+            // touched even though this call failed (see
+            // `ripemd160_address`'s doc comment). Re-applies the touch
+            // the revert above just undid.
+            try state.markTouchedIfEmpty(ripemd160_address);
+        }
+    }
     // The stipend is free money handed to the callee, not a loan against
     // the caller: real geth adds a call's entire leftover gas straight
     // back with no clawback, so an unused stipend comes back in full.
@@ -975,9 +1293,13 @@ fn createOp(self: *Interpreter, kind: CreateKind) !void {
         return;
     }
 
-    const offset = self.toMemIndex(offset256) orelse return;
-    const size = self.toMemIndex(size256) orelse return;
+    const region = self.toMemRegion(offset256, size256) orelse return;
+    const offset = region.offset;
+    const size = region.size;
+    // Same reasoning as `call`: grow the memory as part of paying for it,
+    // so an early exit can't leave the growth charged but undone.
     if (!self.chargeMemoryExpansion(offset, size)) return;
+    try self.memory.expand(offset, size);
     if (!self.chargeGas(gas.create_base)) return;
     if (kind == .create2 and !self.chargeGas(gas.keccak256_word * ((size + 31) / 32))) return;
 
@@ -987,6 +1309,8 @@ fn createOp(self: *Interpreter, kind: CreateKind) !void {
     };
 
     if (self.depth >= max_call_depth) {
+        if (self.last_return_data.len != 0) self.allocator.free(self.last_return_data);
+        self.last_return_data = &.{};
         self.pushStack(0);
         self.pc += 1;
         return;
@@ -998,21 +1322,64 @@ fn createOp(self: *Interpreter, kind: CreateKind) !void {
         .create2 => create2Address(self.address, salt, init_code),
     };
 
-    const cp = state.checkpoint();
-
-    try state.setNonce(self.address, state.get(self.address).nonce + 1);
-
-    if (value != 0 and !try state.transfer(self.address, new_address, value)) {
-        state.revertTo(cp);
+    // Order matters here, and it isn't the obvious one (see
+    // execution-specs' `create`): the endowment and depth checks come
+    // first and bail out *without* touching the creator's nonce; only then
+    // is the nonce incremented; and only after that does the child's own
+    // snapshot begin. So a create whose init code fails still consumes the
+    // creator's nonce — that increment is deliberately outside everything
+    // `revertTo` undoes. Taking the checkpoint too early instead rolls the
+    // nonce back on failure, which shifts every later CREATE address that
+    // account derives: found via a real era1 divergence where a clone
+    // factory's nonce sat one behind real chain (9 vs 10), so its next
+    // CREATE produced a different address entirely and execution diverged
+    // from there on.
+    if (value != 0 and state.getBalance(self.address) < value) {
+        if (self.last_return_data.len != 0) self.allocator.free(self.last_return_data);
+        self.last_return_data = &.{};
         self.pushStack(0);
         self.pc += 1;
         return;
     }
 
-    const max_forwardable = self.gas_remaining - self.gas_remaining / 64;
-    self.gas_remaining -= max_forwardable;
+    try state.setNonce(self.address, state.get(self.address).nonce + 1);
 
-    var child = try Interpreter.initCall(self.allocator, init_code, max_forwardable, .{
+    const cp = state.checkpoint();
+
+    // EIP-161, from Spurious Dragon on: a freshly created contract's own
+    // nonce starts at 1, not 0 — set before its init code runs (real
+    // Frontier/Homestead/Tangerine Whistle never touch the new address's
+    // nonce at all here). This is what keeps a contract from ever being
+    // mistaken for "empty" while its own constructor is still running, or
+    // if it ends up deploying zero bytes of code.
+    if (self.block.fork.atLeast(.spurious_dragon)) try state.setNonce(new_address, 1);
+
+    if (value != 0) {
+        // The endowment check above already ruled out the short case, so
+        // this only ever moves the value.
+        const moved = try state.transfer(self.address, new_address, value);
+        std.debug.assert(moved);
+    }
+
+    // Same as `Evm.create`: execution-specs' `process_message` touches the
+    // new contract's address before its init code runs. Without it a
+    // zero-value pre-Spurious-Dragon creation leaves the address absent
+    // while its constructor executes, so a `SELFDESTRUCT` in that
+    // constructor registers nothing and the contract outlives the
+    // transaction that should have erased it.
+    try state.touch(new_address);
+
+    // Real Frontier/Homestead/DAO forward *all* remaining gas to a nested
+    // CREATE (`create_message_gas = evm.gas_left; evm.gas_left = 0`); the
+    // 63/64ths reservation is EIP-150/Tangerine Whistle's rule, same as
+    // `call`'s.
+    const forwarded = if (self.block.fork.atLeast(.tangerine_whistle))
+        self.gas_remaining - self.gas_remaining / 64
+    else
+        self.gas_remaining;
+    self.gas_remaining -= forwarded;
+
+    var child = try Interpreter.initCall(self.allocator, init_code, forwarded, .{
         .address = new_address,
         .caller = self.address,
         .value = value,
@@ -1025,23 +1392,39 @@ fn createOp(self: *Interpreter, kind: CreateKind) !void {
     defer child.deinit();
     try child.run();
 
-    var success = child.status == .stopped and child.return_data.len <= max_code_size;
+    // EIP-170, from Spurious Dragon on: deployed code over this size is
+    // rejected as an exceptional halt (real Ethereum's `OutOfGasError`),
+    // forfeiting all remaining gas rather than a graceful stop. No limit
+    // at all before this fork.
+    const oversized = self.block.fork.atLeast(.spurious_dragon) and child.return_data.len > max_code_size;
+    var success = child.status == .stopped and !oversized;
+    var status = if (oversized) .out_of_gas else child.status;
+    var deployed_code: []const u8 = child.return_data;
     if (success) {
         const deposit_cost = gas.code_deposit_byte * @as(u64, child.return_data.len);
         if (child.gas_remaining < deposit_cost) {
-            success = false;
+            if (self.block.fork == .frontier) {
+                // Real Frontier: an unaffordable deposit just skips storing
+                // code; the creation still succeeds and gas_remaining is
+                // left exactly as-is. Homestead (EIP-2) made this a hard,
+                // gas-forfeiting failure instead.
+                deployed_code = &.{};
+            } else {
+                success = false;
+                status = .out_of_gas;
+            }
         } else {
             child.gas_remaining -= deposit_cost;
         }
     }
 
     if (success) {
-        try state.setCode(new_address, child.return_data);
+        try state.setCode(new_address, deployed_code);
     } else {
         state.revertTo(cp);
     }
 
-    if (child.status == .stopped or child.status == .reverted) {
+    if (status == .stopped or status == .reverted) {
         self.gas_remaining += child.gas_remaining;
     }
     // See the equivalent comment in `call`: a failed/reverted create's
@@ -1049,10 +1432,18 @@ fn createOp(self: *Interpreter, kind: CreateKind) !void {
     if (success) self.refund += child.refund;
 
     // A successful create's return data was its deployed code, not
-    // something RETURNDATACOPY should expose; only a failure's revert
-    // reason (if any) is visible afterward.
+    // something RETURNDATACOPY should expose; only a genuine `REVERT`'s
+    // reason is visible afterward. An *exceptional* halt (`status ==
+    // .out_of_gas`, whether from the child running out of gas mid-execution
+    // or from this function's own post-hoc deposit-cost/EIP-170 checks)
+    // has no return data at all: real Ethereum clears it, the same as any
+    // other exceptional halt. Found via a real ~2,880,000,000,000 wei era1
+    // divergence — a CREATE whose constructor legitimately RETURNed real
+    // bytes (so `child.return_data` is non-empty) but then failed the
+    // deposit-cost check, leaving a later RETURNDATACOPY seeing stale
+    // "revert reason" bytes that were never actually a revert reason.
     if (self.last_return_data.len != 0) self.allocator.free(self.last_return_data);
-    self.last_return_data = if (success) &.{} else try self.allocator.dupe(u8, child.return_data);
+    self.last_return_data = if (status == .reverted) try self.allocator.dupe(u8, child.return_data) else &.{};
 
     self.pushStack(if (success) @as(u256, new_address) else 0);
     self.pc += 1;
@@ -1074,8 +1465,9 @@ fn log(self: *Interpreter, topic_count: u8) !void {
     while (i < topic_count) : (i += 1) {
         _ = self.popStack() orelse return;
     }
-    const offset = self.toMemIndex(offset256) orelse return;
-    const size = self.toMemIndex(size256) orelse return;
+    const region = self.toMemRegion(offset256, size256) orelse return;
+    const offset = region.offset;
+    const size = region.size;
     if (!self.chargeMemoryExpansion(offset, size)) return;
     const cost = gas.log_base + gas.log_topic * @as(u64, topic_count) + gas.log_data_byte * @as(u64, size);
     if (!self.chargeGas(cost)) return;
@@ -1096,19 +1488,52 @@ fn selfdestruct(self: *Interpreter) !void {
     const beneficiary: Address = @truncate(beneficiary256);
     const balance = state.getBalance(self.address);
 
-    if (!self.chargeGas(gas.selfdestruct_base)) return;
+    const is_tangerine_whistle = self.block.fork.atLeast(.tangerine_whistle);
+    const is_spurious_dragon = self.block.fork.atLeast(.spurious_dragon);
+    var cost: u64 = if (is_tangerine_whistle) gas.selfdestruct_base_150 else gas.selfdestruct_base;
+    // From Spurious Dragon on (EIP-161), the new-account surcharge swaps
+    // `exists` for `isAlive` (an existing-but-empty beneficiary still
+    // counts as "not really there"), and only applies if there's actually
+    // a nonzero balance being moved to it — nothing to move means no
+    // account gets created either way.
+    if (is_spurious_dragon) {
+        if (!state.isAlive(beneficiary) and balance != 0) cost += gas.selfdestruct_new_account;
+    } else if (is_tangerine_whistle and !state.exists(beneficiary)) {
+        cost += gas.selfdestruct_new_account;
+    }
+    if (!self.chargeGas(cost)) return;
 
-    if (balance != 0 and beneficiary != self.address) {
+    // Real Ethereum assigns the beneficiary's balance unconditionally, and
+    // that assignment *materialises* the account even when the amount moved
+    // is zero — a zero-balance SELFDESTRUCT still leaves an empty
+    // beneficiary behind in the state trie. Skipping it when `balance == 0`
+    // left zevm one account short of real chain, which shows up as nothing
+    // at all until a state root is compared (or until a later CALL to that
+    // address is charged the 25,000 new-account fee zevm no longer expects).
+    // From Spurious Dragon on, `markTouchedIfEmpty` below hands that same
+    // empty account to the EIP-161 sweep, so it only survives where it should.
+    if (beneficiary != self.address) {
         // Already confirmed the balance is there; `transfer` can only
         // fail on insufficient balance, which can't happen here.
         _ = try state.transfer(self.address, beneficiary, balance);
-    } else if (beneficiary == self.address and balance != 0) {
+    } else if (balance != 0) {
         // Destroying yourself to yourself just burns the balance.
         try state.setBalance(self.address, 0);
     }
 
+    // EIP-161, from Spurious Dragon on: the beneficiary counts as touched
+    // too (a no-op if it just received a nonzero transfer above, since
+    // `markTouchedIfEmpty` only ever acts on a currently-empty account).
+    if (is_spurious_dragon) try state.markTouchedIfEmpty(beneficiary);
+
+    // Real Ethereum's refund is a set-membership check, not a per-call
+    // counter: an address earns it only the first time it's destroyed in
+    // this transaction, so a contract that gets `CALL`ed (and
+    // self-destructs) repeatedly doesn't rack up the refund again on
+    // every repeat.
+    const already_marked = state.isPendingDestruction(self.address);
     try state.destroyAccount(self.address);
-    self.refund += gas.selfdestruct_refund;
+    if (!already_marked) self.refund += gas.selfdestruct_refund;
     self.status = .stopped;
 }
 
@@ -1225,6 +1650,13 @@ fn sar(shift_amount: u256, value: u256) u256 {
 // --- tests ---
 
 fn expectBinaryOp(op: OpCode, a: u256, b: u256, expected: u256) !void {
+    return expectBinaryOpFork(op, a, b, expected, .frontier);
+}
+
+/// `SHL`/`SHR`/`SAR` are Constantinople-only (EIP-145), unlike every other
+/// binary op `expectBinaryOp` exercises, so those three tests need a later
+/// fork explicitly rather than sharing `expectBinaryOp`'s frontier default.
+fn expectBinaryOpFork(op: OpCode, a: u256, b: u256, expected: u256, fork: Fork) !void {
     var code: std.ArrayList(u8) = .empty;
     defer code.deinit(std.testing.allocator);
     try appendPush32(&code, b);
@@ -1232,7 +1664,7 @@ fn expectBinaryOp(op: OpCode, a: u256, b: u256, expected: u256) !void {
     try code.append(std.testing.allocator, @intFromEnum(op));
     try code.append(std.testing.allocator, @intFromEnum(OpCode.STOP));
 
-    var interp = try Interpreter.init(std.testing.allocator, code.items, 1_000_000);
+    var interp = try Interpreter.initCall(std.testing.allocator, code.items, 1_000_000, .{ .block = .{ .fork = fork } });
     defer interp.deinit();
     try interp.run();
 
@@ -1310,6 +1742,41 @@ test "MULMOD does not overflow when a * b exceeds u256" {
 test "EXP" {
     try expectBinaryOp(.EXP, 2, 10, 1024);
 }
+
+test "EXP costs more per exponent byte from Spurious Dragon on" {
+    const code = [_]u8{
+        @intFromEnum(OpCode.PUSH2), 0x01, 0x00, // exponent: 256 (2 significant bytes)
+        @intFromEnum(OpCode.PUSH1), 2, // base
+        @intFromEnum(OpCode.EXP),
+        @intFromEnum(OpCode.STOP),
+    };
+
+    var frontier_state = State.init(std.testing.allocator);
+    defer frontier_state.deinit();
+    var frontier_interp = try Interpreter.initCall(std.testing.allocator, &code, 1_000_000, .{
+        .address = 0xaa,
+        .state = &frontier_state,
+    });
+    defer frontier_interp.deinit();
+    try frontier_interp.run();
+
+    var sd_state = State.init(std.testing.allocator);
+    defer sd_state.deinit();
+    var sd_interp = try Interpreter.initCall(std.testing.allocator, &code, 1_000_000, .{
+        .address = 0xaa,
+        .state = &sd_state,
+        .block = .{ .fork = .spurious_dragon },
+    });
+    defer sd_interp.deinit();
+    try sd_interp.run();
+
+    try std.testing.expectEqual(Status.stopped, frontier_interp.status);
+    try std.testing.expectEqual(Status.stopped, sd_interp.status);
+    try std.testing.expectEqual(
+        (gas.exp_byte_160 - gas.exp_byte) * 2,
+        frontier_interp.gas_remaining - sd_interp.gas_remaining,
+    );
+}
 test "SIGNEXTEND of a negative byte fills with ones" {
     try expectBinaryOp(.SIGNEXTEND, 0, 0xff, max_u256);
 }
@@ -1347,27 +1814,35 @@ test "BYTE extracts the big-endian byte at the given index" {
     try expectBinaryOp(.BYTE, 31, 0xab, 0xab);
 }
 test "SHL" {
-    try expectBinaryOp(.SHL, 1, 4, 8);
+    try expectBinaryOpFork(.SHL, 1, 4, 8, .constantinople);
 }
 test "SHR" {
-    try expectBinaryOp(.SHR, 1, 8, 4);
+    try expectBinaryOpFork(.SHR, 1, 8, 4, .constantinople);
 }
 test "SHR by 256 or more is zero" {
-    try expectBinaryOp(.SHR, 256, max_u256, 0);
+    try expectBinaryOpFork(.SHR, 256, max_u256, 0, .constantinople);
 }
 test "SAR sign-extends when shifting a negative value" {
-    try expectBinaryOp(.SAR, 1, @bitCast(@as(i256, -2)), @bitCast(@as(i256, -1)));
+    try expectBinaryOpFork(.SAR, 1, @bitCast(@as(i256, -2)), @bitCast(@as(i256, -1)), .constantinople);
 }
 test "SAR by 256 or more of a negative value saturates to all ones" {
-    try expectBinaryOp(.SAR, 256, min_i256_as_u256, max_u256);
+    try expectBinaryOpFork(.SAR, 256, min_i256_as_u256, max_u256, .constantinople);
 }
 
 test "PUSH0 pushes zero" {
     const code = [_]u8{ @intFromEnum(OpCode.PUSH0), @intFromEnum(OpCode.STOP) };
-    var interp = try Interpreter.init(std.testing.allocator, &code, 1_000_000);
+    var interp = try Interpreter.initCall(std.testing.allocator, &code, 1_000_000, .{ .block = .{ .fork = .shanghai } });
     defer interp.deinit();
     try interp.run();
     try std.testing.expectEqual(@as(u256, 0), try interp.stack.pop());
+}
+
+test "PUSH0 is invalid before Shanghai" {
+    const code = [_]u8{@intFromEnum(OpCode.PUSH0)};
+    var interp = try Interpreter.init(std.testing.allocator, &code, 1_000_000);
+    defer interp.deinit();
+    try interp.run();
+    try std.testing.expectEqual(Status.invalid_opcode, interp.status);
 }
 
 test "PUSH1 reads one immediate byte" {
@@ -1634,18 +2109,34 @@ test "PREVRANDAO pushes the current block's difficulty" {
 
 test "BASEFEE pushes the current block's base fee" {
     const code = [_]u8{ @intFromEnum(OpCode.BASEFEE), @intFromEnum(OpCode.STOP) };
-    var interp = try Interpreter.initCall(std.testing.allocator, &code, 1_000_000, .{ .block = .{ .base_fee = 7 } });
+    var interp = try Interpreter.initCall(std.testing.allocator, &code, 1_000_000, .{ .block = .{ .base_fee = 7, .fork = .london } });
     defer interp.deinit();
     try interp.run();
     try std.testing.expectEqual(@as(u256, 7), try interp.stack.pop());
 }
 
+test "BASEFEE is invalid before London" {
+    const code = [_]u8{@intFromEnum(OpCode.BASEFEE)};
+    var interp = try Interpreter.init(std.testing.allocator, &code, 1_000_000);
+    defer interp.deinit();
+    try interp.run();
+    try std.testing.expectEqual(Status.invalid_opcode, interp.status);
+}
+
 test "CHAINID pushes the chain id" {
     const code = [_]u8{ @intFromEnum(OpCode.CHAINID), @intFromEnum(OpCode.STOP) };
-    var interp = try Interpreter.initCall(std.testing.allocator, &code, 1_000_000, .{ .block = .{ .chain_id = 1 } });
+    var interp = try Interpreter.initCall(std.testing.allocator, &code, 1_000_000, .{ .block = .{ .chain_id = 1, .fork = .istanbul } });
     defer interp.deinit();
     try interp.run();
     try std.testing.expectEqual(@as(u256, 1), try interp.stack.pop());
+}
+
+test "CHAINID is invalid before Istanbul" {
+    const code = [_]u8{@intFromEnum(OpCode.CHAINID)};
+    var interp = try Interpreter.init(std.testing.allocator, &code, 1_000_000);
+    defer interp.deinit();
+    try interp.run();
+    try std.testing.expectEqual(Status.invalid_opcode, interp.status);
 }
 
 test "SELFBALANCE pushes this frame's own balance from state" {
@@ -1654,10 +2145,18 @@ test "SELFBALANCE pushes this frame's own balance from state" {
     defer state.deinit();
     try state.setBalance(0x42, 1000);
 
-    var interp = try Interpreter.initCall(std.testing.allocator, &code, 1_000_000, .{ .address = 0x42, .state = &state });
+    var interp = try Interpreter.initCall(std.testing.allocator, &code, 1_000_000, .{ .address = 0x42, .state = &state, .block = .{ .fork = .istanbul } });
     defer interp.deinit();
     try interp.run();
     try std.testing.expectEqual(@as(u256, 1000), try interp.stack.pop());
+}
+
+test "SELFBALANCE is invalid before Istanbul" {
+    const code = [_]u8{@intFromEnum(OpCode.SELFBALANCE)};
+    var interp = try Interpreter.init(std.testing.allocator, &code, 1_000_000);
+    defer interp.deinit();
+    try interp.run();
+    try std.testing.expectEqual(Status.invalid_opcode, interp.status);
 }
 
 test "block context is inherited by nested calls" {
@@ -1759,11 +2258,82 @@ test "REVERT halts as .reverted and still captures output" {
         @intFromEnum(OpCode.PUSH1), 0,
         @intFromEnum(OpCode.REVERT),
     };
-    var interp = try Interpreter.init(std.testing.allocator, &code, 1_000_000);
+    // REVERT is Byzantium-only (EIP-140); see the "REVERT is invalid before
+    // Byzantium" test below for the pre-fork behavior.
+    var interp = try Interpreter.initCall(std.testing.allocator, &code, 1_000_000, .{ .block = .{ .fork = .byzantium } });
     defer interp.deinit();
     try interp.run();
     try std.testing.expectEqual(Status.reverted, interp.status);
     try std.testing.expectEqual(@as(u256, 0x99), std.mem.readInt(u256, interp.return_data[0..32], .big));
+}
+
+test "REVERT is invalid before Byzantium" {
+    const code = [_]u8{
+        @intFromEnum(OpCode.PUSH1), 0,
+        @intFromEnum(OpCode.PUSH1), 0,
+        @intFromEnum(OpCode.REVERT),
+    };
+    var interp = try Interpreter.init(std.testing.allocator, &code, 1_000_000);
+    defer interp.deinit();
+    try interp.run();
+    try std.testing.expectEqual(Status.invalid_opcode, interp.status);
+}
+
+test "a CALLed contract's own internal JUMP loop runs correctly through State's cached jumpdest analysis" {
+    // callee: the same counts-a-stack-value-down-to-zero loop as the
+    // JUMP/JUMPDEST unit test above, but reached via `state.setCode` +
+    // `CALL` instead of a bare `Interpreter.init`, so this exercises
+    // `State.getJumpdest`'s cached bitset (cloned into the child
+    // `Interpreter`) rather than a fresh `analyzeJumpdests` scan — the
+    // two must validate `JUMP`/`JUMPI` identically.
+    const push1 = @intFromEnum(OpCode.PUSH1);
+    const callee_code = [_]u8{
+        push1, 5, // 0,1: counter = 5
+        @intFromEnum(OpCode.JUMPDEST), // 2: loop:
+        @intFromEnum(OpCode.DUP1), // 3
+        @intFromEnum(OpCode.ISZERO), // 4
+        push1, 15, // 5,6: push end
+        @intFromEnum(OpCode.JUMPI), // 7: if counter == 0, goto end
+        push1, 1, // 8,9
+        @intFromEnum(OpCode.SWAP1), // 10
+        @intFromEnum(OpCode.SUB), // 11: counter -= 1
+        push1, 2, // 12,13: push loop
+        @intFromEnum(OpCode.JUMP), // 14: goto loop
+        @intFromEnum(OpCode.JUMPDEST), // 15: end:
+        @intFromEnum(OpCode.PUSH1), 0,
+        @intFromEnum(OpCode.MSTORE),
+        @intFromEnum(OpCode.PUSH1), 32,
+        @intFromEnum(OpCode.PUSH1), 0,
+        @intFromEnum(OpCode.RETURN),
+    };
+
+    var state = State.init(std.testing.allocator);
+    defer state.deinit();
+    try state.setCode(0xcc, &callee_code);
+
+    // caller: CALL(gas=10000, addr=0xcc, value=0, argsOffset=0, argsSize=0, retOffset=0, retSize=32)
+    const caller_code = [_]u8{
+        @intFromEnum(OpCode.PUSH1), 32, // retSize
+        @intFromEnum(OpCode.PUSH1), 0, // retOffset
+        @intFromEnum(OpCode.PUSH1), 0, // argsSize
+        @intFromEnum(OpCode.PUSH1), 0, // argsOffset
+        @intFromEnum(OpCode.PUSH1), 0, // value
+        @intFromEnum(OpCode.PUSH1), 0xcc, // address
+        @intFromEnum(OpCode.PUSH2), 0x27, 0x10, // gas
+        @intFromEnum(OpCode.CALL),
+        @intFromEnum(OpCode.STOP),
+    };
+
+    var interp = try Interpreter.initCall(std.testing.allocator, &caller_code, 1_000_000, .{
+        .address = 0xaa,
+        .state = &state,
+    });
+    defer interp.deinit();
+    try interp.run();
+
+    try std.testing.expectEqual(Status.stopped, interp.status);
+    try std.testing.expectEqual(@as(u256, 1), try interp.stack.pop());
+    try std.testing.expectEqual(@as(u256, 0), try interp.memory.readWord(0));
 }
 
 test "CALL runs the callee, transfers value, and copies its return data back" {
@@ -1810,6 +2380,211 @@ test "CALL runs the callee, transfers value, and copies its return data back" {
     try std.testing.expectEqual(@as(u256, 42), state.getBalance(callee_addr));
 }
 
+test "a CALL with argsSize/retSize both 0 succeeds despite huge, unfit-in-usize offsets" {
+    // The classic Solidity `.transfer()`/`.send()` compilation: no calldata,
+    // no expected return data, and offset slots holding whatever the
+    // free-memory pointer (or other stale stack value) happened to be —
+    // real Ethereum never actually dereferences them when size is 0, so an
+    // arbitrarily large offset must not fail the call. Found via a real
+    // historical mainnet transaction (block 4,890,213) that zevm rejected
+    // as out-of-gas despite it succeeding on real mainnet: a CryptoKitties
+    // auction paying out proceeds via exactly this bytecode pattern.
+    var state = State.init(std.testing.allocator);
+    defer state.deinit();
+    try state.setBalance(0xaa, 1000);
+
+    // caller: CALL(gas=10000, addr=0xdd, value=0, argsOffset=huge,
+    // argsSize=0, retOffset=huge, retSize=0)
+    const caller_code = [_]u8{
+        @intFromEnum(OpCode.PUSH1), 0, // retSize
+        @intFromEnum(OpCode.PUSH32), 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, // retOffset
+        @intFromEnum(OpCode.PUSH1), 0, // argsSize
+        @intFromEnum(OpCode.PUSH32), 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, // argsOffset
+        @intFromEnum(OpCode.PUSH1), 0, // value
+        @intFromEnum(OpCode.PUSH1), 0xdd, // address
+        @intFromEnum(OpCode.PUSH2), 0x27, 0x10, // gas
+        @intFromEnum(OpCode.CALL),
+        @intFromEnum(OpCode.STOP),
+    };
+
+    var interp = try Interpreter.initCall(std.testing.allocator, &caller_code, 1_000_000, .{
+        .address = 0xaa,
+        .state = &state,
+    });
+    defer interp.deinit();
+    try interp.run();
+
+    try std.testing.expectEqual(Status.stopped, interp.status);
+    try std.testing.expectEqual(@as(u256, 1), try interp.stack.pop());
+}
+
+test "a zero-value CALL still touches (creates) a not-yet-existing target" {
+    var state = State.init(std.testing.allocator);
+    defer state.deinit();
+    try state.setBalance(0xaa, 1000);
+
+    // caller: CALL(gas=10000, addr=0xdd, value=0, argsOffset=0, argsSize=0, retOffset=0, retSize=0)
+    const caller_code = [_]u8{
+        @intFromEnum(OpCode.PUSH1), 0, // retSize
+        @intFromEnum(OpCode.PUSH1), 0, // retOffset
+        @intFromEnum(OpCode.PUSH1), 0, // argsSize
+        @intFromEnum(OpCode.PUSH1), 0, // argsOffset
+        @intFromEnum(OpCode.PUSH1), 0, // value
+        @intFromEnum(OpCode.PUSH1), 0xdd, // address
+        @intFromEnum(OpCode.PUSH2), 0x27, 0x10, // gas
+        @intFromEnum(OpCode.CALL),
+        @intFromEnum(OpCode.STOP),
+    };
+
+    try std.testing.expect(!state.exists(0xdd));
+    var interp = try Interpreter.initCall(std.testing.allocator, &caller_code, 1_000_000, .{
+        .address = 0xaa,
+        .state = &state,
+    });
+    defer interp.deinit();
+    try interp.run();
+
+    try std.testing.expectEqual(Status.stopped, interp.status);
+    try std.testing.expectEqual(@as(u256, 1), try interp.stack.pop());
+    try std.testing.expect(state.exists(0xdd));
+    try std.testing.expectEqual(@as(u256, 0), state.getBalance(0xdd));
+}
+
+test "a zero-value CALL to a not-yet-existing address still pays the new-account surcharge" {
+    // caller: CALL(gas=10000, addr=0xdd, value=0, argsOffset=0, argsSize=0, retOffset=0, retSize=0)
+    const caller_code = [_]u8{
+        @intFromEnum(OpCode.PUSH1), 0, // retSize
+        @intFromEnum(OpCode.PUSH1), 0, // retOffset
+        @intFromEnum(OpCode.PUSH1), 0, // argsSize
+        @intFromEnum(OpCode.PUSH1), 0, // argsOffset
+        @intFromEnum(OpCode.PUSH1), 0, // value
+        @intFromEnum(OpCode.PUSH1), 0xdd, // address
+        @intFromEnum(OpCode.PUSH2), 0x27, 0x10, // gas
+        @intFromEnum(OpCode.CALL),
+        @intFromEnum(OpCode.STOP),
+    };
+
+    // Baseline: 0xdd already exists (pre-touched), so no new-account charge.
+    var existing_state = State.init(std.testing.allocator);
+    defer existing_state.deinit();
+    try existing_state.setBalance(0xdd, 0);
+    var existing_interp = try Interpreter.initCall(std.testing.allocator, &caller_code, 1_000_000, .{
+        .address = 0xaa,
+        .state = &existing_state,
+    });
+    defer existing_interp.deinit();
+    try existing_interp.run();
+
+    // 0xdd doesn't exist yet: real Frontier (per execution-specs'
+    // `calculate_message_call_gas`) charges the new-account surcharge for
+    // *any* CALL to a not-yet-existing address, independent of value.
+    var new_state = State.init(std.testing.allocator);
+    defer new_state.deinit();
+    var new_interp = try Interpreter.initCall(std.testing.allocator, &caller_code, 1_000_000, .{
+        .address = 0xaa,
+        .state = &new_state,
+    });
+    defer new_interp.deinit();
+    try new_interp.run();
+
+    try std.testing.expectEqual(Status.stopped, existing_interp.status);
+    try std.testing.expectEqual(Status.stopped, new_interp.status);
+    try std.testing.expectEqual(
+        gas.call_new_account,
+        existing_interp.gas_remaining - new_interp.gas_remaining,
+    );
+}
+
+test "from Spurious Dragon on, a zero-value CALL no longer pays the new-account surcharge" {
+    // Same caller code as the pre-161 test above: CALL(..., value=0, ...).
+    const caller_code = [_]u8{
+        @intFromEnum(OpCode.PUSH1), 0, // retSize
+        @intFromEnum(OpCode.PUSH1), 0, // retOffset
+        @intFromEnum(OpCode.PUSH1), 0, // argsSize
+        @intFromEnum(OpCode.PUSH1), 0, // argsOffset
+        @intFromEnum(OpCode.PUSH1), 0, // value
+        @intFromEnum(OpCode.PUSH1), 0xdd, // address
+        @intFromEnum(OpCode.PUSH2), 0x27, 0x10, // gas
+        @intFromEnum(OpCode.CALL),
+        @intFromEnum(OpCode.STOP),
+    };
+
+    var existing_state = State.init(std.testing.allocator);
+    defer existing_state.deinit();
+    try existing_state.setBalance(0xdd, 0);
+    var existing_interp = try Interpreter.initCall(std.testing.allocator, &caller_code, 1_000_000, .{
+        .address = 0xaa,
+        .state = &existing_state,
+        .block = .{ .fork = .spurious_dragon },
+    });
+    defer existing_interp.deinit();
+    try existing_interp.run();
+
+    var new_state = State.init(std.testing.allocator);
+    defer new_state.deinit();
+    var new_interp = try Interpreter.initCall(std.testing.allocator, &caller_code, 1_000_000, .{
+        .address = 0xaa,
+        .state = &new_state,
+        .block = .{ .fork = .spurious_dragon },
+    });
+    defer new_interp.deinit();
+    try new_interp.run();
+
+    try std.testing.expectEqual(Status.stopped, existing_interp.status);
+    try std.testing.expectEqual(Status.stopped, new_interp.status);
+    try std.testing.expectEqual(existing_interp.gas_remaining, new_interp.gas_remaining);
+}
+
+test "from Spurious Dragon on, a value-transferring CALL to an existing-but-empty address still pays the new-account surcharge" {
+    // caller: CALL(gas=10000, addr=0xdd, value=100, argsOffset=0, argsSize=0, retOffset=0, retSize=0)
+    const caller_code = [_]u8{
+        @intFromEnum(OpCode.PUSH1), 0, // retSize
+        @intFromEnum(OpCode.PUSH1), 0, // retOffset
+        @intFromEnum(OpCode.PUSH1), 0, // argsSize
+        @intFromEnum(OpCode.PUSH1), 0, // argsOffset
+        @intFromEnum(OpCode.PUSH1), 100, // value
+        @intFromEnum(OpCode.PUSH1), 0xdd, // address
+        @intFromEnum(OpCode.PUSH2), 0x27, 0x10, // gas
+        @intFromEnum(OpCode.CALL),
+        @intFromEnum(OpCode.STOP),
+    };
+
+    // Baseline: 0xdd already alive (nonzero balance), so no surcharge.
+    var alive_state = State.init(std.testing.allocator);
+    defer alive_state.deinit();
+    try alive_state.setBalance(0xaa, 1000);
+    try alive_state.setBalance(0xdd, 1);
+    var alive_interp = try Interpreter.initCall(std.testing.allocator, &caller_code, 1_000_000, .{
+        .address = 0xaa,
+        .state = &alive_state,
+        .block = .{ .fork = .spurious_dragon },
+    });
+    defer alive_interp.deinit();
+    try alive_interp.run();
+
+    // 0xdd exists but is empty (a zero-balance shell, e.g. from an earlier
+    // zero-value touch): `isAlive` is false, so the surcharge still
+    // applies, unlike pre-161's plain `exists` check.
+    var empty_state = State.init(std.testing.allocator);
+    defer empty_state.deinit();
+    try empty_state.setBalance(0xaa, 1000);
+    try empty_state.setBalance(0xdd, 0);
+    var empty_interp = try Interpreter.initCall(std.testing.allocator, &caller_code, 1_000_000, .{
+        .address = 0xaa,
+        .state = &empty_state,
+        .block = .{ .fork = .spurious_dragon },
+    });
+    defer empty_interp.deinit();
+    try empty_interp.run();
+
+    try std.testing.expectEqual(Status.stopped, alive_interp.status);
+    try std.testing.expectEqual(Status.stopped, empty_interp.status);
+    try std.testing.expectEqual(
+        gas.call_new_account,
+        alive_interp.gas_remaining - empty_interp.gas_remaining,
+    );
+}
+
 test "DELEGATECALL preserves the caller's own address, caller, and value" {
     // target: returns ADDRESS, CALLER, CALLVALUE as three consecutive words.
     const target_code = [_]u8{
@@ -1848,6 +2623,7 @@ test "DELEGATECALL preserves the caller's own address, caller, and value" {
         .caller = 0xbb,
         .value = 777,
         .state = &state,
+        .block = .{ .fork = .homestead },
     });
     defer interp.deinit();
     try interp.run();
@@ -1856,6 +2632,31 @@ test "DELEGATECALL preserves the caller's own address, caller, and value" {
     try std.testing.expectEqual(@as(u256, 0xaa), try interp.memory.readWord(0));
     try std.testing.expectEqual(@as(u256, 0xbb), try interp.memory.readWord(32));
     try std.testing.expectEqual(@as(u256, 777), try interp.memory.readWord(64));
+}
+
+test "DELEGATECALL before Homestead halts as invalid_opcode" {
+    var state = State.init(std.testing.allocator);
+    defer state.deinit();
+    try state.setCode(0xdd, &.{@intFromEnum(OpCode.STOP)});
+
+    const caller_code = [_]u8{
+        @intFromEnum(OpCode.PUSH1), 0, // retSize
+        @intFromEnum(OpCode.PUSH1), 0, // retOffset
+        @intFromEnum(OpCode.PUSH1), 0, // argsSize
+        @intFromEnum(OpCode.PUSH1), 0, // argsOffset
+        @intFromEnum(OpCode.PUSH1), 0xdd, // address
+        @intFromEnum(OpCode.PUSH2), 0x27, 0x10, // gas
+        @intFromEnum(OpCode.DELEGATECALL),
+    };
+
+    var interp = try Interpreter.initCall(std.testing.allocator, &caller_code, 1_000_000, .{
+        .address = 0xaa,
+        .state = &state,
+    });
+    defer interp.deinit();
+    try interp.run();
+
+    try std.testing.expectEqual(Status.invalid_opcode, interp.status);
 }
 
 test "a value-transferring CALL nested inside a STATICCALL is rejected" {
@@ -1891,12 +2692,31 @@ test "a value-transferring CALL nested inside a STATICCALL is rejected" {
     var interp = try Interpreter.initCall(std.testing.allocator, &caller_code, 1_000_000, .{
         .address = 0xaa,
         .state = &state,
+        .block = .{ .fork = .byzantium }, // STATICCALL is Byzantium-only (EIP-214).
     });
     defer interp.deinit();
     try interp.run();
 
     try std.testing.expectEqual(Status.stopped, interp.status);
     try std.testing.expectEqual(@as(u256, 0), try interp.stack.pop());
+}
+
+test "STATICCALL is invalid before Byzantium" {
+    const code = [_]u8{
+        @intFromEnum(OpCode.PUSH1), 0,
+        @intFromEnum(OpCode.PUSH1), 0,
+        @intFromEnum(OpCode.PUSH1), 0,
+        @intFromEnum(OpCode.PUSH1), 0,
+        @intFromEnum(OpCode.PUSH1), 0xdd,
+        @intFromEnum(OpCode.PUSH2), 0x27, 0x10,
+        @intFromEnum(OpCode.STATICCALL),
+    };
+
+    var interp = try Interpreter.initCall(std.testing.allocator, &code, 1_000_000, .{});
+    defer interp.deinit();
+    try interp.run();
+
+    try std.testing.expectEqual(Status.invalid_opcode, interp.status);
 }
 
 test "REVERT inside a CALL rolls back the value transfer that led to it" {
@@ -1992,6 +2812,150 @@ test "CALL with insufficient balance fails without transferring or executing" {
     try std.testing.expectEqual(@as(u256, 0), state.getBalance(0xcc));
 }
 
+test "a CALL requesting more gas than the caller has left fails outright, not capped" {
+    // callee: trivial, would succeed if ever reached.
+    const callee_code = [_]u8{@intFromEnum(OpCode.STOP)};
+    var state = State.init(std.testing.allocator);
+    defer state.deinit();
+    try state.setCode(0xcc, &callee_code);
+
+    // caller: CALL(gas=1_000_000, addr=0xcc, value=0, argsOffset=0, argsSize=0, retOffset=0, retSize=0)
+    // with far too little gas of its own to cover that request.
+    const caller_code = [_]u8{
+        @intFromEnum(OpCode.PUSH1), 0, // retSize
+        @intFromEnum(OpCode.PUSH1), 0, // retOffset
+        @intFromEnum(OpCode.PUSH1), 0, // argsSize
+        @intFromEnum(OpCode.PUSH1), 0, // argsOffset
+        @intFromEnum(OpCode.PUSH1), 0, // value
+        @intFromEnum(OpCode.PUSH1), 0xcc, // address
+        @intFromEnum(OpCode.PUSH3), 0x0f, 0x42, 0x40, // gas = 1,000,000
+        @intFromEnum(OpCode.CALL),
+        @intFromEnum(OpCode.STOP),
+    };
+
+    var interp = try Interpreter.initCall(std.testing.allocator, &caller_code, 10_000, .{
+        .address = 0xaa,
+        .state = &state,
+    });
+    defer interp.deinit();
+    try interp.run();
+
+    // execution-specs' `calculate_message_call_gas` (Frontier/Homestead)
+    // charges `base + the full requested gas value (uncapped) +
+    // surcharges` as one static cost, hard-failing the whole frame if
+    // that's unaffordable — it does not silently cap the forwarded amount
+    // to whatever's left. That capping is EIP-150 behavior, introduced
+    // later, not something Frontier or Homestead ever did.
+    try std.testing.expectEqual(Status.out_of_gas, interp.status);
+}
+
+test "from Tangerine Whistle on, a CALL requesting more gas than available is capped at 63/64ths, not failed" {
+    // callee: trivial, succeeds immediately either way.
+    const callee_code = [_]u8{@intFromEnum(OpCode.STOP)};
+    var state = State.init(std.testing.allocator);
+    defer state.deinit();
+    try state.setCode(0xcc, &callee_code);
+
+    // Same setup as the pre-150 hard-fail test above: caller has only
+    // 10,000 gas but requests 1,000,000 for the CALL.
+    const caller_code = [_]u8{
+        @intFromEnum(OpCode.PUSH1), 0, // retSize
+        @intFromEnum(OpCode.PUSH1), 0, // retOffset
+        @intFromEnum(OpCode.PUSH1), 0, // argsSize
+        @intFromEnum(OpCode.PUSH1), 0, // argsOffset
+        @intFromEnum(OpCode.PUSH1), 0, // value
+        @intFromEnum(OpCode.PUSH1), 0xcc, // address
+        @intFromEnum(OpCode.PUSH3), 0x0f, 0x42, 0x40, // gas = 1,000,000
+        @intFromEnum(OpCode.CALL),
+        @intFromEnum(OpCode.STOP),
+    };
+
+    var interp = try Interpreter.initCall(std.testing.allocator, &caller_code, 10_000, .{
+        .address = 0xaa,
+        .state = &state,
+        .block = .{ .fork = .tangerine_whistle },
+    });
+    defer interp.deinit();
+    try interp.run();
+
+    try std.testing.expectEqual(Status.stopped, interp.status);
+    try std.testing.expectEqual(@as(u256, 1), try interp.stack.pop());
+}
+
+test "from Tangerine Whistle on, a requested-gas value too large to fit a u64 is capped, not an immediate out-of-gas" {
+    // A real, observed mainnet pattern: a contract computes the gas to
+    // forward via unchecked subtraction (e.g. `msg.gas() - N`), which
+    // wraps around near 2^256 if it underflows. execution-specs'
+    // `min(gas, max_message_call_gas(...))` uses Python's
+    // arbitrary-precision integers, so this is just another oversized
+    // request the 63/64ths cap reduces to something affordable — pre-150
+    // treats the very same u64-overflow as an immediate hard failure
+    // instead (see the sibling "fails outright, not capped" test), but
+    // that rule doesn't carry over here.
+    const callee_code = [_]u8{@intFromEnum(OpCode.STOP)};
+    var state = State.init(std.testing.allocator);
+    defer state.deinit();
+    try state.setCode(0xcc, &callee_code);
+
+    const caller_code = [_]u8{
+        @intFromEnum(OpCode.PUSH1), 0, // retSize
+        @intFromEnum(OpCode.PUSH1), 0, // retOffset
+        @intFromEnum(OpCode.PUSH1), 0, // argsSize
+        @intFromEnum(OpCode.PUSH1), 0, // argsOffset
+        @intFromEnum(OpCode.PUSH1), 0, // value
+        @intFromEnum(OpCode.PUSH1), 0xcc, // address
+        @intFromEnum(OpCode.PUSH32),
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, // gas = 2^256 - 1
+        @intFromEnum(OpCode.CALL),
+        @intFromEnum(OpCode.STOP),
+    };
+
+    var interp = try Interpreter.initCall(std.testing.allocator, &caller_code, 10_000, .{
+        .address = 0xaa,
+        .state = &state,
+        .block = .{ .fork = .tangerine_whistle },
+    });
+    defer interp.deinit();
+    try interp.run();
+
+    try std.testing.expectEqual(Status.stopped, interp.status);
+    try std.testing.expectEqual(@as(u256, 1), try interp.stack.pop());
+}
+
+test "from Tangerine Whistle on, a CALL still fails outright if even its static cost is unaffordable" {
+    const callee_code = [_]u8{@intFromEnum(OpCode.STOP)};
+    var state = State.init(std.testing.allocator);
+    defer state.deinit();
+    try state.setCode(0xcc, &callee_code);
+
+    // caller: CALL(gas=0, addr=0xcc, ...) but doesn't even have the 700
+    // gas call_base_150 requires.
+    const caller_code = [_]u8{
+        @intFromEnum(OpCode.PUSH1), 0, // retSize
+        @intFromEnum(OpCode.PUSH1), 0, // retOffset
+        @intFromEnum(OpCode.PUSH1), 0, // argsSize
+        @intFromEnum(OpCode.PUSH1), 0, // argsOffset
+        @intFromEnum(OpCode.PUSH1), 0, // value
+        @intFromEnum(OpCode.PUSH1), 0xcc, // address
+        @intFromEnum(OpCode.PUSH1), 0, // gas
+        @intFromEnum(OpCode.CALL),
+        @intFromEnum(OpCode.STOP),
+    };
+
+    var interp = try Interpreter.initCall(std.testing.allocator, &caller_code, 100, .{
+        .address = 0xaa,
+        .state = &state,
+        .block = .{ .fork = .tangerine_whistle },
+    });
+    defer interp.deinit();
+    try interp.run();
+
+    try std.testing.expectEqual(Status.out_of_gas, interp.status);
+}
+
 test "CREATE2 address derivation is deterministic and depends on the salt" {
     const addr1 = create2Address(0xaa, 1, "code");
     const addr2 = create2Address(0xaa, 1, "code");
@@ -2049,6 +3013,318 @@ test "CREATE deploys the init code's returned bytes as the new account's code" {
     try std.testing.expectEqual(@as(u64, 1), state.get(0xaa).nonce);
 }
 
+test "nested CREATE forwards all remaining gas pre-150, only 63/64ths from Tangerine Whistle" {
+    // init code: an infinite loop (JUMPDEST, PUSH1 0, JUMP) that only ever
+    // halts by running out of whatever gas it's given — isolates exactly
+    // how much was forwarded, since an out-of-gas child returns nothing.
+    const init_code = [_]u8{
+        @intFromEnum(OpCode.JUMPDEST),
+        @intFromEnum(OpCode.PUSH1), 0,
+        @intFromEnum(OpCode.JUMP),
+    };
+
+    var caller_code: std.ArrayList(u8) = .empty;
+    defer caller_code.deinit(std.testing.allocator);
+    try caller_code.append(std.testing.allocator, @intFromEnum(OpCode.PUSH4));
+    try caller_code.appendSlice(std.testing.allocator, &init_code);
+    try caller_code.appendSlice(std.testing.allocator, &.{
+        @intFromEnum(OpCode.PUSH1), 0,
+        @intFromEnum(OpCode.MSTORE),
+        @intFromEnum(OpCode.PUSH1), 4, // size
+        @intFromEnum(OpCode.PUSH1), 28, // offset (32 - 4)
+        @intFromEnum(OpCode.PUSH1), 0, // value
+        @intFromEnum(OpCode.CREATE),
+        @intFromEnum(OpCode.STOP),
+    });
+
+    const gas_limit: u64 = 1_000_000;
+
+    var frontier_state = State.init(std.testing.allocator);
+    defer frontier_state.deinit();
+    var frontier_interp = try Interpreter.initCall(std.testing.allocator, caller_code.items, gas_limit, .{
+        .address = 0xaa,
+        .state = &frontier_state,
+    });
+    defer frontier_interp.deinit();
+    try frontier_interp.run();
+
+    var tw_state = State.init(std.testing.allocator);
+    defer tw_state.deinit();
+    var tw_interp = try Interpreter.initCall(std.testing.allocator, caller_code.items, gas_limit, .{
+        .address = 0xaa,
+        .state = &tw_state,
+        .block = .{ .fork = .tangerine_whistle },
+    });
+    defer tw_interp.deinit();
+    try tw_interp.run();
+
+    try std.testing.expectEqual(Status.stopped, frontier_interp.status);
+    try std.testing.expectEqual(Status.stopped, tw_interp.status);
+
+    // Everything before CREATE itself: PUSH4/PUSH1/MSTORE/PUSH1/PUSH1/PUSH1,
+    // six verylow-tier ops, plus MSTORE's own memory expansion to fit the
+    // 32-byte word (CREATE's [28, 32) read is already covered by then).
+    const prefix_cost = gas.verylow * 6 + gas.memoryExpansionCost(0, 0, 32);
+    const static_cost = prefix_cost + gas.create_base;
+    const available_after_static = gas_limit - static_cost;
+
+    // Pre-150 forwards *everything* left after static costs, so nothing
+    // comes back from the never-ending child; Tangerine Whistle reserves
+    // 1/64th for the caller instead, which shows up directly as extra
+    // gas_remaining once the (identical) static/prefix costs cancel out.
+    try std.testing.expectEqual(
+        available_after_static / 64,
+        tw_interp.gas_remaining - frontier_interp.gas_remaining,
+    );
+}
+
+/// Init code that returns 5000 bytes (all zero) of "runtime code" — its
+/// code-deposit cost (200 gas/byte = 1,000,000 gas) is deliberately far
+/// beyond what a modest gas budget can afford, to exercise the
+/// insufficient-deposit-gas fork branch below without needing to hit an
+/// exact gas boundary.
+fn bigReturnInitCode() [12]u8 {
+    return .{
+        @intFromEnum(OpCode.PUSH1), 0, // value
+        @intFromEnum(OpCode.PUSH2), 0x13, 0x87, // offset = 4999
+        @intFromEnum(OpCode.MSTORE8),
+        @intFromEnum(OpCode.PUSH2), 0x13, 0x88, // size = 5000
+        @intFromEnum(OpCode.PUSH1), 0, // offset = 0
+        @intFromEnum(OpCode.RETURN),
+    };
+}
+
+fn buildCreateCaller(allocator: std.mem.Allocator, init_code: [12]u8) !std.ArrayList(u8) {
+    var caller_code: std.ArrayList(u8) = .empty;
+    try caller_code.append(allocator, @intFromEnum(OpCode.PUSH12));
+    try caller_code.appendSlice(allocator, &init_code);
+    try caller_code.appendSlice(allocator, &.{
+        @intFromEnum(OpCode.PUSH1), 0,
+        @intFromEnum(OpCode.MSTORE),
+        @intFromEnum(OpCode.PUSH1), 12, // size
+        @intFromEnum(OpCode.PUSH1), 20, // offset (32 - 12)
+        @intFromEnum(OpCode.PUSH1), 0, // value
+        @intFromEnum(OpCode.CREATE),
+        @intFromEnum(OpCode.STOP),
+    });
+    return caller_code;
+}
+
+test "CREATE with insufficient deposit gas still succeeds on Frontier, with no code stored" {
+    const init_code = bigReturnInitCode();
+    var caller_code = try buildCreateCaller(std.testing.allocator, init_code);
+    defer caller_code.deinit(std.testing.allocator);
+
+    var state = State.init(std.testing.allocator);
+    defer state.deinit();
+
+    const new_address = try Interpreter.createAddress(std.testing.allocator, 0xaa, 0);
+
+    var interp = try Interpreter.initCall(std.testing.allocator, caller_code.items, 50_000, .{
+        .address = 0xaa,
+        .state = &state,
+        .block = .{ .fork = .frontier },
+    });
+    defer interp.deinit();
+    try interp.run();
+
+    try std.testing.expectEqual(Status.stopped, interp.status);
+    try std.testing.expectEqual(@as(u256, new_address), try interp.stack.pop());
+    try std.testing.expect(state.exists(new_address));
+    try std.testing.expectEqualSlices(u8, &.{}, state.getCode(new_address));
+}
+
+test "CREATE with insufficient deposit gas fails entirely on Homestead" {
+    const init_code = bigReturnInitCode();
+    var caller_code = try buildCreateCaller(std.testing.allocator, init_code);
+    defer caller_code.deinit(std.testing.allocator);
+
+    var state = State.init(std.testing.allocator);
+    defer state.deinit();
+
+    const new_address = try Interpreter.createAddress(std.testing.allocator, 0xaa, 0);
+
+    var interp = try Interpreter.initCall(std.testing.allocator, caller_code.items, 50_000, .{
+        .address = 0xaa,
+        .state = &state,
+        .block = .{ .fork = .homestead },
+    });
+    defer interp.deinit();
+    try interp.run();
+
+    try std.testing.expectEqual(Status.stopped, interp.status);
+    try std.testing.expectEqual(@as(u256, 0), try interp.stack.pop());
+    try std.testing.expect(!state.exists(new_address));
+}
+
+test "a failed CREATE still consumes the creator's nonce, so its next CREATE lands at a different address" {
+    const init_code = bigReturnInitCode(); // returns 5000 bytes; deposit cost unaffordable
+    var caller_code = try buildCreateCaller(std.testing.allocator, init_code);
+    defer caller_code.deinit(std.testing.allocator);
+
+    var state = State.init(std.testing.allocator);
+    defer state.deinit();
+    try state.setNonce(0xaa, 7);
+
+    var interp = try Interpreter.initCall(std.testing.allocator, caller_code.items, 50_000, .{
+        .address = 0xaa,
+        .state = &state,
+        .block = .{ .fork = .byzantium },
+    });
+    defer interp.deinit();
+    try interp.run();
+
+    // The create itself failed (0 pushed, no account stored)...
+    try std.testing.expectEqual(Status.stopped, interp.status);
+    try std.testing.expectEqual(@as(u256, 0), try interp.stack.pop());
+    // ...but the nonce it consumed is *not* rolled back with the rest of
+    // the child's state, matching execution-specs' `create`: the increment
+    // happens before the child's snapshot begins. Real chain relies on
+    // this — a factory whose nonce lags by one derives a different address
+    // for every later CREATE.
+    try std.testing.expectEqual(@as(u64, 8), state.get(0xaa).nonce);
+}
+
+test "a CREATE that can't afford its endowment leaves the creator's nonce alone" {
+    const init_code = bigReturnInitCode();
+    var caller_code: std.ArrayList(u8) = .empty;
+    defer caller_code.deinit(std.testing.allocator);
+    try caller_code.append(std.testing.allocator, @intFromEnum(OpCode.PUSH12));
+    try caller_code.appendSlice(std.testing.allocator, &init_code);
+    try caller_code.appendSlice(std.testing.allocator, &.{
+        @intFromEnum(OpCode.PUSH1), 0,
+        @intFromEnum(OpCode.MSTORE),
+        @intFromEnum(OpCode.PUSH1), 12, // size
+        @intFromEnum(OpCode.PUSH1), 20, // offset (32 - 12)
+        @intFromEnum(OpCode.PUSH1), 99, // value: more than the creator has
+        @intFromEnum(OpCode.CREATE),
+        @intFromEnum(OpCode.STOP),
+    });
+
+    var state = State.init(std.testing.allocator);
+    defer state.deinit();
+    try state.setNonce(0xaa, 7);
+    try state.setBalance(0xaa, 1); // short of the 99 endowment
+
+    var interp = try Interpreter.initCall(std.testing.allocator, caller_code.items, 200_000, .{
+        .address = 0xaa,
+        .state = &state,
+        .block = .{ .fork = .byzantium },
+    });
+    defer interp.deinit();
+    try interp.run();
+
+    try std.testing.expectEqual(Status.stopped, interp.status);
+    try std.testing.expectEqual(@as(u256, 0), try interp.stack.pop());
+    // Unlike the failed-init-code case above, the endowment check bails
+    // out *before* the nonce is touched at all.
+    try std.testing.expectEqual(@as(u64, 7), state.get(0xaa).nonce);
+}
+
+test "CREATE failing on insufficient deposit gas clears RETURNDATASIZE, not exposing the deployed code it couldn't afford to store" {
+    const init_code = bigReturnInitCode();
+    var caller_code: std.ArrayList(u8) = .empty;
+    defer caller_code.deinit(std.testing.allocator);
+    try caller_code.append(std.testing.allocator, @intFromEnum(OpCode.PUSH12));
+    try caller_code.appendSlice(std.testing.allocator, &init_code);
+    try caller_code.appendSlice(std.testing.allocator, &.{
+        @intFromEnum(OpCode.PUSH1), 0,
+        @intFromEnum(OpCode.MSTORE),
+        @intFromEnum(OpCode.PUSH1), 12, // size
+        @intFromEnum(OpCode.PUSH1), 20, // offset (32 - 12)
+        @intFromEnum(OpCode.PUSH1), 0, // value
+        @intFromEnum(OpCode.CREATE),
+        @intFromEnum(OpCode.POP), // discard CREATE's own result (0, since it failed)
+        @intFromEnum(OpCode.RETURNDATASIZE),
+        @intFromEnum(OpCode.STOP),
+    });
+
+    var state = State.init(std.testing.allocator);
+    defer state.deinit();
+
+    // Tangerine Whistle on (not Homestead, unlike the sibling test above):
+    // Homestead-era `CREATE` forwards *all* remaining gas to the child,
+    // leaving nothing for this test's own follow-up opcodes regardless of
+    // how large a budget it's given — EIP-150's 63/64ths reservation is
+    // what leaves the caller anything to work with after an all-gas-forfeiting
+    // failure like this one.
+    var interp = try Interpreter.initCall(std.testing.allocator, caller_code.items, 50_000, .{
+        .address = 0xaa,
+        .state = &state,
+        .block = .{ .fork = .byzantium },
+    });
+    defer interp.deinit();
+    try interp.run();
+
+    try std.testing.expectEqual(Status.stopped, interp.status);
+    try std.testing.expectEqual(@as(u256, 0), try interp.stack.pop());
+}
+
+/// Init code that RETURNs `max_code_size + 1` bytes read straight out of
+/// never-written (so all-zero) memory — no need to actually fill that much
+/// memory, just to charge for expanding into it and return the range.
+fn oversizedReturnInitCode() [6]u8 {
+    return .{
+        @intFromEnum(OpCode.PUSH2), 0x60, 0x01, // size = 24577 (max_code_size + 1)
+        @intFromEnum(OpCode.PUSH1), 0, // offset = 0
+        @intFromEnum(OpCode.RETURN),
+    };
+}
+
+fn buildOversizedCreateCaller(allocator: std.mem.Allocator, init_code: [6]u8) !std.ArrayList(u8) {
+    var caller_code: std.ArrayList(u8) = .empty;
+    try caller_code.append(allocator, @intFromEnum(OpCode.PUSH6));
+    try caller_code.appendSlice(allocator, &init_code);
+    try caller_code.appendSlice(allocator, &.{
+        @intFromEnum(OpCode.PUSH1), 0,
+        @intFromEnum(OpCode.MSTORE),
+        @intFromEnum(OpCode.PUSH1), 6, // size
+        @intFromEnum(OpCode.PUSH1), 26, // offset (32 - 6)
+        @intFromEnum(OpCode.PUSH1), 0, // value
+        @intFromEnum(OpCode.CREATE),
+        @intFromEnum(OpCode.STOP),
+    });
+    return caller_code;
+}
+
+test "nested CREATE rejects code over max_code_size from Spurious Dragon on, not before" {
+    const init_code = oversizedReturnInitCode();
+    var caller_code = try buildOversizedCreateCaller(std.testing.allocator, init_code);
+    defer caller_code.deinit(std.testing.allocator);
+
+    const new_address = try Interpreter.createAddress(std.testing.allocator, 0xaa, 0);
+
+    // Pre-Spurious-Dragon: no limit at all, the oversized code is stored.
+    var tw_state = State.init(std.testing.allocator);
+    defer tw_state.deinit();
+    var tw_interp = try Interpreter.initCall(std.testing.allocator, caller_code.items, 10_000_000, .{
+        .address = 0xaa,
+        .state = &tw_state,
+        .block = .{ .fork = .tangerine_whistle },
+    });
+    defer tw_interp.deinit();
+    try tw_interp.run();
+
+    try std.testing.expectEqual(Status.stopped, tw_interp.status);
+    try std.testing.expectEqual(@as(u256, new_address), try tw_interp.stack.pop());
+    try std.testing.expectEqual(@as(usize, 24577), tw_state.getCode(new_address).len);
+
+    // From Spurious Dragon on: an exceptional halt, nothing stored.
+    var sd_state = State.init(std.testing.allocator);
+    defer sd_state.deinit();
+    var sd_interp = try Interpreter.initCall(std.testing.allocator, caller_code.items, 10_000_000, .{
+        .address = 0xaa,
+        .state = &sd_state,
+        .block = .{ .fork = .spurious_dragon },
+    });
+    defer sd_interp.deinit();
+    try sd_interp.run();
+
+    try std.testing.expectEqual(Status.stopped, sd_interp.status);
+    try std.testing.expectEqual(@as(u256, 0), try sd_interp.stack.pop());
+    try std.testing.expect(!sd_state.exists(new_address));
+}
+
 test "SSTORE then SLOAD round-trips within the same execution" {
     const code = [_]u8{
         @intFromEnum(OpCode.PUSH1), 42,
@@ -2071,6 +3347,40 @@ test "SSTORE then SLOAD round-trips within the same execution" {
     try std.testing.expectEqual(Status.stopped, interp.status);
     try std.testing.expectEqual(@as(u256, 42), try interp.stack.pop());
     try std.testing.expectEqual(@as(u256, 42), state.getStorage(0xaa, 1));
+}
+
+test "SLOAD costs more from Tangerine Whistle on" {
+    const code = [_]u8{
+        @intFromEnum(OpCode.PUSH1), 1,
+        @intFromEnum(OpCode.SLOAD),
+        @intFromEnum(OpCode.STOP),
+    };
+
+    var frontier_state = State.init(std.testing.allocator);
+    defer frontier_state.deinit();
+    var frontier_interp = try Interpreter.initCall(std.testing.allocator, &code, 1_000_000, .{
+        .address = 0xaa,
+        .state = &frontier_state,
+    });
+    defer frontier_interp.deinit();
+    try frontier_interp.run();
+
+    var tw_state = State.init(std.testing.allocator);
+    defer tw_state.deinit();
+    var tw_interp = try Interpreter.initCall(std.testing.allocator, &code, 1_000_000, .{
+        .address = 0xaa,
+        .state = &tw_state,
+        .block = .{ .fork = .tangerine_whistle },
+    });
+    defer tw_interp.deinit();
+    try tw_interp.run();
+
+    try std.testing.expectEqual(Status.stopped, frontier_interp.status);
+    try std.testing.expectEqual(Status.stopped, tw_interp.status);
+    try std.testing.expectEqual(
+        gas.sload_150 - gas.sload,
+        frontier_interp.gas_remaining - tw_interp.gas_remaining,
+    );
 }
 
 test "SSTORE clearing a nonzero slot to zero accumulates a refund" {
@@ -2236,6 +3546,7 @@ test "SSTORE inside a STATICCALL is rejected" {
     var interp = try Interpreter.initCall(std.testing.allocator, &caller_code, 1_000_000, .{
         .address = 0xaa,
         .state = &state,
+        .block = .{ .fork = .byzantium }, // STATICCALL is Byzantium-only (EIP-214).
     });
     defer interp.deinit();
     try interp.run();
@@ -2337,6 +3648,39 @@ test "BALANCE reads another account's balance" {
     try std.testing.expectEqual(@as(u256, 555), try interp.stack.pop());
 }
 
+test "BALANCE costs more from Tangerine Whistle on" {
+    const code = [_]u8{
+        @intFromEnum(OpCode.PUSH1), 0xbb,
+        @intFromEnum(OpCode.BALANCE),
+        @intFromEnum(OpCode.STOP),
+    };
+    var state = State.init(std.testing.allocator);
+    defer state.deinit();
+    try state.setBalance(0xbb, 555);
+
+    var frontier_interp = try Interpreter.initCall(std.testing.allocator, &code, 1_000_000, .{
+        .address = 0xaa,
+        .state = &state,
+    });
+    defer frontier_interp.deinit();
+    try frontier_interp.run();
+
+    var tw_interp = try Interpreter.initCall(std.testing.allocator, &code, 1_000_000, .{
+        .address = 0xaa,
+        .state = &state,
+        .block = .{ .fork = .tangerine_whistle },
+    });
+    defer tw_interp.deinit();
+    try tw_interp.run();
+
+    try std.testing.expectEqual(Status.stopped, frontier_interp.status);
+    try std.testing.expectEqual(Status.stopped, tw_interp.status);
+    try std.testing.expectEqual(
+        gas.balance_150 - gas.balance,
+        frontier_interp.gas_remaining - tw_interp.gas_remaining,
+    );
+}
+
 test "ORIGIN pushes the transaction's original sender, not the immediate caller" {
     const code = [_]u8{ @intFromEnum(OpCode.ORIGIN), @intFromEnum(OpCode.STOP) };
     var interp = try Interpreter.initCall(std.testing.allocator, &code, 1_000_000, .{
@@ -2410,6 +3754,39 @@ test "EXTCODESIZE reads another account's code length" {
     try std.testing.expectEqual(@as(u256, 3), try interp.stack.pop());
 }
 
+test "EXTCODESIZE costs more from Tangerine Whistle on" {
+    const code = [_]u8{
+        @intFromEnum(OpCode.PUSH1), 0xbb,
+        @intFromEnum(OpCode.EXTCODESIZE),
+        @intFromEnum(OpCode.STOP),
+    };
+    var state = State.init(std.testing.allocator);
+    defer state.deinit();
+    try state.setCode(0xbb, &.{ 1, 2, 3 });
+
+    var frontier_interp = try Interpreter.initCall(std.testing.allocator, &code, 1_000_000, .{
+        .address = 0xaa,
+        .state = &state,
+    });
+    defer frontier_interp.deinit();
+    try frontier_interp.run();
+
+    var tw_interp = try Interpreter.initCall(std.testing.allocator, &code, 1_000_000, .{
+        .address = 0xaa,
+        .state = &state,
+        .block = .{ .fork = .tangerine_whistle },
+    });
+    defer tw_interp.deinit();
+    try tw_interp.run();
+
+    try std.testing.expectEqual(Status.stopped, frontier_interp.status);
+    try std.testing.expectEqual(Status.stopped, tw_interp.status);
+    try std.testing.expectEqual(
+        gas.extcode_150 - gas.extcode,
+        frontier_interp.gas_remaining - tw_interp.gas_remaining,
+    );
+}
+
 test "EXTCODECOPY copies another account's code into memory" {
     const code = [_]u8{
         @intFromEnum(OpCode.PUSH1), 3, // size
@@ -2448,6 +3825,7 @@ test "EXTCODEHASH is 0 for an account that's never been touched" {
     var interp = try Interpreter.initCall(std.testing.allocator, &code, 1_000_000, .{
         .address = 0xaa,
         .state = &state,
+        .block = .{ .fork = .constantinople },
     });
     defer interp.deinit();
     try interp.run();
@@ -2468,11 +3846,37 @@ test "EXTCODEHASH of an existing account is keccak256 of its code" {
     var interp = try Interpreter.initCall(std.testing.allocator, &code, 1_000_000, .{
         .address = 0xaa,
         .state = &state,
+        .block = .{ .fork = .constantinople },
     });
     defer interp.deinit();
     try interp.run();
 
     try std.testing.expectEqual(keccak256(&.{ 1, 2, 3 }), try interp.stack.pop());
+}
+
+test "EXTCODEHASH is invalid before Constantinople" {
+    const code = [_]u8{
+        @intFromEnum(OpCode.PUSH1), 0xbb,
+        @intFromEnum(OpCode.EXTCODEHASH),
+    };
+    var interp = try Interpreter.init(std.testing.allocator, &code, 1_000_000);
+    defer interp.deinit();
+    try interp.run();
+    try std.testing.expectEqual(Status.invalid_opcode, interp.status);
+}
+
+test "CREATE2 is invalid before Constantinople" {
+    const code = [_]u8{
+        @intFromEnum(OpCode.PUSH1), 0,
+        @intFromEnum(OpCode.PUSH1), 0,
+        @intFromEnum(OpCode.PUSH1), 0,
+        @intFromEnum(OpCode.PUSH1), 0,
+        @intFromEnum(OpCode.CREATE2),
+    };
+    var interp = try Interpreter.init(std.testing.allocator, &code, 1_000_000);
+    defer interp.deinit();
+    try interp.run();
+    try std.testing.expectEqual(Status.invalid_opcode, interp.status);
 }
 
 test "BLOCKHASH looks up a recent block's hash from recent_hashes" {
@@ -2554,12 +3958,22 @@ test "RETURNDATASIZE returns the last CALL's output length" {
     var interp = try Interpreter.initCall(std.testing.allocator, &caller_code, 1_000_000, .{
         .address = 0xaa,
         .state = &state,
+        .block = .{ .fork = .byzantium }, // RETURNDATASIZE is Byzantium-only (EIP-211).
     });
     defer interp.deinit();
     try interp.run();
 
     try std.testing.expectEqual(Status.stopped, interp.status);
     try std.testing.expectEqual(@as(u256, 4), try interp.stack.pop());
+}
+
+test "RETURNDATASIZE is invalid before Byzantium" {
+    const code = [_]u8{@intFromEnum(OpCode.RETURNDATASIZE)};
+    var interp = try Interpreter.init(std.testing.allocator, &code, 1_000_000);
+    defer interp.deinit();
+    try interp.run();
+
+    try std.testing.expectEqual(Status.invalid_opcode, interp.status);
 }
 
 test "RETURNDATACOPY copies the last CALL's output into memory" {
@@ -2595,6 +4009,7 @@ test "RETURNDATACOPY copies the last CALL's output into memory" {
     var interp = try Interpreter.initCall(std.testing.allocator, &caller_code, 1_000_000, .{
         .address = 0xaa,
         .state = &state,
+        .block = .{ .fork = .byzantium }, // RETURNDATACOPY is Byzantium-only (EIP-211).
     });
     defer interp.deinit();
     try interp.run();
@@ -2605,11 +4020,11 @@ test "RETURNDATACOPY copies the last CALL's output into memory" {
     try std.testing.expectEqualSlices(u8, &.{ 0xde, 0xad, 0xbe, 0xef }, word_bytes[0..4]);
 }
 
-test "RETURNDATACOPY reading past the last call's output is invalid" {
+test "RETURNDATACOPY is invalid before Byzantium" {
     const code = [_]u8{
-        @intFromEnum(OpCode.PUSH1), 1, // size: nothing has been called yet, so any size is out of bounds
-        @intFromEnum(OpCode.PUSH1), 0, // offset
-        @intFromEnum(OpCode.PUSH1), 0, // dest
+        @intFromEnum(OpCode.PUSH1), 0,
+        @intFromEnum(OpCode.PUSH1), 0,
+        @intFromEnum(OpCode.PUSH1), 0,
         @intFromEnum(OpCode.RETURNDATACOPY),
     };
     var interp = try Interpreter.init(std.testing.allocator, &code, 1_000_000);
@@ -2617,6 +4032,112 @@ test "RETURNDATACOPY reading past the last call's output is invalid" {
     try interp.run();
 
     try std.testing.expectEqual(Status.invalid_opcode, interp.status);
+}
+
+test "RETURNDATACOPY reading past the last call's output is invalid" {
+    const code = [_]u8{
+        @intFromEnum(OpCode.PUSH1), 1, // size: nothing has been called yet, so any size is out of bounds
+        @intFromEnum(OpCode.PUSH1), 0, // offset
+        @intFromEnum(OpCode.PUSH1), 0, // dest
+        @intFromEnum(OpCode.RETURNDATACOPY),
+    };
+    var interp = try Interpreter.initCall(std.testing.allocator, &code, 1_000_000, .{
+        .block = .{ .fork = .byzantium },
+    });
+    defer interp.deinit();
+    try interp.run();
+
+    try std.testing.expectEqual(Status.invalid_opcode, interp.status);
+}
+
+test "a CALL that fails for insufficient balance clears RETURNDATASIZE, not leaving a stale value from an earlier successful call" {
+    const callee_code = [_]u8{
+        @intFromEnum(OpCode.PUSH4), 0xde, 0xad, 0xbe, 0xef,
+        @intFromEnum(OpCode.PUSH1), 0,
+        @intFromEnum(OpCode.MSTORE),
+        @intFromEnum(OpCode.PUSH1), 4,
+        @intFromEnum(OpCode.PUSH1), 28,
+        @intFromEnum(OpCode.RETURN),
+    };
+    var state = State.init(std.testing.allocator);
+    defer state.deinit();
+    try state.setCode(0xcc, &callee_code);
+    try state.setBalance(0xaa, 0); // can't afford the second CALL's value
+
+    const caller_code = [_]u8{
+        // First: a real CALL that succeeds and returns 4 bytes.
+        @intFromEnum(OpCode.PUSH1), 0, // retSize
+        @intFromEnum(OpCode.PUSH1), 0, // retOffset
+        @intFromEnum(OpCode.PUSH1), 0, // argsSize
+        @intFromEnum(OpCode.PUSH1), 0, // argsOffset
+        @intFromEnum(OpCode.PUSH1), 0, // value
+        @intFromEnum(OpCode.PUSH1), 0xcc, // address
+        @intFromEnum(OpCode.PUSH2), 0x27, 0x10, // gas
+        @intFromEnum(OpCode.CALL),
+        @intFromEnum(OpCode.POP), // discard CALL's success flag
+        // Second: a CALL with a value the caller can't afford (address
+        // 0xcc has no code either, but that's beside the point: the
+        // balance check rejects it before a callee would ever run).
+        @intFromEnum(OpCode.PUSH1), 0, // retSize
+        @intFromEnum(OpCode.PUSH1), 0, // retOffset
+        @intFromEnum(OpCode.PUSH1), 0, // argsSize
+        @intFromEnum(OpCode.PUSH1), 0, // argsOffset
+        @intFromEnum(OpCode.PUSH1), 1, // value: unaffordable
+        @intFromEnum(OpCode.PUSH1), 0xcc, // address
+        @intFromEnum(OpCode.PUSH2), 0x27, 0x10, // gas
+        @intFromEnum(OpCode.CALL),
+        @intFromEnum(OpCode.POP), // discard CALL's success flag
+        @intFromEnum(OpCode.RETURNDATASIZE),
+        @intFromEnum(OpCode.STOP),
+    };
+
+    var interp = try Interpreter.initCall(std.testing.allocator, &caller_code, 1_000_000, .{
+        .address = 0xaa,
+        .state = &state,
+        .block = .{ .fork = .byzantium },
+    });
+    defer interp.deinit();
+    try interp.run();
+
+    try std.testing.expectEqual(Status.stopped, interp.status);
+    try std.testing.expectEqual(@as(u256, 0), try interp.stack.pop());
+}
+
+test "a CALL that exits early still grows the memory it charged for" {
+    // The args region reaches past the end of memory, so the CALL pays a
+    // memory-expansion charge. It then exits early on an unaffordable
+    // value, never reading those bytes. If the growth is charged but not
+    // performed, the following MSTORE into the same region is billed for
+    // it all over again — which is exactly how zevm overcharged a real
+    // mainnet transaction (block 6,228,137) by 3 gas.
+    var state = State.init(std.testing.allocator);
+    defer state.deinit();
+    try state.setBalance(0xaa, 0); // can't afford the CALL's value
+
+    const code = [_]u8{
+        @intFromEnum(OpCode.PUSH1), 0, // retSize
+        @intFromEnum(OpCode.PUSH1), 160, // retOffset
+        @intFromEnum(OpCode.PUSH1), 2, // argsSize: reaches byte 162
+        @intFromEnum(OpCode.PUSH1), 160, // argsOffset
+        @intFromEnum(OpCode.PUSH1), 1, // value: unaffordable
+        @intFromEnum(OpCode.PUSH1), 0xcc, // address
+        @intFromEnum(OpCode.PUSH2), 0x27, 0x10, // gas
+        @intFromEnum(OpCode.CALL),
+        @intFromEnum(OpCode.POP),
+        @intFromEnum(OpCode.STOP),
+    };
+
+    var interp = try Interpreter.initCall(std.testing.allocator, &code, 1_000_000, .{
+        .address = 0xaa,
+        .state = &state,
+        .block = .{ .fork = .byzantium },
+    });
+    defer interp.deinit();
+    try interp.run();
+
+    try std.testing.expectEqual(Status.stopped, interp.status);
+    // Grown to cover byte 162, rounded up to a whole word: 6 words.
+    try std.testing.expectEqual(@as(usize, 192), interp.memory.len());
 }
 
 test "LOG0 charges gas and reads memory without erroring" {
@@ -2660,6 +4181,7 @@ test "LOG1 inside a STATICCALL is rejected" {
     var interp = try Interpreter.initCall(std.testing.allocator, &caller_code, 1_000_000, .{
         .address = 0xaa,
         .state = &state,
+        .block = .{ .fork = .byzantium }, // STATICCALL is Byzantium-only (EIP-214).
     });
     defer interp.deinit();
     try interp.run();
@@ -2719,7 +4241,7 @@ test "CALLCODE keeps this frame's own storage context but resets caller/value" {
     try std.testing.expectEqual(@as(u256, 1000), state.getBalance(0xaa));
 }
 
-test "SELFDESTRUCT transfers balance to the beneficiary and wipes code" {
+test "SELFDESTRUCT transfers balance to the beneficiary immediately, but its code only at transaction end" {
     const code = [_]u8{
         @intFromEnum(OpCode.PUSH1), 0xbb,
         @intFromEnum(OpCode.SELFDESTRUCT),
@@ -2740,8 +4262,156 @@ test "SELFDESTRUCT transfers balance to the beneficiary and wipes code" {
     try std.testing.expectEqual(Status.stopped, interp.status);
     try std.testing.expectEqual(@as(u256, 0), state.getBalance(0xaa));
     try std.testing.expectEqual(@as(u256, 510), state.getBalance(0xbb));
-    try std.testing.expectEqualSlices(u8, &.{}, state.getCode(0xaa));
     try std.testing.expectEqual(gas.selfdestruct_refund, interp.refund);
+
+    // Balance moves immediately, but real Ethereum only deletes the
+    // account itself (code included) once the transaction fully commits —
+    // until `finalizeTransaction`, a later call within the same
+    // transaction would still find this same code here.
+    try std.testing.expectEqualSlices(u8, &code, state.getCode(0xaa));
+    state.finalizeTransaction();
+    try std.testing.expectEqualSlices(u8, &.{}, state.getCode(0xaa));
+}
+
+test "from Tangerine Whistle on, SELFDESTRUCT costs 5000 base plus a new-account surcharge for a not-yet-existing beneficiary" {
+    const code = [_]u8{
+        @intFromEnum(OpCode.PUSH1), 0xbb,
+        @intFromEnum(OpCode.SELFDESTRUCT),
+    };
+
+    // Baseline: 0xbb already exists (pre-touched), so no surcharge — just
+    // the flat 5000 base.
+    var existing_state = State.init(std.testing.allocator);
+    defer existing_state.deinit();
+    try existing_state.setCode(0xaa, &code);
+    try existing_state.setBalance(0xbb, 0);
+    var existing_interp = try Interpreter.initCall(std.testing.allocator, &code, 1_000_000, .{
+        .address = 0xaa,
+        .state = &existing_state,
+        .block = .{ .fork = .tangerine_whistle },
+    });
+    defer existing_interp.deinit();
+    try existing_interp.run();
+
+    // 0xbb doesn't exist yet: pays the extra 25000.
+    var new_state = State.init(std.testing.allocator);
+    defer new_state.deinit();
+    try new_state.setCode(0xaa, &code);
+    var new_interp = try Interpreter.initCall(std.testing.allocator, &code, 1_000_000, .{
+        .address = 0xaa,
+        .state = &new_state,
+        .block = .{ .fork = .tangerine_whistle },
+    });
+    defer new_interp.deinit();
+    try new_interp.run();
+
+    // Pre-150, for comparison: no charge at all (base is 0, and the
+    // new-account surcharge doesn't exist yet).
+    var frontier_state = State.init(std.testing.allocator);
+    defer frontier_state.deinit();
+    try frontier_state.setCode(0xaa, &code);
+    var frontier_interp = try Interpreter.initCall(std.testing.allocator, &code, 1_000_000, .{
+        .address = 0xaa,
+        .state = &frontier_state,
+    });
+    defer frontier_interp.deinit();
+    try frontier_interp.run();
+
+    try std.testing.expectEqual(Status.stopped, existing_interp.status);
+    try std.testing.expectEqual(Status.stopped, new_interp.status);
+    try std.testing.expectEqual(Status.stopped, frontier_interp.status);
+    try std.testing.expectEqual(gas.selfdestruct_new_account, existing_interp.gas_remaining - new_interp.gas_remaining);
+    try std.testing.expectEqual(gas.selfdestruct_base_150, frontier_interp.gas_remaining - existing_interp.gas_remaining);
+}
+
+test "from Spurious Dragon on, SELFDESTRUCT's new-account surcharge only applies if there's actually a balance to move" {
+    const code = [_]u8{
+        @intFromEnum(OpCode.PUSH1), 0xbb,
+        @intFromEnum(OpCode.SELFDESTRUCT),
+    };
+
+    // 0xbb doesn't exist (not alive), but 0xaa has zero balance: nothing
+    // would actually move, so no surcharge despite the not-alive beneficiary.
+    var zero_balance_state = State.init(std.testing.allocator);
+    defer zero_balance_state.deinit();
+    try zero_balance_state.setCode(0xaa, &code);
+    var zero_balance_interp = try Interpreter.initCall(std.testing.allocator, &code, 1_000_000, .{
+        .address = 0xaa,
+        .state = &zero_balance_state,
+        .block = .{ .fork = .spurious_dragon },
+    });
+    defer zero_balance_interp.deinit();
+    try zero_balance_interp.run();
+
+    // Same, but 0xaa has a nonzero balance to move: the surcharge applies,
+    // same as Tangerine Whistle's rule.
+    var nonzero_balance_state = State.init(std.testing.allocator);
+    defer nonzero_balance_state.deinit();
+    try nonzero_balance_state.setCode(0xaa, &code);
+    try nonzero_balance_state.setBalance(0xaa, 100);
+    var nonzero_balance_interp = try Interpreter.initCall(std.testing.allocator, &code, 1_000_000, .{
+        .address = 0xaa,
+        .state = &nonzero_balance_state,
+        .block = .{ .fork = .spurious_dragon },
+    });
+    defer nonzero_balance_interp.deinit();
+    try nonzero_balance_interp.run();
+
+    try std.testing.expectEqual(Status.stopped, zero_balance_interp.status);
+    try std.testing.expectEqual(Status.stopped, nonzero_balance_interp.status);
+    try std.testing.expectEqual(
+        gas.selfdestruct_new_account,
+        zero_balance_interp.gas_remaining - nonzero_balance_interp.gas_remaining,
+    );
+}
+
+test "a zero-balance SELFDESTRUCT still materialises its beneficiary" {
+    // Real chain assigns the beneficiary's balance unconditionally, so even
+    // moving nothing leaves an empty account behind in the state trie. This
+    // is a state-root-visible difference that produces no other symptom at
+    // the time: mainnet block 113,121 destroyed a zero-balance contract to a
+    // brand-new beneficiary, and zevm's root diverged from the header there
+    // while every balance still matched.
+    const code = [_]u8{
+        @intFromEnum(OpCode.PUSH1), 0xbb, // beneficiary, which does not exist yet
+        @intFromEnum(OpCode.SELFDESTRUCT),
+    };
+    var state = State.init(std.testing.allocator);
+    defer state.deinit();
+    try state.setCode(0xaa, &code);
+    // Balance deliberately left at zero: nothing moves.
+    try std.testing.expect(!state.exists(0xbb));
+
+    var interp = try Interpreter.initCall(std.testing.allocator, &code, 1_000_000, .{
+        .address = 0xaa,
+        .state = &state,
+    });
+    defer interp.deinit();
+    try interp.run();
+
+    try std.testing.expect(state.exists(0xbb));
+    try std.testing.expectEqual(@as(u256, 0), state.getBalance(0xbb));
+}
+
+test "a zero-balance SELFDESTRUCT to yourself does not resurrect anything" {
+    // The beneficiary-is-self case must not go through the transfer path:
+    // there is no separate account to materialise.
+    const code = [_]u8{
+        @intFromEnum(OpCode.PUSH1), 0xaa,
+        @intFromEnum(OpCode.SELFDESTRUCT),
+    };
+    var state = State.init(std.testing.allocator);
+    defer state.deinit();
+    try state.setCode(0xaa, &code);
+
+    var interp = try Interpreter.initCall(std.testing.allocator, &code, 1_000_000, .{
+        .address = 0xaa,
+        .state = &state,
+    });
+    defer interp.deinit();
+    try interp.run();
+
+    try std.testing.expectEqual(@as(u256, 0), state.getBalance(0xaa));
 }
 
 test "SELFDESTRUCT to yourself burns the balance instead of moving it" {
@@ -2762,6 +4432,139 @@ test "SELFDESTRUCT to yourself burns the balance instead of moving it" {
     try interp.run();
 
     try std.testing.expectEqual(@as(u256, 0), state.getBalance(0xaa));
+}
+
+test "a CALL to an address that just self-destructed, within the same transaction, still runs its code" {
+    // callee: PUSH1 0, CALLDATALOAD, SELFDESTRUCT — pre-EIP-150, this costs
+    // exactly 6 gas (3+3+0) and halts, moving whatever balance it has to
+    // beneficiary 0 (empty calldata reads as zero). Mirrors a real,
+    // observed mainnet pattern: a "self-destructing helper" contract that
+    // legitimately gets `CALL`ed, and destructs, more than once in one
+    // transaction.
+    const selfdestruct_code = [_]u8{
+        @intFromEnum(OpCode.PUSH1), 0,
+        @intFromEnum(OpCode.CALLDATALOAD),
+        @intFromEnum(OpCode.SELFDESTRUCT),
+    };
+    // caller: CALL(gas=6, addr=0xcc, value=0, all sizes/offsets 0), twice, then STOP.
+    const call_once = [_]u8{
+        @intFromEnum(OpCode.PUSH1), 0, // retSize
+        @intFromEnum(OpCode.PUSH1), 0, // retOffset
+        @intFromEnum(OpCode.PUSH1), 0, // argsSize
+        @intFromEnum(OpCode.PUSH1), 0, // argsOffset
+        @intFromEnum(OpCode.PUSH1), 0, // value
+        @intFromEnum(OpCode.PUSH1), 0xcc, // address
+        @intFromEnum(OpCode.PUSH1), 6, // gas
+        @intFromEnum(OpCode.CALL),
+        @intFromEnum(OpCode.POP),
+    };
+    const caller_code = call_once ++ call_once ++ [_]u8{@intFromEnum(OpCode.STOP)};
+
+    // Baseline: 0xcc pre-exists with no code at all, so both CALLs hit the
+    // trivial "no code" success path and forward nothing.
+    var baseline_state = State.init(std.testing.allocator);
+    defer baseline_state.deinit();
+    try baseline_state.setBalance(0xcc, 0);
+    var baseline_interp = try Interpreter.initCall(std.testing.allocator, &caller_code, 1_000_000, .{
+        .address = 0xaa,
+        .state = &baseline_state,
+    });
+    defer baseline_interp.deinit();
+    try baseline_interp.run();
+
+    // Test: 0xcc starts out not existing at all and holds the
+    // self-destructing code above.
+    var state = State.init(std.testing.allocator);
+    defer state.deinit();
+    try state.setCode(0xcc, &selfdestruct_code);
+    var interp = try Interpreter.initCall(std.testing.allocator, &caller_code, 1_000_000, .{
+        .address = 0xaa,
+        .state = &state,
+    });
+    defer interp.deinit();
+    try interp.run();
+
+    try std.testing.expectEqual(Status.stopped, baseline_interp.status);
+    try std.testing.expectEqual(Status.stopped, interp.status);
+    // `setCode` already touches 0xcc into existence in both scenarios, so
+    // no new-account surcharge is in play here — this isolates just the
+    // forwarded-gas question. Both CALLs fully spend their forwarded 6 gas
+    // running the callee's code, including the second, even though the
+    // first CALL already self-destructed it. If a self-destruct wiped code
+    // immediately instead of only at `finalizeTransaction`, the second
+    // CALL would wrongly hit the "no code" trivial-success path and refund
+    // its 6 gas back, making this difference 6 less than expected.
+    try std.testing.expectEqual(
+        2 * 6,
+        baseline_interp.gas_remaining - interp.gas_remaining,
+    );
+    // Real Ethereum's SELFDESTRUCT refund is earned once per address per
+    // transaction (a set-membership check against `accounts_to_delete`),
+    // not once per call: destroying the same already-destroyed contract a
+    // second time doesn't pay out again. A contract repeatedly `CALL`ed to
+    // self-destruct itself, like this real-world mainnet pattern, would
+    // otherwise rack up an inflated refund, hit the per-transaction cap,
+    // and badly under-report gas_used.
+    try std.testing.expectEqual(gas.selfdestruct_refund, interp.refund);
+}
+
+test "a CALL to a previously-self-destructed address pays the new-account surcharge again" {
+    const selfdestruct_code = [_]u8{
+        @intFromEnum(OpCode.PUSH1), 0xbb,
+        @intFromEnum(OpCode.SELFDESTRUCT),
+    };
+    var state = State.init(std.testing.allocator);
+    defer state.deinit();
+    try state.setCode(0xcc, &selfdestruct_code);
+
+    var destroyer = try Interpreter.initCall(std.testing.allocator, &selfdestruct_code, 1_000_000, .{
+        .address = 0xcc,
+        .state = &state,
+    });
+    defer destroyer.deinit();
+    try destroyer.run();
+    // Mirrors what `Evm.executeTransaction` does once a transaction's own
+    // call/create is done: only past this point is a self-destruct real.
+    state.finalizeTransaction();
+    try std.testing.expect(!state.exists(0xcc));
+
+    // caller: CALL(gas=10000, addr=0xcc, value=0, argsOffset=0, argsSize=0, retOffset=0, retSize=0)
+    const caller_code = [_]u8{
+        @intFromEnum(OpCode.PUSH1), 0, // retSize
+        @intFromEnum(OpCode.PUSH1), 0, // retOffset
+        @intFromEnum(OpCode.PUSH1), 0, // argsSize
+        @intFromEnum(OpCode.PUSH1), 0, // argsOffset
+        @intFromEnum(OpCode.PUSH1), 0, // value
+        @intFromEnum(OpCode.PUSH1), 0xcc, // address
+        @intFromEnum(OpCode.PUSH2), 0x27, 0x10, // gas
+        @intFromEnum(OpCode.CALL),
+        @intFromEnum(OpCode.STOP),
+    };
+
+    // Baseline: an ordinary, never-destroyed account, so no surcharge.
+    var existing_state = State.init(std.testing.allocator);
+    defer existing_state.deinit();
+    try existing_state.setBalance(0xcc, 0);
+    var existing_interp = try Interpreter.initCall(std.testing.allocator, &caller_code, 1_000_000, .{
+        .address = 0xaa,
+        .state = &existing_state,
+    });
+    defer existing_interp.deinit();
+    try existing_interp.run();
+
+    var post_destruct_interp = try Interpreter.initCall(std.testing.allocator, &caller_code, 1_000_000, .{
+        .address = 0xaa,
+        .state = &state,
+    });
+    defer post_destruct_interp.deinit();
+    try post_destruct_interp.run();
+
+    try std.testing.expectEqual(Status.stopped, existing_interp.status);
+    try std.testing.expectEqual(Status.stopped, post_destruct_interp.status);
+    try std.testing.expectEqual(
+        gas.call_new_account,
+        existing_interp.gas_remaining - post_destruct_interp.gas_remaining,
+    );
 }
 
 test "SELFDESTRUCT inside a reverted CALL restores the destroyed account's code" {
@@ -2796,6 +4599,7 @@ test "SELFDESTRUCT inside a reverted CALL restores the destroyed account's code"
     var interp = try Interpreter.initCall(std.testing.allocator, &caller_code, 1_000_000, .{
         .address = 0xaa,
         .state = &state,
+        .block = .{ .fork = .byzantium }, // REVERT is Byzantium-only (EIP-140).
     });
     defer interp.deinit();
     try interp.run();

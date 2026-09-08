@@ -1,7 +1,8 @@
 //! Executes a decoded `Transaction` against a `State`.
 //!
-//! Only Frontier is implemented. `processBlock` panics on any block from a
-//! later fork (see `Fork`) instead of silently applying stale rules.
+//! Only Frontier through Byzantium are implemented. `processBlock` panics
+//! on any block from a later fork (see `Fork`) instead of silently
+//! applying stale rules.
 
 const std = @import("std");
 const Address = @import("Address.zig").Address;
@@ -10,6 +11,7 @@ const Interpreter = @import("Interpreter.zig");
 const Transaction = @import("Transaction.zig").Transaction;
 const Block = @import("Block.zig").Block;
 const Fork = @import("Fork.zig").Fork;
+const DaoFork = @import("DaoFork.zig");
 const gas = @import("gas.zig");
 const Precompiles = @import("Precompiles.zig");
 
@@ -24,8 +26,11 @@ tx: Interpreter.TxContext = .{},
 
 const Evm = @This();
 
-/// Miner reward for a block with no uncles: Frontier's flat 5 ETH.
-const block_reward: u256 = 5_000_000_000_000_000_000;
+/// Miner reward for a block with no uncles: Frontier's flat 5 ETH, cut to
+/// 3 ETH by EIP-649 at Byzantium.
+fn blockReward(fork: Fork) u256 {
+    return if (fork.atLeast(.byzantium)) 3_000_000_000_000_000_000 else 5_000_000_000_000_000_000;
+}
 
 pub const Result = struct {
     status: Interpreter.Status,
@@ -40,6 +45,11 @@ pub const Result = struct {
 };
 
 pub fn executeTransaction(self: *Evm, tx: Transaction, from: Address) !Result {
+    // DEBUG: resets Interpreter's step-count safety valve (see its doc
+    // comment) so it measures *this* transaction's total, not a running
+    // total across the whole replay.
+    Interpreter.debug_total_step_count = 0;
+
     // A nonce mismatch means we fed transactions out of order, not that the
     // transaction itself is invalid. Worth panicking on immediately.
     const current_nonce = self.state.get(from).nonce;
@@ -50,17 +60,43 @@ pub fn executeTransaction(self: *Evm, tx: Transaction, from: Address) !Result {
         );
     }
 
+    // EIP-155, from Spurious Dragon on: a `v` of 27/28 predates chain-id
+    // replay protection and is always accepted; `v >= 35` encodes a chain
+    // id (`(v - 35) / 2`) that must match this network's. A `v` too
+    // malformed to have produced `from` in the first place (recovered
+    // externally, before this function runs) can't reach here, so unlike
+    // real Ethereum's `chain_id()` there's no separate "bad v" rejection.
+    if (self.block.fork.atLeast(.spurious_dragon) and tx.v >= 35) {
+        const tx_chain_id: u256 = (tx.v - 35) / 2;
+        if (tx_chain_id != self.block.chain_id) return error.WrongChainId;
+    }
+
     // Real Ethereum reserves the full potential fee up front and refunds
-    // what's unused after execution. Unlike insufficient balance for
-    // `value` alone (handled gracefully in `call`/`create`), failing this
-    // check on a replayed transaction means our balance has already
-    // drifted from real chain state.
-    const upfront_cost = @as(u256, tx.gas_limit) * tx.gas_price;
+    // what's unused after execution. The sender must be able to cover the
+    // `value` it is sending *as well as* that fee: execution-specs'
+    // `process_transaction` asserts `balance >= gas_fee + value`, and a
+    // block carrying a transaction that fails it is invalid. This is a
+    // different rule from a *nested* `CALL`/`CREATE` that can't afford its
+    // value, which fails gracefully (pushes 0) rather than voiding
+    // anything — checking only `gas_fee` here let zevm accept transactions
+    // real chain rejects, charging gas and silently dropping the transfer.
+    // Failing this check on a replayed transaction means our balance has
+    // already drifted from real chain state.
+    const gas_fee = @as(u256, tx.gas_limit) * tx.gas_price;
+    const upfront_cost = gas_fee + tx.value;
     const balance_before = self.state.getBalance(from);
     if (upfront_cost > balance_before) {
+        // Fatal path: this aborts the whole replay, so the detail is worth
+        // printing unconditionally rather than hiding behind a flag.
+        std.debug.print(
+            "DEBUG InsufficientBalance: block={d} from={x} nonce={d} gas_limit={d} gas_price={d} value={d} gas_fee={d} upfront_cost={d} balance_before={d} short_by={d}\n",
+            .{ self.block.number, from, tx.nonce, tx.gas_limit, tx.gas_price, tx.value, gas_fee, upfront_cost, balance_before, upfront_cost - balance_before },
+        );
         return error.InsufficientBalance;
     }
-    try self.state.setBalance(from, balance_before - upfront_cost);
+    // Only the fee is debited here; `value` moves separately, through the
+    // transfer inside the call/create this transaction turns into.
+    try self.state.setBalance(from, balance_before - gas_fee);
 
     // A transaction's nonce always advances, whether it succeeds, reverts,
     // or fails outright.
@@ -81,6 +117,12 @@ pub fn executeTransaction(self: *Evm, tx: Transaction, from: Address) !Result {
         try self.state.creditBalance(self.block.coinbase, @as(u256, result.gas_used) * tx.gas_price);
     }
 
+    // Any `SELFDESTRUCT` that survived to here (a reverted one never
+    // reaches `pending_destructions` in the first place) is now permanent:
+    // erase those accounts from state entirely, same as real Ethereum does
+    // at the end of a transaction.
+    self.state.finalizeTransaction();
+
     return result;
 }
 
@@ -88,13 +130,20 @@ pub fn executeTransaction(self: *Evm, tx: Transaction, from: Address) !Result {
 /// Per-transaction `Result`s aren't surfaced; call `executeTransaction`
 /// directly if you need them.
 pub fn processBlock(self: *Evm, block: Block) !void {
+    State.debug_block_number = block.number;
     const fork = Fork.at(block.number);
-    if (fork != .frontier) {
+    if (fork.atLeast(.constantinople)) {
         std.debug.panic(
-            "block {d} is past Frontier (fork: {s}): this Evm only implements Frontier's rules",
+            "block {d} is past Byzantium (fork: {s}): this Evm only implements up to Byzantium's rules",
             .{ block.number, @tagName(fork) },
         );
     }
+
+    // The DAO fork wasn't an EVM/gas rule change: at exactly this block, an
+    // irregular state transition hardcoded into every client moves all
+    // ether out of The DAO (and its children) before any of the block's
+    // own transactions run.
+    if (block.number == 1_920_000) try DaoFork.apply(self.state);
 
     self.block = .{
         .number = block.number,
@@ -105,6 +154,7 @@ pub fn processBlock(self: *Evm, block: Block) !void {
         .base_fee = block.base_fee,
         .chain_id = block.chain_id,
         .recent_hashes = block.recent_hashes,
+        .fork = fork,
     };
 
     for (block.transactions) |entry| {
@@ -114,12 +164,13 @@ pub fn processBlock(self: *Evm, block: Block) !void {
 
     // A whole block is never rolled back once processed, so rewards credit
     // directly rather than through `setBalance`'s journaled bookkeeping.
-    var miner_reward = block_reward;
+    const reward = blockReward(fork);
+    var miner_reward = reward;
     for (block.uncles) |uncle| {
         const distance = block.number - uncle.number;
-        const uncle_reward = block_reward * (8 - distance) / 8;
+        const uncle_reward = reward * (8 - distance) / 8;
         try self.state.creditBalance(uncle.miner, uncle_reward);
-        miner_reward += block_reward / 32; // "nephew" bonus for including it
+        miner_reward += reward / 32; // "nephew" bonus for including it
     }
     try self.state.creditBalance(block.miner, miner_reward);
 }
@@ -141,8 +192,15 @@ fn call(self: *Evm, value: u256, data: []const u8, gas_limit: u64, from: Address
 
     // Insufficient balance for `value` alone doesn't abort the block: the
     // gas fee is already reserved, so this fails like an immediate REVERT,
-    // paying only the intrinsic cost.
-    if (value != 0 and !try self.state.transfer(from, to, value)) {
+    // paying only the intrinsic cost. Always calls `transfer`, even for
+    // value == 0, since it still has to touch `to` (see its own doc comment).
+    if (!try self.state.transfer(from, to, value)) {
+        if (value > 1_000_000_000_000_000_000_000) {
+            std.debug.print(
+                "DEBUG large reverted transfer: block={d} from={x} to={x} value={d} sender_balance={d}\n",
+                .{ self.block.number, from, to, value, self.state.getBalance(from) },
+            );
+        }
         self.state.revertTo(cp);
         return .{
             .status = .reverted,
@@ -154,8 +212,12 @@ fn call(self: *Evm, value: u256, data: []const u8, gas_limit: u64, from: Address
     const execution_gas_limit = gas_limit - intrinsic;
 
     // A transaction can target a precompile directly, same as `Interpreter.call`.
-    if (try Precompiles.call(self.allocator, to, data, execution_gas_limit)) |result| {
+    if (try Precompiles.call(self.allocator, to, data, execution_gas_limit, self.block.fork)) |result| {
         const status: Interpreter.Status = if (result.success) .stopped else .out_of_gas;
+        // EIP-161, from Spurious Dragon on: mark `to` touched regardless
+        // of outcome — journaled, so the revert below (if any)
+        // automatically discards it, same as `Interpreter.call`.
+        if (self.block.fork.atLeast(.spurious_dragon)) try self.state.markTouchedIfEmpty(to);
         if (status != .stopped) self.state.revertTo(cp);
         return .{
             .status = status,
@@ -172,6 +234,8 @@ fn call(self: *Evm, value: u256, data: []const u8, gas_limit: u64, from: Address
     // build/teardown, from stack-probing a frame that size) for a call
     // that would just hit `.stopped` anyway.
     if (code.len == 0) {
+        // Always a trivial success, so no revert to worry about here.
+        if (self.block.fork.atLeast(.spurious_dragon)) try self.state.markTouchedIfEmpty(to);
         return .{
             .status = .stopped,
             .return_data = try self.allocator.alloc(u8, 0),
@@ -187,10 +251,12 @@ fn call(self: *Evm, value: u256, data: []const u8, gas_limit: u64, from: Address
         .tx = self.tx,
         .state = self.state,
         .block = self.block,
+        .jumpdest = self.state.getJumpdest(to),
     });
     defer interp.deinit();
     try interp.run();
 
+    if (self.block.fork.atLeast(.spurious_dragon)) try self.state.markTouchedIfEmpty(to);
     if (interp.status != .stopped) self.state.revertTo(cp);
 
     return .{
@@ -221,7 +287,16 @@ fn create(self: *Evm, nonce: u64, value: u256, data: []const u8, gas_limit: u64,
     const new_address = try Interpreter.createAddress(self.allocator, from, nonce);
     const cp = self.state.checkpoint();
 
-    const intrinsic = gas.intrinsicCost(data);
+    // EIP-161, from Spurious Dragon on: a freshly created contract's own
+    // nonce starts at 1, not 0 (mirrors `Interpreter.createOp`'s nested
+    // `CREATE`/`CREATE2`).
+    if (self.block.fork.atLeast(.spurious_dragon)) try self.state.setNonce(new_address, 1);
+
+    // EIP-2 (Homestead): a top-level contract-creation transaction pays an
+    // extra `create_base` surcharge on top of the usual intrinsic cost.
+    // Nested `CREATE`/`CREATE2` (`Interpreter.createOp`) are unaffected.
+    var intrinsic = gas.intrinsicCost(data);
+    if (self.block.fork != .frontier) intrinsic += gas.create_base;
     if (gas_limit < intrinsic) {
         self.state.revertTo(cp);
         return .{
@@ -244,6 +319,16 @@ fn create(self: *Evm, nonce: u64, value: u256, data: []const u8, gas_limit: u64,
         };
     }
 
+    // Materialise the new contract before its init code runs, matching
+    // execution-specs' `process_message`. Pre-Spurious-Dragon there's no
+    // nonce to set and a zero-value creation moves nothing, so without this
+    // the address exists nowhere while its constructor executes — and a
+    // constructor that `SELFDESTRUCT`s then registers no destruction at all
+    // (`destroyAccount` no-ops on an account that isn't there), leaving
+    // `setCode` below to create it permanently. Real chain deletes such a
+    // contract at transaction end; zevm was keeping it forever.
+    try self.state.touch(new_address);
+
     var interp = try Interpreter.initCall(self.allocator, data, gas_limit - intrinsic, .{
         .address = new_address,
         .caller = from,
@@ -255,28 +340,44 @@ fn create(self: *Evm, nonce: u64, value: u256, data: []const u8, gas_limit: u64,
     defer interp.deinit();
     try interp.run();
 
+    // EIP-170, from Spurious Dragon on: deployed code over this size is an
+    // exceptional halt (forfeits all remaining gas), not a graceful stop.
+    // No limit at all before this fork. Mirrors `Interpreter.createOp`.
+    const oversized = self.block.fork.atLeast(.spurious_dragon) and interp.return_data.len > Interpreter.max_code_size;
+
     // Mirrors `Interpreter.createOp`: a successful init code run still has
     // to afford storing its returned code, at `code_deposit_byte` gas/byte.
-    var success = interp.status == .stopped;
+    var success = interp.status == .stopped and !oversized;
+    var status: Interpreter.Status = if (oversized) .out_of_gas else interp.status;
+    var deployed_code: []const u8 = interp.return_data;
     if (success) {
         const deposit_cost = gas.code_deposit_byte * @as(u64, interp.return_data.len);
         if (interp.gas_remaining < deposit_cost) {
-            success = false;
+            if (self.block.fork == .frontier) {
+                // Real Frontier: an unaffordable deposit just skips storing
+                // code; the creation still succeeds and gas_remaining is
+                // left exactly as-is. Homestead (EIP-2) made this a hard,
+                // gas-forfeiting failure instead.
+                deployed_code = &.{};
+            } else {
+                success = false;
+                status = .out_of_gas;
+            }
         } else {
             interp.gas_remaining -= deposit_cost;
         }
     }
     if (success) {
-        try self.state.setCode(new_address, interp.return_data);
+        try self.state.setCode(new_address, deployed_code);
     } else {
         self.state.revertTo(cp);
     }
 
     return .{
-        .status = interp.status,
+        .status = status,
         .return_data = try self.allocator.dupe(u8, interp.return_data),
         .created_address = new_address,
-        .gas_used = gasUsed(interp.status, interp.gas_remaining, interp.refund, gas_limit - intrinsic, intrinsic),
+        .gas_used = gasUsed(status, interp.gas_remaining, interp.refund, gas_limit - intrinsic, intrinsic),
     };
 }
 
@@ -311,6 +412,47 @@ test "a plain value-transfer call moves balance and produces no output" {
     try std.testing.expectEqual(@as(u256, 900), state.getBalance(0x1));
     try std.testing.expectEqual(@as(u256, 100), state.getBalance(0xdd));
     try std.testing.expectEqual(@as(u64, 1), state.get(0x1).nonce);
+}
+
+test "a zero-value call still touches (creates) a not-yet-existing recipient" {
+    var state = State.init(std.testing.allocator);
+    defer state.deinit();
+    try state.setBalance(0x1, 1000);
+
+    var evm = Evm{ .allocator = std.testing.allocator, .state = &state };
+    var tx = testTx();
+    tx.to = 0xdd;
+    tx.value = 0;
+
+    try std.testing.expect(!state.exists(0xdd));
+    const result = try evm.executeTransaction(tx, 0x1);
+    defer std.testing.allocator.free(result.return_data);
+
+    try std.testing.expectEqual(Interpreter.Status.stopped, result.status);
+    try std.testing.expect(state.exists(0xdd));
+    try std.testing.expectEqual(@as(u256, 0), state.getBalance(0xdd));
+}
+
+test "from Spurious Dragon on, a zero-value call to a not-yet-existing recipient leaves no trace behind (EIP-161)" {
+    var state = State.init(std.testing.allocator);
+    defer state.deinit();
+    try state.setBalance(0x1, 1000);
+
+    var evm = Evm{ .allocator = std.testing.allocator, .state = &state, .block = .{ .fork = .spurious_dragon } };
+    var tx = testTx();
+    tx.to = 0xdd;
+    tx.value = 0;
+
+    try std.testing.expect(!state.exists(0xdd));
+    const result = try evm.executeTransaction(tx, 0x1);
+    defer std.testing.allocator.free(result.return_data);
+
+    // Contrast with the pre-161 test above: the exact same call, but this
+    // time `finalizeTransaction`'s EIP-161 sweep deletes the touched,
+    // still-empty account before the transaction is done, instead of
+    // leaving a permanent zero-balance shell behind.
+    try std.testing.expectEqual(Interpreter.Status.stopped, result.status);
+    try std.testing.expect(!state.exists(0xdd));
 }
 
 test "a call into a contract runs its code and returns its output" {
@@ -374,6 +516,158 @@ test "a contract-creation transaction deploys the init code's returned bytes" {
     try std.testing.expectEqual(@as(u64, 6), state.get(0x1).nonce);
 }
 
+test "a freshly created contract's own nonce is 1 from Spurious Dragon on, 0 before (EIP-161)" {
+    const OpCode = @import("OpCode.zig").OpCode;
+    const init_code = [_]u8{
+        @intFromEnum(OpCode.PUSH3), 0x60,                       0x2a,                        0x00,
+        @intFromEnum(OpCode.PUSH1), 0,                          @intFromEnum(OpCode.MSTORE), @intFromEnum(OpCode.PUSH1),
+        3,                          @intFromEnum(OpCode.PUSH1), 29,                          @intFromEnum(OpCode.RETURN),
+    };
+
+    var pre_state = State.init(std.testing.allocator);
+    defer pre_state.deinit();
+    try pre_state.setBalance(0x1, 1000);
+    var pre_evm = Evm{ .allocator = std.testing.allocator, .state = &pre_state };
+    var pre_tx = testTx();
+    pre_tx.data = &init_code;
+    const pre_result = try pre_evm.executeTransaction(pre_tx, 0x1);
+    defer std.testing.allocator.free(pre_result.return_data);
+    try std.testing.expectEqual(@as(u64, 0), pre_state.get(pre_result.created_address.?).nonce);
+
+    var sd_state = State.init(std.testing.allocator);
+    defer sd_state.deinit();
+    try sd_state.setBalance(0x1, 1000);
+    var sd_evm = Evm{ .allocator = std.testing.allocator, .state = &sd_state, .block = .{ .fork = .spurious_dragon } };
+    var sd_tx = testTx();
+    sd_tx.data = &init_code;
+    const sd_result = try sd_evm.executeTransaction(sd_tx, 0x1);
+    defer std.testing.allocator.free(sd_result.return_data);
+    try std.testing.expectEqual(@as(u64, 1), sd_state.get(sd_result.created_address.?).nonce);
+}
+
+test "a Homestead contract-creation transaction's intrinsic gas includes the create surcharge" {
+    var state = State.init(std.testing.allocator);
+    defer state.deinit();
+    try state.setBalance(0x1, 1000);
+
+    var evm = Evm{ .allocator = std.testing.allocator, .state = &state, .block = .{ .fork = .homestead } };
+    var tx = testTx();
+    tx.gas_limit = 52_999; // one short of 21,000 (tx_base) + 32,000 (create_base)
+
+    const result = try evm.executeTransaction(tx, 0x1);
+    defer std.testing.allocator.free(result.return_data);
+    try std.testing.expectEqual(Interpreter.Status.out_of_gas, result.status);
+}
+
+test "a Homestead contract-creation transaction succeeds once gas covers the create surcharge" {
+    var state = State.init(std.testing.allocator);
+    defer state.deinit();
+    try state.setBalance(0x1, 1000);
+
+    var evm = Evm{ .allocator = std.testing.allocator, .state = &state, .block = .{ .fork = .homestead } };
+    var tx = testTx();
+    tx.gas_limit = 53_000; // exactly 21,000 + 32,000
+
+    const result = try evm.executeTransaction(tx, 0x1);
+    defer std.testing.allocator.free(result.return_data);
+    try std.testing.expectEqual(Interpreter.Status.stopped, result.status);
+    try std.testing.expectEqual(@as(u64, 53_000), result.gas_used);
+}
+
+test "CREATE transaction with insufficient deposit gas still succeeds on Frontier, with no code stored" {
+    const OpCode = @import("OpCode.zig").OpCode;
+    // init code: returns 5000 bytes (all zero), whose code-deposit cost
+    // (200 gas/byte = 1,000,000 gas) is far beyond what's provided.
+    const init_code = [_]u8{
+        @intFromEnum(OpCode.PUSH1), 0, // value
+        @intFromEnum(OpCode.PUSH2), 0x13, 0x87, // offset = 4999
+        @intFromEnum(OpCode.MSTORE8),
+        @intFromEnum(OpCode.PUSH2), 0x13, 0x88, // size = 5000
+        @intFromEnum(OpCode.PUSH1), 0, // offset = 0
+        @intFromEnum(OpCode.RETURN),
+    };
+
+    var state = State.init(std.testing.allocator);
+    defer state.deinit();
+    try state.setBalance(0x1, 1000);
+
+    var evm = Evm{ .allocator = std.testing.allocator, .state = &state, .block = .{ .fork = .frontier } };
+    var tx = testTx();
+    tx.data = &init_code;
+    tx.gas_limit = 21_000 + 5_000; // enough to run init code, nowhere near the 1,000,000 deposit
+
+    const result = try evm.executeTransaction(tx, 0x1);
+    defer std.testing.allocator.free(result.return_data);
+    try std.testing.expectEqual(Interpreter.Status.stopped, result.status);
+    const created = result.created_address.?;
+    try std.testing.expect(state.exists(created));
+    try std.testing.expectEqualSlices(u8, &.{}, state.getCode(created));
+}
+
+test "CREATE transaction with insufficient deposit gas fails entirely on Homestead" {
+    const OpCode = @import("OpCode.zig").OpCode;
+    const init_code = [_]u8{
+        @intFromEnum(OpCode.PUSH1), 0, // value
+        @intFromEnum(OpCode.PUSH2), 0x13, 0x87, // offset = 4999
+        @intFromEnum(OpCode.MSTORE8),
+        @intFromEnum(OpCode.PUSH2), 0x13, 0x88, // size = 5000
+        @intFromEnum(OpCode.PUSH1), 0, // offset = 0
+        @intFromEnum(OpCode.RETURN),
+    };
+
+    var state = State.init(std.testing.allocator);
+    defer state.deinit();
+    try state.setBalance(0x1, 1000);
+
+    var evm = Evm{ .allocator = std.testing.allocator, .state = &state, .block = .{ .fork = .homestead } };
+    var tx = testTx();
+    tx.data = &init_code;
+    tx.gas_limit = 53_000 + 5_000;
+
+    const result = try evm.executeTransaction(tx, 0x1);
+    defer std.testing.allocator.free(result.return_data);
+    try std.testing.expectEqual(Interpreter.Status.out_of_gas, result.status);
+    const created = result.created_address.?;
+    try std.testing.expect(!state.exists(created));
+}
+
+test "top-level CREATE transaction rejects code over max_code_size from Spurious Dragon on, not before" {
+    const OpCode = @import("OpCode.zig").OpCode;
+    // Returns 24577 bytes (max_code_size + 1) read straight out of
+    // never-written (so all-zero) memory.
+    const init_code = [_]u8{
+        @intFromEnum(OpCode.PUSH2), 0x60, 0x01, // size = 24577
+        @intFromEnum(OpCode.PUSH1), 0, // offset = 0
+        @intFromEnum(OpCode.RETURN),
+    };
+
+    // Pre-Spurious-Dragon: no limit at all, the oversized code is stored.
+    var tw_state = State.init(std.testing.allocator);
+    defer tw_state.deinit();
+    try tw_state.setBalance(0x1, 1000);
+    var tw_evm = Evm{ .allocator = std.testing.allocator, .state = &tw_state, .block = .{ .fork = .tangerine_whistle } };
+    var tw_tx = testTx();
+    tw_tx.data = &init_code;
+    tw_tx.gas_limit = 10_000_000;
+    const tw_result = try tw_evm.executeTransaction(tw_tx, 0x1);
+    defer std.testing.allocator.free(tw_result.return_data);
+    try std.testing.expectEqual(Interpreter.Status.stopped, tw_result.status);
+    try std.testing.expectEqual(@as(usize, 24577), tw_state.getCode(tw_result.created_address.?).len);
+
+    // From Spurious Dragon on: an exceptional halt, nothing stored.
+    var sd_state = State.init(std.testing.allocator);
+    defer sd_state.deinit();
+    try sd_state.setBalance(0x1, 1000);
+    var sd_evm = Evm{ .allocator = std.testing.allocator, .state = &sd_state, .block = .{ .fork = .spurious_dragon } };
+    var sd_tx = testTx();
+    sd_tx.data = &init_code;
+    sd_tx.gas_limit = 10_000_000;
+    const sd_result = try sd_evm.executeTransaction(sd_tx, 0x1);
+    defer std.testing.allocator.free(sd_result.return_data);
+    try std.testing.expectEqual(Interpreter.Status.out_of_gas, sd_result.status);
+    try std.testing.expect(!sd_state.exists(sd_result.created_address.?));
+}
+
 test "a reverted call rolls back its balance transfer and reports .reverted" {
     const OpCode = @import("OpCode.zig").OpCode;
     const code = [_]u8{
@@ -387,7 +681,8 @@ test "a reverted call rolls back its balance transfer and reports .reverted" {
     try state.setBalance(0x1, 1000);
     try state.setCode(0xdd, &code);
 
-    var evm = Evm{ .allocator = std.testing.allocator, .state = &state };
+    // REVERT is Byzantium-only (EIP-140).
+    var evm = Evm{ .allocator = std.testing.allocator, .state = &state, .block = .{ .fork = .byzantium } };
     var tx = testTx();
     tx.to = 0xdd;
     tx.value = 100;
@@ -443,7 +738,8 @@ test "gas is charged even when the call reverts" {
     try state.setBalance(0x1, 10_000_000);
     try state.setCode(0xdd, &code);
 
-    var evm = Evm{ .allocator = std.testing.allocator, .state = &state, .block = .{ .coinbase = 0xcc } };
+    // REVERT is Byzantium-only (EIP-140).
+    var evm = Evm{ .allocator = std.testing.allocator, .state = &state, .block = .{ .coinbase = 0xcc, .fork = .byzantium } };
     var tx = testTx();
     tx.to = 0xdd;
     tx.gas_price = 10;
@@ -456,6 +752,62 @@ test "gas is charged even when the call reverts" {
     const fee_paid = 10_000_000 - state.getBalance(0x1);
     try std.testing.expectEqual(@as(u256, result.gas_used) * 10, fee_paid);
     try std.testing.expectEqual(fee_paid, state.getBalance(0xcc));
+}
+
+test "a later transaction's CALL to a self-destructed address pays the new-account surcharge again" {
+    const OpCode = @import("OpCode.zig").OpCode;
+    const selfdestruct_code = [_]u8{
+        @intFromEnum(OpCode.PUSH1), 0xbb,
+        @intFromEnum(OpCode.SELFDESTRUCT),
+    };
+    // caller: CALL(gas=10000, addr=0xdd, value=0, argsOffset=0, argsSize=0, retOffset=0, retSize=0)
+    const caller_code = [_]u8{
+        @intFromEnum(OpCode.PUSH1), 0, // retSize
+        @intFromEnum(OpCode.PUSH1), 0, // retOffset
+        @intFromEnum(OpCode.PUSH1), 0, // argsSize
+        @intFromEnum(OpCode.PUSH1), 0, // argsOffset
+        @intFromEnum(OpCode.PUSH1), 0, // value
+        @intFromEnum(OpCode.PUSH1), 0xdd, // address
+        @intFromEnum(OpCode.PUSH2), 0x27, 0x10, // gas
+        @intFromEnum(OpCode.CALL),
+        @intFromEnum(OpCode.STOP),
+    };
+
+    var state = State.init(std.testing.allocator);
+    defer state.deinit();
+    try state.setCode(0xdd, &selfdestruct_code);
+    try state.setCode(0xee, &caller_code);
+    try state.setBalance(0x1, 10_000_000);
+
+    var evm = Evm{ .allocator = std.testing.allocator, .state = &state };
+    var destroy_tx = testTx();
+    destroy_tx.nonce = 0;
+    destroy_tx.to = 0xdd;
+    const destroy_result = try evm.executeTransaction(destroy_tx, 0x1);
+    std.testing.allocator.free(destroy_result.return_data);
+    try std.testing.expect(!state.exists(0xdd));
+
+    var call_tx = testTx();
+    call_tx.nonce = 1;
+    call_tx.to = 0xee;
+    const call_result = try evm.executeTransaction(call_tx, 0x1);
+    defer std.testing.allocator.free(call_result.return_data);
+
+    // Baseline: the same caller contract, but targeting an address that was
+    // never touched at all, so it pays the surcharge exactly once (from the
+    // caller's own CALL, not from any prior destruction).
+    var baseline_state = State.init(std.testing.allocator);
+    defer baseline_state.deinit();
+    try baseline_state.setCode(0xee, &caller_code);
+    try baseline_state.setBalance(0x1, 10_000_000);
+    var baseline_evm = Evm{ .allocator = std.testing.allocator, .state = &baseline_state };
+    var baseline_tx = testTx();
+    baseline_tx.to = 0xee;
+    const baseline_result = try baseline_evm.executeTransaction(baseline_tx, 0x1);
+    defer std.testing.allocator.free(baseline_result.return_data);
+
+    try std.testing.expectEqual(Interpreter.Status.stopped, call_result.status);
+    try std.testing.expectEqual(baseline_result.gas_used, call_result.gas_used);
 }
 
 test "clearing a storage slot earns a refund that reduces gas_used, when not capped" {
@@ -582,7 +934,101 @@ test "insufficient balance for gas fails the transaction after execution complet
     try std.testing.expectError(error.InsufficientBalance, evm.executeTransaction(tx, 0x1));
 }
 
-test "insufficient balance for value alone fails just that transaction, not the whole block" {
+test "a sender that can afford the gas fee but not the value it sends is rejected" {
+    // execution-specs' `process_transaction` asserts
+    // `balance >= gas_fee + value`, so a block carrying this transaction is
+    // invalid. Checking the fee alone let it through, charging gas and
+    // silently dropping the transfer — which is how a real mainnet
+    // divergence at block 6,831,202 stayed invisible until it surfaced
+    // 32 blocks later as someone else's missing balance.
+    var state = State.init(std.testing.allocator);
+    defer state.deinit();
+    // Covers the 21000-wei fee with room to spare, but not fee plus value.
+    try state.setBalance(0x1, 21_100);
+
+    var evm = Evm{ .allocator = std.testing.allocator, .state = &state, .block = .{ .coinbase = 0xcc } };
+    var tx = testTx();
+    tx.to = 0xdd;
+    tx.gas_limit = 21_000; // exactly the intrinsic cost of a plain transfer
+    tx.gas_price = 1;
+    tx.value = 200;
+
+    try std.testing.expectError(error.InsufficientBalance, evm.executeTransaction(tx, 0x1));
+    // Rejected outright: no gas debited, no nonce burned, nothing credited.
+    try std.testing.expectEqual(@as(u256, 21_100), state.getBalance(0x1));
+    try std.testing.expectEqual(@as(u64, 0), state.get(0x1).nonce);
+    try std.testing.expectEqual(@as(u256, 0), state.getBalance(0xdd));
+}
+
+test "a sender holding exactly the gas fee plus the value it sends is accepted" {
+    var state = State.init(std.testing.allocator);
+    defer state.deinit();
+    try state.setBalance(0x1, 21_200); // exactly 21000 fee + 200 value
+
+    var evm = Evm{ .allocator = std.testing.allocator, .state = &state, .block = .{ .coinbase = 0xcc } };
+    var tx = testTx();
+    tx.to = 0xdd;
+    tx.gas_limit = 21_000; // exactly the intrinsic cost of a plain transfer
+    tx.gas_price = 1;
+    tx.value = 200;
+
+    const result = try evm.executeTransaction(tx, 0x1);
+    try std.testing.expect(result.status == .stopped);
+    try std.testing.expectEqual(@as(u256, 200), state.getBalance(0xdd));
+}
+
+test "from Spurious Dragon on, an EIP-155 transaction signed for the wrong chain id is rejected" {
+    var state = State.init(std.testing.allocator);
+    defer state.deinit();
+    try state.setBalance(0x1, 1000);
+
+    // block.chain_id defaults to 1 (mainnet); v = 35 + chain_id*2 + {0,1},
+    // so v = 43 encodes chain_id = 4, not 1.
+    var evm = Evm{ .allocator = std.testing.allocator, .state = &state, .block = .{ .fork = .spurious_dragon } };
+    var tx = testTx();
+    tx.to = 0xdd;
+    tx.v = 43;
+
+    try std.testing.expectError(error.WrongChainId, evm.executeTransaction(tx, 0x1));
+}
+
+test "from Spurious Dragon on, a legacy v (27/28) transaction is always accepted regardless of chain id" {
+    var state = State.init(std.testing.allocator);
+    defer state.deinit();
+    try state.setBalance(0x1, 1000);
+
+    var evm = Evm{ .allocator = std.testing.allocator, .state = &state, .block = .{ .fork = .spurious_dragon } };
+    var tx = testTx();
+    tx.to = 0xdd;
+    tx.v = 27;
+
+    const result = try evm.executeTransaction(tx, 0x1);
+    defer std.testing.allocator.free(result.return_data);
+    try std.testing.expectEqual(Interpreter.Status.stopped, result.status);
+}
+
+test "before Spurious Dragon, a wrong-chain-id v isn't rejected: the check doesn't exist yet" {
+    var state = State.init(std.testing.allocator);
+    defer state.deinit();
+    try state.setBalance(0x1, 1000);
+
+    var evm = Evm{ .allocator = std.testing.allocator, .state = &state, .block = .{ .fork = .tangerine_whistle } };
+    var tx = testTx();
+    tx.to = 0xdd;
+    tx.v = 43; // would encode chain_id = 4, mismatched with the default chain_id = 1
+
+    const result = try evm.executeTransaction(tx, 0x1);
+    defer std.testing.allocator.free(result.return_data);
+    try std.testing.expectEqual(Interpreter.Status.stopped, result.status);
+}
+
+test "a sender short on value alone is rejected even when the gas is free" {
+    // Previously this reverted gracefully "so it fails just that
+    // transaction, not the whole block". That leniency was wrong:
+    // execution-specs' `process_transaction` requires
+    // `balance >= gas_fee + value` and treats a block carrying such a
+    // transaction as invalid. A zero gas price makes the fee vanish, so
+    // `value` alone decides it.
     var state = State.init(std.testing.allocator);
     defer state.deinit();
     try state.setBalance(0x1, 10);
@@ -592,14 +1038,45 @@ test "insufficient balance for value alone fails just that transaction, not the 
     tx.to = 0xdd;
     tx.value = 100;
 
-    // Insufficient value alone reverts gracefully; it doesn't abort the block.
+    try std.testing.expectError(error.InsufficientBalance, evm.executeTransaction(tx, 0x1));
+    // Rejected before anything is applied: the nonce does not advance.
+    try std.testing.expectEqual(@as(u256, 10), state.getBalance(0x1));
+    try std.testing.expectEqual(@as(u64, 0), state.get(0x1).nonce);
+}
+
+test "a contract whose constructor self-destructs leaves no account behind" {
+    // Mainnet block 1,527,679 creates a contract whose init code ends in
+    // CALLER SELFDESTRUCT, so it destroys itself before ever deploying. Real
+    // chain erases it at transaction end and it exists at no block, ever.
+    // With a zero endowment and no EIP-161 nonce to set, nothing materialised
+    // the address before its constructor ran, so `destroyAccount` — which
+    // no-ops on an account that isn't there — registered nothing, and the
+    // `setCode` that follows a successful creation then made it permanent.
+    const OpCode = @import("OpCode.zig").OpCode;
+    const init_code = [_]u8{
+        @intFromEnum(OpCode.CALLER),
+        @intFromEnum(OpCode.SELFDESTRUCT),
+    };
+
+    var state = State.init(std.testing.allocator);
+    defer state.deinit();
+    try state.setBalance(0x1, 1_000_000);
+
+    var evm = Evm{
+        .allocator = std.testing.allocator,
+        .state = &state,
+        .block = .{ .coinbase = 0xcc, .fork = .homestead },
+    };
+    var tx = testTx();
+    tx.to = null;
+    tx.value = 0;
+    tx.data = &init_code;
+
     const result = try evm.executeTransaction(tx, 0x1);
     defer std.testing.allocator.free(result.return_data);
-    try std.testing.expectEqual(Interpreter.Status.reverted, result.status);
-    try std.testing.expectEqual(@as(u256, 10), state.getBalance(0x1));
-    // the nonce still advances: a failed transfer doesn't unwind the
-    // nonce increment, which happens before the transfer is attempted.
-    try std.testing.expectEqual(@as(u64, 1), state.get(0x1).nonce);
+
+    const created = result.created_address.?;
+    try std.testing.expect(!state.exists(created));
 }
 
 test "processBlock with no transactions credits the flat block reward" {
@@ -610,6 +1087,58 @@ test "processBlock with no transactions credits the flat block reward" {
     try evm.processBlock(.{ .number = 10, .miner = 0xaa, .transactions = &.{} });
 
     try std.testing.expectEqual(@as(u256, 5_000_000_000_000_000_000), state.getBalance(0xaa));
+}
+
+test "processBlock credits the reduced 3 ETH block reward from Byzantium on" {
+    var state = State.init(std.testing.allocator);
+    defer state.deinit();
+
+    var evm = Evm{ .allocator = std.testing.allocator, .state = &state };
+    try evm.processBlock(.{ .number = 4_370_000, .miner = 0xaa, .transactions = &.{} });
+
+    try std.testing.expectEqual(@as(u256, 3_000_000_000_000_000_000), state.getBalance(0xaa));
+}
+
+test "processBlock credits Byzantium's uncle rewards and nephew bonus off the reduced 3 ETH reward" {
+    var state = State.init(std.testing.allocator);
+    defer state.deinit();
+
+    var evm = Evm{ .allocator = std.testing.allocator, .state = &state };
+    try evm.processBlock(.{
+        .number = 4_370_000,
+        .miner = 0xaa,
+        .transactions = &.{},
+        .uncles = &.{.{ .number = 4_369_998, .miner = 0xbb }}, // distance = 2
+    });
+
+    // uncle: 3 ETH * (8 - 2) / 8 = 2.25 ETH
+    try std.testing.expectEqual(@as(u256, 2_250_000_000_000_000_000), state.getBalance(0xbb));
+    // miner: 3 ETH + 3 ETH/32 nephew bonus = 3.09375 ETH
+    try std.testing.expectEqual(@as(u256, 3_093_750_000_000_000_000), state.getBalance(0xaa));
+}
+
+test "processBlock applies the DAO fork's irregular state transition at exactly block 1,920,000" {
+    var state = State.init(std.testing.allocator);
+    defer state.deinit();
+    try state.setBalance(DaoFork.accounts[0], 4200);
+
+    var evm = Evm{ .allocator = std.testing.allocator, .state = &state };
+    try evm.processBlock(.{ .number = 1_920_000, .miner = 0xaa, .transactions = &.{} });
+
+    try std.testing.expectEqual(@as(u256, 0), state.getBalance(DaoFork.accounts[0]));
+    try std.testing.expectEqual(@as(u256, 4200), state.getBalance(DaoFork.recovery));
+}
+
+test "the DAO fork's state transition doesn't apply to any other block" {
+    var state = State.init(std.testing.allocator);
+    defer state.deinit();
+    try state.setBalance(DaoFork.accounts[0], 4200);
+
+    var evm = Evm{ .allocator = std.testing.allocator, .state = &state };
+    try evm.processBlock(.{ .number = 1_919_999, .miner = 0xaa, .transactions = &.{} });
+
+    try std.testing.expectEqual(@as(u256, 4200), state.getBalance(DaoFork.accounts[0]));
+    try std.testing.expectEqual(@as(u256, 0), state.getBalance(DaoFork.recovery));
 }
 
 test "processBlock runs its transactions before crediting the reward" {
