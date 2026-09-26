@@ -6,7 +6,8 @@ fn millisSince(io: std.Io, start: std.Io.Clock.Timestamp) f64 {
     return @as(f64, @floatFromInt(elapsed.raw.nanoseconds)) / 1_000_000.0;
 }
 
-pub fn main(io: std.Io) anyerror!void {
+pub fn main(io: std.Io, args: []const []const u8) anyerror!void {
+    _ = args;
     var gpa = std.heap.DebugAllocator(.{}){};
     defer std.debug.assert(gpa.deinit() == .ok);
     const allocator = gpa.allocator();

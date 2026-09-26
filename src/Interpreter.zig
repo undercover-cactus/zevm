@@ -506,14 +506,22 @@ fn step(self: *Interpreter) !void {
                 self.status = .invalid_opcode;
                 return;
             }
-            if (!self.chargeGas(gas.extcode)) return;
+            // 400 per EIP-1052, not `gas.extcode`: that is Frontier's 20 for
+            // EXTCODESIZE, and charging it here undercharged every
+            // EXTCODEHASH by 380 gas. Found at mainnet block 7,398,462.
+            if (!self.chargeGas(gas.extcodehash)) return;
             const address256 = self.popStack() orelse return;
             const state = self.state orelse {
                 self.status = .invalid_opcode;
                 return;
             };
             const address: Address = @truncate(address256);
-            self.pushStack(if (state.exists(address)) keccak256(state.getCode(address)) else 0);
+            // EIP-1052 returns 0 for an account that "does not exist or is
+            // empty (as defined by EIP-161)" — so `isAlive`, not `exists`.
+            // An existing-but-empty account (zero nonce, zero balance, no
+            // code) hashes to 0 here, *not* to `keccak256("")`; those are
+            // different answers and only the first one is correct.
+            self.pushStack(if (state.isAlive(address)) keccak256(state.getCode(address)) else 0);
             self.pc += 1;
         },
         .BLOCKHASH => {
@@ -1199,7 +1207,7 @@ fn call(self: *Interpreter, kind: CallKind) !void {
             .depth = self.depth + 1,
             .state = state,
             .block = self.block,
-            .jumpdest = state.getJumpdest(target),
+            .jumpdest = try state.getJumpdest(target),
         });
         defer child.deinit();
         try child.run();
@@ -1273,7 +1281,7 @@ pub fn createAddress(allocator: std.mem.Allocator, sender: Address, nonce: u64) 
     return @truncate(keccak256(list));
 }
 
-fn create2Address(sender: Address, salt: u256, init_code: []const u8) Address {
+pub fn create2Address(sender: Address, salt: u256, init_code: []const u8) Address {
     var buf: [1 + 20 + 32 + 32]u8 = undefined;
     buf[0] = 0xff;
     std.mem.writeInt(u160, buf[1..21], sender, .big);
@@ -1344,6 +1352,40 @@ fn createOp(self: *Interpreter, kind: CreateKind) !void {
 
     try state.setNonce(self.address, state.get(self.address).nonce + 1);
 
+    // EIP-684: creating to an address that already has code or a nonzero
+    // nonce fails immediately, "with exactly the same behavior as would
+    // arise if the first byte in the init code were an invalid opcode" —
+    // so the init code never runs and every bit of gas handed to the
+    // creation is forfeit, unlike the endowment and depth bail-outs above
+    // which hand it all back. The creator's nonce increment above still
+    // stands. `CREATE` derives its address from that nonce and so can
+    // essentially never collide, which is why this went unnoticed for
+    // 7.75M blocks; `CREATE2` picks the address by salt, so hitting an
+    // occupied one is trivial and deliberate. Found at mainnet block
+    // 7,753,545, where zevm ran the init code real chain had refused and
+    // came out 333,570 gas light.
+    const collides = state.get(new_address).nonce != 0 or state.getCode(new_address).len != 0;
+
+    // Real Frontier/Homestead/DAO forward *all* remaining gas to a nested
+    // CREATE (`create_message_gas = evm.gas_left; evm.gas_left = 0`); the
+    // 63/64ths reservation is EIP-150/Tangerine Whistle's rule, same as
+    // `call`'s.
+    const forwarded = if (self.block.fork.atLeast(.tangerine_whistle))
+        self.gas_remaining - self.gas_remaining / 64
+    else
+        self.gas_remaining;
+    self.gas_remaining -= forwarded;
+
+    if (collides) {
+        // `forwarded` is deliberately not returned: that is what makes this
+        // an exceptional halt rather than a graceful failure.
+        if (self.last_return_data.len != 0) self.allocator.free(self.last_return_data);
+        self.last_return_data = &.{};
+        self.pushStack(0);
+        self.pc += 1;
+        return;
+    }
+
     const cp = state.checkpoint();
 
     // EIP-161, from Spurious Dragon on: a freshly created contract's own
@@ -1368,16 +1410,6 @@ fn createOp(self: *Interpreter, kind: CreateKind) !void {
     // constructor registers nothing and the contract outlives the
     // transaction that should have erased it.
     try state.touch(new_address);
-
-    // Real Frontier/Homestead/DAO forward *all* remaining gas to a nested
-    // CREATE (`create_message_gas = evm.gas_left; evm.gas_left = 0`); the
-    // 63/64ths reservation is EIP-150/Tangerine Whistle's rule, same as
-    // `call`'s.
-    const forwarded = if (self.block.fork.atLeast(.tangerine_whistle))
-        self.gas_remaining - self.gas_remaining / 64
-    else
-        self.gas_remaining;
-    self.gas_remaining -= forwarded;
 
     var child = try Interpreter.initCall(self.allocator, init_code, forwarded, .{
         .address = new_address,
@@ -3852,6 +3884,86 @@ test "EXTCODEHASH of an existing account is keccak256 of its code" {
     try interp.run();
 
     try std.testing.expectEqual(keccak256(&.{ 1, 2, 3 }), try interp.stack.pop());
+}
+
+test "EXTCODEHASH of an existing but empty account is 0, not the hash of empty code" {
+    // EIP-1052 defers to EIP-161's notion of "empty": zero nonce, zero
+    // balance, no code. Such an account exists in state yet must hash to 0,
+    // which is a different answer from `keccak256("")` (0xc5d2...). Using
+    // plain existence here returns the wrong one.
+    const code = [_]u8{
+        @intFromEnum(OpCode.PUSH1), 0xbb,
+        @intFromEnum(OpCode.EXTCODEHASH),
+        @intFromEnum(OpCode.STOP),
+    };
+    var state = State.init(std.testing.allocator);
+    defer state.deinit();
+    // Materialised, but with nothing in it — exactly EIP-161's "empty".
+    try state.setBalance(0xbb, 0);
+    try std.testing.expect(state.exists(0xbb));
+
+    var interp = try Interpreter.initCall(std.testing.allocator, &code, 1_000_000, .{
+        .address = 0xaa,
+        .state = &state,
+        .block = .{ .fork = .constantinople },
+    });
+    defer interp.deinit();
+    try interp.run();
+
+    try std.testing.expectEqual(Status.stopped, interp.status);
+    try std.testing.expectEqual(@as(u256, 0), try interp.stack.pop());
+}
+
+test "EXTCODEHASH of a codeless account holding a balance is the hash of empty code" {
+    // Balance alone makes it non-empty, so it is "alive" and hashes as a
+    // real account with no code — the other side of the rule above.
+    const code = [_]u8{
+        @intFromEnum(OpCode.PUSH1), 0xbb,
+        @intFromEnum(OpCode.EXTCODEHASH),
+        @intFromEnum(OpCode.STOP),
+    };
+    var state = State.init(std.testing.allocator);
+    defer state.deinit();
+    try state.setBalance(0xbb, 1);
+
+    var interp = try Interpreter.initCall(std.testing.allocator, &code, 1_000_000, .{
+        .address = 0xaa,
+        .state = &state,
+        .block = .{ .fork = .constantinople },
+    });
+    defer interp.deinit();
+    try interp.run();
+
+    try std.testing.expectEqual(Status.stopped, interp.status);
+    try std.testing.expectEqual(keccak256(""), try interp.stack.pop());
+}
+
+test "EXTCODEHASH costs 400 gas, its own EIP-1052 price" {
+    // Not EXTCODESIZE's price in either era: 700 after EIP-150 would be an
+    // overcharge, and Frontier's 20 (which this once charged by reusing
+    // `gas.extcode`) undercharges by 380. The latter left every transaction
+    // that touched EXTCODEHASH 380 gas cheaper than real chain, first seen
+    // as a miner-balance mismatch at mainnet block 7,398,462.
+    const code = [_]u8{
+        @intFromEnum(OpCode.PUSH1), 0xbb,
+        @intFromEnum(OpCode.EXTCODEHASH),
+        @intFromEnum(OpCode.STOP),
+    };
+    var state = State.init(std.testing.allocator);
+    defer state.deinit();
+    try state.setBalance(0xbb, 1);
+
+    var interp = try Interpreter.initCall(std.testing.allocator, &code, 1_000_000, .{
+        .address = 0xaa,
+        .state = &state,
+        .block = .{ .fork = .constantinople },
+    });
+    defer interp.deinit();
+    try interp.run();
+
+    try std.testing.expectEqual(Status.stopped, interp.status);
+    // PUSH1 (3) + EXTCODEHASH (400) + STOP (0).
+    try std.testing.expectEqual(@as(u64, 1_000_000 - 3 - 400), interp.gas_remaining);
 }
 
 test "EXTCODEHASH is invalid before Constantinople" {

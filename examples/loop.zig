@@ -3,8 +3,9 @@ const zevm = @import("zevm");
 
 const OpCode = zevm.OpCode;
 
-pub fn main(io: std.Io) anyerror!void {
+pub fn main(io: std.Io, args: []const []const u8) anyerror!void {
     _ = io;
+    _ = args;
 
     // Sums 1..5 with a JUMP/JUMPI loop, keeping [acc, counter] on the stack
     // (counter on top).

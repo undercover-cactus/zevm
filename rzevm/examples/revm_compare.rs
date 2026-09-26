@@ -212,7 +212,7 @@ fn main() {
     // contract's slot 5 with 7.7e12 (a tenth of the tx's 7.7e13 value)
     // that real chain rolls back — the first corruption of that contract's
     // state, which surfaces ~27K blocks later as an InsufficientBalance.
-    let tx_hashes = ["0xd31250c86050cb571c548315c0018626989f2fb2385455ec301bd4cdd21ee1c7"];
+    let tx_hashes = ["0x9751be08e65ce89c69bd029ac63fbc4d4e9175bbfc6c8a40b652ca5842cab04a"];
 
     let last_idx = tx_hashes.len() - 1;
     let entries: Vec<(u64, TxEnv, u64)> = tx_hashes
@@ -232,7 +232,7 @@ fn main() {
     // the separate `gas_params` table intrinsic-gas validation reads,
     // leaving CREATE transactions charged modern surcharges even under
     // "Frontier". `with_spec_and_mainnet_gas_params` sets both together.
-    ctx.cfg = CfgEnv::new().with_spec_and_mainnet_gas_params(SpecId::BYZANTIUM);
+    ctx.cfg = CfgEnv::new().with_spec_and_mainnet_gas_params(SpecId::PETERSBURG);
 
     let mut entries = entries;
     let (last_block, last_tx_env, last_real_gas_used) = entries.pop().unwrap();

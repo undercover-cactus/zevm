@@ -10,13 +10,13 @@ test:
 check:
 	zig build check --summary all
 
-# Downloads real pre-merge mainnet history (blocks 0..7,274,495, the last
-# full file before Constantinople at block 7,280,000 — this Evm implements
-# up to Byzantium) as .era1 files into data/era1/. Safe to re-run: skips
-# files already downloaded.
+# Downloads real pre-merge mainnet history (blocks 0..9,068,543, the last
+# full file before Istanbul at block 9,069,000 — this Evm implements up to
+# Petersburg) as .era1 files into data/era1/. Safe to re-run: skips files
+# already downloaded.
 download-era1:
 	@mkdir -p $(ERA1_DEST)
-	@max_index=$$(( 7274495 / $(BLOCKS_PER_FILE) )); \
+	@max_index=$$(( 9068543 / $(BLOCKS_PER_FILE) )); \
 	echo "Fetching directory listing..."; \
 	listing="$$(curl -sL $(ERA1_HOST)/)"; \
 	for i in $$(seq 0 $$max_index); do \

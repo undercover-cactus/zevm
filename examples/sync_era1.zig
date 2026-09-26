@@ -12,6 +12,12 @@ const Snappy = @import("Snappy.zig");
 const secp256k1 = zevm.Secp256k1;
 const Secp256k1 = secp256k1.Secp256k1;
 
+// DEBUG: era1-replay divergence hunt scaffolding, same spirit as
+// `State.debug_enabled`. Gated by an explicit boolean rather than a
+// sentinel block number, so block 0 is not accidentally special.
+const debug_dump_block_enabled = false;
+const debug_dump_block: u64 = 6831202;
+
 fn millisSince(io: std.Io, start: std.Io.Clock.Timestamp) f64 {
     const elapsed = start.durationTo(std.Io.Clock.Timestamp.now(io, .awake));
     return @as(f64, @floatFromInt(elapsed.raw.nanoseconds)) / 1_000_000.0;
@@ -47,6 +53,15 @@ const DecodedHeader = struct {
     timestamp: u64,
     gas_limit: u64,
     difficulty: u256,
+    /// What this block commits its whole world state to. Free ground truth
+    /// for validating a replay: no RPC, no trusted third party, just the
+    /// era1 files already on disk.
+    state_root: zevm.Hash,
+    /// Total gas the block's transactions used, also committed to by the
+    /// header. Far weaker than `state_root` (it says nothing about *values*
+    /// written) but free to check and, unlike the root, cheap enough to
+    /// check on every single block.
+    gas_used: u64,
 };
 
 /// Frontier-era headers RLP-encode as a 15-field list (`parentHash,
@@ -61,6 +76,8 @@ fn decodeHeader(header: zevm.Rlp.Item) DecodedHeader {
         .timestamp = bytesToU64(header.list[11].string),
         .gas_limit = bytesToU64(header.list[9].string),
         .difficulty = bytesToU256(header.list[7].string),
+        .state_root = bytesToU256(header.list[3].string),
+        .gas_used = bytesToU64(header.list[10].string),
     };
 }
 
@@ -172,6 +189,39 @@ fn lessThanStr(_: void, a: []const u8, b: []const u8) bool {
     return std.mem.lessThan(u8, a, b);
 }
 
+/// The `stateRoot` a given block's real header commits to, read straight out
+/// of the era1 files. Ground truth with no network and no trusted third
+/// party — the same bytes the replay is being checked against.
+fn era1StateRoot(allocator: std.mem.Allocator, io: std.Io, block: u64) !zevm.Hash {
+    var dir = try std.Io.Dir.cwd().openDir(io, "data/era1", .{ .iterate = true });
+    defer dir.close(io);
+    const names = try era1FileNames(allocator, io, dir);
+    defer {
+        for (names) |n| allocator.free(n);
+        allocator.free(names);
+    }
+
+    const file_index = block / blocks_per_file;
+    if (file_index >= names.len) return error.BlockNotInEra1Files;
+    const raw = try dir.readFileAlloc(io, names[file_index], allocator, .unlimited);
+    defer allocator.free(raw);
+    const records = try readRecords(allocator, raw);
+    defer allocator.free(records);
+
+    // One version record, then four per block (header, body, receipts,
+    // total difficulty) — same layout the replay loop walks.
+    const index = 1 + (block % blocks_per_file) * 4;
+    if (index >= records.len) return error.BlockNotInEra1Files;
+    const header_rlp = try Snappy.frameDecompress(allocator, records[index].data);
+    defer allocator.free(header_rlp);
+    const item = try zevm.Rlp.decode(allocator, header_rlp);
+    defer item.deinit(allocator);
+
+    const header = decodeHeader(item);
+    if (header.number != block) return error.Era1BlockIndexMismatch;
+    return header.state_root;
+}
+
 fn era1FileNames(allocator: std.mem.Allocator, io: std.Io, dir: std.Io.Dir) ![][]u8 {
     var files: std.ArrayList([]u8) = .empty;
     errdefer {
@@ -189,42 +239,391 @@ fn era1FileNames(allocator: std.mem.Allocator, io: std.Io, dir: std.Io.Dir) ![][
     return files.toOwnedSlice(allocator);
 }
 
-pub fn main(io: std.Io) anyerror!void {
+pub fn main(io: std.Io, args: []const []const u8) anyerror!void {
     // Not `DebugAllocator` (unlike `sync.zig`'s smaller benchmark): this
     // driver's era1 decoding does a huge number of small allocations, and
     // `DebugAllocator`'s per-allocation bookkeeping dominates runtime at
     // that volume, same reasoning `ffi.zig` uses `smp_allocator` for.
     const allocator = std.heap.smp_allocator;
 
-    var state = zevm.State.init(allocator);
-    defer state.deinit();
-
-    const genesis_json = @embedFile("data/mainnet_genesis.json");
-    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, genesis_json, .{});
-    defer parsed.deinit();
-
-    var accounts = parsed.value.object.get("alloc").?.object.iterator();
-    while (accounts.next()) |entry| {
-        var address_bytes: [20]u8 = undefined;
-        _ = try std.fmt.hexToBytes(&address_bytes, entry.key_ptr.*);
-        const address: zevm.Address = std.mem.readInt(u160, &address_bytes, .big);
-
-        const balance_hex = entry.value_ptr.object.get("balance").?.string;
-        const balance = try std.fmt.parseInt(u256, balance_hex[2..], 16);
-
-        try state.setBalance(address, balance);
+    // Debugging aids for iterating on a divergence/hang found deep into a
+    // multi-million-block replay without re-running from genesis each time:
+    //   --dump-at <block> <path>   dump full state right after that block,
+    //                              then exit (block must be a file's last
+    //                              block, i.e. (block+1) % 8192 == 0).
+    //   --resume-from <path>       load state from a dump instead of
+    //                              genesis, skip straight to the block
+    //                              after it. The dump also carries
+    //                              BLOCKHASH's 256-block window, so a
+    //                              resumed run's BLOCKHASH results match a
+    //                              from-genesis run from the very next
+    //                              block on.
+    var dump_at_block: ?u64 = null;
+    // Checks the state root after *every* block rather than only at the
+    // dump point, stopping at the first mismatch. Rebuilding the whole trie
+    // per block is far too slow to leave on for a full replay, but early
+    // state is small enough that it costs little — and it names the exact
+    // block a divergence begins, which a chunk-boundary check can only
+    // narrow to 65,536 candidates.
+    var verify_roots = false;
+    // Checks the root at exactly one block, then stops. Rebuilding the trie
+    // per block (`--verify-roots`) costs ~0.4s once the account count reaches
+    // the hundreds of thousands, which is hours across a whole chunk; one
+    // check per run makes a binary search over a chunk far cheaper than
+    // walking it — ~log2(65536) = 16 runs instead of 65,536 rebuilds.
+    var root_at_block: ?u64 = null;
+    // Compares each block's total gas against its header, stopping at the
+    // first block that disagrees. Catches any gas divergence at the exact
+    // block for the cost of one addition per transaction, where a state root
+    // bisect over the same range costs ~16 full trie builds. Blind to a
+    // divergence that spends the right gas and stores the wrong value, so it
+    // narrows rather than replaces the root check.
+    var check_gas = false;
+    // Computes the state root of an existing snapshot in a fresh process. A
+    // replay process still holds its journal and allocator churn when it
+    // reaches a chunk boundary; loading the same state cold costs far less,
+    // which is what makes the very largest checkpoints verifiable at all.
+    var snapshot_root_path: ?[]const u8 = null;
+    var dump_path: []const u8 = "";
+    var resume_path: ?[]const u8 = null;
+    // --scan-miner <address> <end_block>   header-only scan (no state, no
+    //                                      tx parsing, no EVM execution) for
+    //                                      every block/uncle up to
+    //                                      end_block whose miner is
+    //                                      `address`, printing each match's
+    //                                      block number and whether it was
+    //                                      an uncle. Existed only to test
+    //                                      the "under-credited block
+    //                                      reward" hypothesis during a real
+    //                                      divergence hunt, cheaply — skips
+    //                                      the two most expensive parts of
+    //                                      a normal replay (ECDSA
+    //                                      sender-recovery and EVM
+    //                                      interpretation) entirely.
+    var scan_miner: ?zevm.Address = null;
+    var scan_end_block: u64 = 0;
+    var scan_start_block: u64 = 0;
+    var check_balance_addr: ?[]const u8 = null;
+    var check_balance_dump: []const u8 = "";
+    var check_storage_addr: ?[]const u8 = null;
+    var check_storage_slot: []const u8 = "";
+    var check_storage_dump: []const u8 = "";
+    {
+        var i: usize = 0;
+        while (i < args.len) : (i += 1) {
+            if (std.mem.eql(u8, args[i], "--check-gas")) {
+                check_gas = true;
+            } else if (std.mem.eql(u8, args[i], "--root-at") and i + 1 < args.len) {
+                root_at_block = try std.fmt.parseInt(u64, args[i + 1], 10);
+                i += 1;
+            } else if (std.mem.eql(u8, args[i], "--verify-roots")) {
+                verify_roots = true;
+            } else if (std.mem.eql(u8, args[i], "--dump-at") and i + 2 < args.len) {
+                dump_at_block = try std.fmt.parseInt(u64, args[i + 1], 10);
+                dump_path = args[i + 2];
+                i += 2;
+                // Resuming restarts at the dumped block's *file*, not the
+                // block itself: a mid-file dump makes that file's earlier
+                // blocks get replayed a second time on resume, silently
+                // double-applying their transactions (nonce mismatches
+                // downstream). Catch this immediately rather than producing
+                // a corrupt-but-successfully-written dump.
+                if ((dump_at_block.? + 1) % blocks_per_file != 0) {
+                    std.debug.print("--dump-at {d} is not a file's last block ((block+1) % {d} must be 0)\n", .{ dump_at_block.?, blocks_per_file });
+                    return error.InvalidDumpAtBlock;
+                }
+            } else if (std.mem.eql(u8, args[i], "--resume-from") and i + 1 < args.len) {
+                resume_path = args[i + 1];
+                i += 1;
+            } else if (std.mem.eql(u8, args[i], "--scan-miner") and i + 2 < args.len) {
+                var addr_bytes: [20]u8 = undefined;
+                const hex = if (std.mem.startsWith(u8, args[i + 1], "0x")) args[i + 1][2..] else args[i + 1];
+                _ = try std.fmt.hexToBytes(&addr_bytes, hex);
+                scan_miner = std.mem.readInt(u160, &addr_bytes, .big);
+                scan_end_block = try std.fmt.parseInt(u64, args[i + 2], 10);
+                i += 2;
+                // Optional 3rd arg: a starting block to skip ahead to
+                // (rounded down to its file's first block), so a scan can
+                // target a narrow known-relevant range instead of always
+                // paying full genesis-to-end_block sender-recovery cost.
+                if (i + 1 < args.len and args[i + 1].len > 0 and args[i + 1][0] != '-') {
+                    scan_start_block = try std.fmt.parseInt(u64, args[i + 1], 10);
+                    i += 1;
+                }
+            } else if (std.mem.eql(u8, args[i], "--snapshot-root") and i + 1 < args.len) {
+                snapshot_root_path = args[i + 1];
+                i += 1;
+            } else if (std.mem.eql(u8, args[i], "--check-balance") and i + 2 < args.len) {
+                check_balance_addr = args[i + 1];
+                check_balance_dump = args[i + 2];
+                i += 2;
+            } else if (std.mem.eql(u8, args[i], "--check-storage") and i + 3 < args.len) {
+                check_storage_addr = args[i + 1];
+                check_storage_slot = args[i + 2];
+                check_storage_dump = args[i + 3];
+                i += 3;
+            }
+        }
     }
-    std.debug.print("loaded {d} genesis accounts\n", .{state.accounts.count()});
+
+    // --check-balance <address> <dump-path>   loads a snapshot and prints
+    // one address's balance/nonce/existence, then exits. A quick way to
+    // ask "did zevm's own replay ever correctly credit this account by
+    // this checkpoint?" without needing @embedFile (which chokes badly at
+    // compile time on a multi-hundred-MB dump — confirmed during a real
+    // divergence hunt: hours of CPU time for what should be a few seconds).
+    if (snapshot_root_path) |path| {
+        var file = try std.Io.Dir.cwd().openFile(io, path, .{});
+        defer file.close(io);
+        const bytes = try std.posix.mmap(
+            null,
+            (try file.stat(io)).size,
+            .{ .READ = true },
+            .{ .TYPE = .PRIVATE },
+            file.handle,
+            0,
+        );
+        defer std.posix.munmap(bytes);
+        std.posix.madvise(bytes.ptr, bytes.len, std.posix.MADV.SEQUENTIAL) catch {};
+
+        const computed = try zevm.State.snapshotStateRoot(allocator, bytes);
+        const expected = try era1StateRoot(allocator, io, computed.block);
+        if (computed.root != expected) {
+            std.debug.print(
+                "STATE ROOT MISMATCH at block {d}\n  computed 0x{x:0>64}\n  header   0x{x:0>64}\n",
+                .{ computed.block, computed.root, expected },
+            );
+            return error.StateRootMismatch;
+        }
+        std.debug.print("state root OK at block {d} (0x{x:0>64})\n", .{ computed.block, computed.root });
+        return;
+    }
+
+    if (check_balance_addr) |addr_hex| {
+        var addr_bytes: [20]u8 = undefined;
+        const hex = if (std.mem.startsWith(u8, addr_hex, "0x")) addr_hex[2..] else addr_hex;
+        _ = try std.fmt.hexToBytes(&addr_bytes, hex);
+        const target: zevm.Address = std.mem.readInt(u160, &addr_bytes, .big);
+
+        const dump = try std.Io.Dir.cwd().readFileAlloc(io, check_balance_dump, allocator, .unlimited);
+        defer allocator.free(dump);
+        const snapshot = try zevm.State.loadSnapshot(allocator, dump);
+        std.debug.print("block {d}: balance={d} nonce={d} exists={}\n", .{
+            snapshot.block,
+            snapshot.state.getBalance(target),
+            snapshot.state.get(target).nonce,
+            snapshot.state.exists(target),
+        });
+        return;
+    }
+
+    // --check-storage <address> <slot> <dump-path>   same idea as
+    // --check-balance, but for a single storage slot.
+    if (check_storage_addr) |addr_hex| {
+        var addr_bytes: [20]u8 = undefined;
+        const hex = if (std.mem.startsWith(u8, addr_hex, "0x")) addr_hex[2..] else addr_hex;
+        _ = try std.fmt.hexToBytes(&addr_bytes, hex);
+        const target: zevm.Address = std.mem.readInt(u160, &addr_bytes, .big);
+        const slot: u256 = try std.fmt.parseInt(u256, check_storage_slot, 0);
+
+        const dump = try std.Io.Dir.cwd().readFileAlloc(io, check_storage_dump, allocator, .unlimited);
+        defer allocator.free(dump);
+        const snapshot = try zevm.State.loadSnapshot(allocator, dump);
+
+        // A slot of 0 means "dump the whole account instead": balance,
+        // nonce, code length, and every storage slot it has. Loading a
+        // multi-GB snapshot takes minutes, so checking a contract's whole
+        // storage one `--check-storage` call per slot is impractical —
+        // this gets all of it from a single load.
+        if (slot == 0) {
+            const account = snapshot.state.get(target);
+            // `get` returns a zeroed account for an address that isn't there,
+            // so an absent account and an existing-but-empty one print
+            // identically without this — and telling those two apart is
+            // exactly what a `SELFDESTRUCT` or EIP-161 sweep question needs.
+            std.debug.print("block {d}: exists={} balance={d} nonce={d} code_len={d} slots={d}\n", .{
+                snapshot.block,
+                snapshot.state.exists(target),
+                account.balance,
+                account.nonce,
+                account.code.len,
+                account.storage.count(),
+            });
+            var it = account.storage.iterator();
+            while (it.next()) |kv| {
+                std.debug.print("  slot {d} = {d}\n", .{ kv.key_ptr.*, kv.value_ptr.* });
+            }
+            return;
+        }
+
+        std.debug.print("block {d}: storage[{d}]={d}\n", .{
+            snapshot.block,
+            slot,
+            snapshot.state.getStorage(target, slot),
+        });
+        return;
+    }
+
+    if (scan_miner) |target| {
+        var era1_dir = try std.Io.Dir.cwd().openDir(io, "data/era1", .{ .iterate = true });
+        defer era1_dir.close(io);
+        const all_files = try era1FileNames(allocator, io, era1_dir);
+        defer {
+            for (all_files) |f| allocator.free(f);
+            allocator.free(all_files);
+        }
+        const secp = try Secp256k1.init();
+        const start_file_index = scan_start_block / blocks_per_file;
+        const scan_files = all_files[@min(start_file_index, all_files.len)..];
+
+        var matches: u64 = 0;
+        var in_total: u256 = 0;
+        var out_total: u256 = 0;
+        var out_gas_total: u256 = 0;
+        outer: for (scan_files) |file_name| {
+            const raw = try era1_dir.readFileAlloc(io, file_name, allocator, .unlimited);
+            defer allocator.free(raw);
+            const records = try readRecords(allocator, raw);
+            defer allocator.free(records);
+
+            var idx: usize = 1; // skip version record
+            while (idx < records.len and std.mem.eql(u8, &records[idx].kind, &record_type.compressed_header)) {
+                const header_record = records[idx];
+                const body_record = records[idx + 1];
+                idx += 4;
+
+                const header_rlp = try Snappy.frameDecompress(allocator, header_record.data);
+                defer allocator.free(header_rlp);
+                const header_item = try zevm.Rlp.decode(allocator, header_rlp);
+                defer header_item.deinit(allocator);
+                const header = decodeHeader(header_item);
+                if (header.number > scan_end_block) break :outer;
+
+                if (header.miner == target) {
+                    matches += 1;
+                    std.debug.print("MATCH: block {d} miner\n", .{header.number});
+                }
+
+                const body_rlp = try Snappy.frameDecompress(allocator, body_record.data);
+                defer allocator.free(body_rlp);
+                const body_item = try zevm.Rlp.decode(allocator, body_rlp);
+                defer body_item.deinit(allocator);
+                for (body_item.list[1].list) |uncle_item| {
+                    const uncle = decodeUncle(uncle_item);
+                    if (uncle.miner == target) {
+                        matches += 1;
+                        std.debug.print("MATCH: block {d} UNCLE (included in block {d})\n", .{ uncle.number, header.number });
+                    }
+                }
+
+                for (body_item.list[0].list) |tx_item| {
+                    const entry = try parseTransaction(allocator, secp, tx_item);
+                    if (entry.tx.to == target and entry.tx.value > 0) {
+                        in_total += entry.tx.value;
+                        std.debug.print("IN:  block {d} from {x} value {d} (running in_total {d})\n", .{ header.number, entry.from, entry.tx.value, in_total });
+                    }
+                    if (entry.from == target) {
+                        out_total += entry.tx.value;
+                        const gas_cost = @as(u256, entry.tx.gas_limit) * entry.tx.gas_price;
+                        out_gas_total += gas_cost;
+                        const selector = if (entry.tx.data.len >= 4) entry.tx.data[0..4] else entry.tx.data;
+                        std.debug.print("OUT: block {d} nonce {d} value {d} gas_limit {d} gas_price {d} upfront_gas {d} to {?x} selector {x} datalen {d} (running out_total {d} out_gas_total {d})\n", .{ header.number, entry.tx.nonce, entry.tx.value, entry.tx.gas_limit, entry.tx.gas_price, gas_cost, entry.tx.to, selector, entry.tx.data.len, out_total, out_gas_total });
+                    }
+                }
+            }
+        }
+        std.debug.print("scan done: {d} miner matches, in_total={d} out_total={d} out_gas_total={d} (upfront, not actual gas used) through block {d}\n", .{ matches, in_total, out_total, out_gas_total, scan_end_block });
+        return;
+    }
+
+    var state: zevm.State = undefined;
+    var starting_block: u64 = 0;
+    // Populated from the dump when resuming; otherwise `recent_hashes`
+    // below just starts empty, same as a from-genesis run.
+    var resumed_hashes: []zevm.Hash = &.{};
+    if (resume_path) |path| {
+        // Mapped rather than read into a heap buffer: the snapshot runs
+        // ~20GB at this depth, and `readFileAlloc` would hold all of it as
+        // anonymous memory for the whole load, on top of the ~44GB of state
+        // being built from it. A mapping's pages are file-backed and clean,
+        // so the kernel can evict them under pressure instead of OOM-killing
+        // the replay (which it did, twice). `loadSnapshot` copies out every
+        // byte it keeps (code included), so nothing points into the mapping
+        // once it returns.
+        var file = try std.Io.Dir.cwd().openFile(io, path, .{});
+        defer file.close(io);
+        const dump = try std.posix.mmap(
+            null,
+            (try file.stat(io)).size,
+            .{ .READ = true },
+            .{ .TYPE = .PRIVATE },
+            file.handle,
+            0,
+        );
+        // Deliberately NOT unmapped: the loaded state's contract code points
+        // into this mapping rather than being copied to the heap (see
+        // `State.snapshot_bytes`), so it has to outlive the state. It is
+        // released when the process exits, which is the same moment the
+        // state is discarded anyway.
+        //
+        // No `MADV_SEQUENTIAL` either, for the same reason. The load itself
+        // is one front-to-back pass and would benefit, but the code pages
+        // are read again at random throughout the replay, and advising the
+        // kernel to drop what it has just passed makes every later `CALL`
+        // fault its callee's code back in.
+        const snapshot = try zevm.State.loadSnapshot(allocator, dump);
+        state = snapshot.state;
+        starting_block = snapshot.block + 1;
+        resumed_hashes = snapshot.recent_hashes;
+        std.debug.print("resumed from block {d}, starting at {d} ({d} accounts)\n", .{ snapshot.block, starting_block, state.accounts.count() });
+    } else {
+        state = zevm.State.init(allocator);
+
+        const genesis_json = @embedFile("data/mainnet_genesis.json");
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, genesis_json, .{});
+        defer parsed.deinit();
+
+        var accounts = parsed.value.object.get("alloc").?.object.iterator();
+        while (accounts.next()) |entry| {
+            var address_bytes: [20]u8 = undefined;
+            _ = try std.fmt.hexToBytes(&address_bytes, entry.key_ptr.*);
+            const address: zevm.Address = std.mem.readInt(u160, &address_bytes, .big);
+
+            const balance_hex = entry.value_ptr.object.get("balance").?.string;
+            const balance = try std.fmt.parseInt(u256, balance_hex[2..], 16);
+
+            try state.setBalance(address, balance);
+        }
+        std.debug.print("loaded {d} genesis accounts\n", .{state.accounts.count()});
+
+        // Mainnet's genesis state root is a published constant, and the
+        // genesis allocation is small enough to hash in well under a second.
+        // Checking it here means a broken trie is caught before a single
+        // block is replayed, rather than looking like a consensus bug later.
+        const genesis_root = try state.stateRoot(allocator);
+        const expected_genesis_root: zevm.Hash = 0xd7f8974fb5ac78d9ac099b9ad5018bedc2ce0a72dad1827a1709da30580f0544;
+        if (genesis_root != expected_genesis_root) {
+            std.debug.print(
+                "genesis state root MISMATCH\n  computed 0x{x:0>64}\n  expected 0x{x:0>64}\n",
+                .{ genesis_root, expected_genesis_root },
+            );
+            return error.GenesisStateRootMismatch;
+        }
+        std.debug.print("genesis state root OK (0x{x:0>64})\n", .{genesis_root});
+    }
+    defer state.deinit();
 
     var era1_dir = try std.Io.Dir.cwd().openDir(io, "data/era1", .{ .iterate = true });
     defer era1_dir.close(io);
 
-    const files = try era1FileNames(allocator, io, era1_dir);
+    const all_files = try era1FileNames(allocator, io, era1_dir);
     defer {
-        for (files) |f| allocator.free(f);
-        allocator.free(files);
+        for (all_files) |f| allocator.free(f);
+        allocator.free(all_files);
     }
-    std.debug.print("found {d} era1 files\n", .{files.len});
+    const start_file_index = starting_block / blocks_per_file;
+    const files = all_files[@min(start_file_index, all_files.len)..];
+    std.debug.print("found {d} era1 files ({d} remaining after skip)\n", .{ all_files.len, files.len });
 
     var evm = zevm.Evm{ .allocator = allocator, .state = &state };
     const secp = try Secp256k1.init();
@@ -251,10 +650,12 @@ pub fn main(io: std.Io) anyerror!void {
 
     // BLOCKHASH's lookup window, most recent first (index 0 is the
     // previous block's hash), capped at the 256 blocks real Ethereum keeps.
-    var recent_hashes: std.ArrayList(zevm.Hash) = .empty;
+    // Seeded from the dump on resume (`resumed_hashes`), empty otherwise —
+    // either way, ownership transfers straight into the list, no copy.
+    var recent_hashes: std.ArrayList(zevm.Hash) = if (resumed_hashes.len != 0) .fromOwnedSlice(resumed_hashes) else .empty;
     defer recent_hashes.deinit(allocator);
 
-    for (files, 0..) |file_name, file_index| {
+    for (files, start_file_index..) |file_name, file_index| {
         const raw = try era1_dir.readFileAlloc(io, file_name, allocator, .unlimited);
         defer allocator.free(raw);
 
@@ -307,6 +708,17 @@ pub fn main(io: std.Io) anyerror!void {
             }
             transactions_in_file += entries.items.len;
 
+            // DEBUG: era1-replay divergence hunt. Dumps every transaction of
+            // one specific block exactly as zevm parsed it, to compare
+            // against the real chain's block body. Gated by an explicit
+            // boolean, not a sentinel block number.
+            if (debug_dump_block_enabled and header.number == debug_dump_block) {
+                std.debug.print("DEBUG block {d}: zevm parsed {d} transactions\n", .{ header.number, entries.items.len });
+                for (entries.items, 0..) |e, ti| {
+                    std.debug.print("DEBUG   tx[{d}] from={x} to={?x} nonce={d} value={d} gas_limit={d} gas_price={d}\n", .{ ti, e.from, e.tx.to, e.tx.nonce, e.tx.value, e.tx.gas_limit, e.tx.gas_price });
+                }
+            }
+
             var uncles: std.ArrayList(zevm.Block.Uncle) = .empty;
             defer uncles.deinit(allocator);
             for (uncles_rlp) |uncle_item| {
@@ -317,21 +729,65 @@ pub fn main(io: std.Io) anyerror!void {
             decode_ns += @intCast(decode_start.durationTo(std.Io.Clock.Timestamp.now(io, .awake)).raw.nanoseconds);
             const execute_start = std.Io.Clock.Timestamp.now(io, .awake);
 
-            evm.processBlock(.{
-                .number = header.number,
-                .miner = header.miner,
-                .transactions = entries.items,
-                .uncles = uncles.items,
-                .timestamp = header.timestamp,
-                .gas_limit = header.gas_limit,
-                .difficulty = header.difficulty,
-                .recent_hashes = recent_hashes.items,
-            }) catch |err| {
-                std.debug.print("block {d} failed: {s}\n", .{ header.number, @errorName(err) });
-                return err;
-            };
+            // Block 0 is genesis itself: its state *is* the allocation loaded
+            // above, not something produced by executing it. Replaying it
+            // credits a block reward for a block that never had a miner,
+            // inventing an account at the zero address — holding 5 ETH — that
+            // real chain has never had. Its hash is still recorded below,
+            // since block 1's `BLOCKHASH` can legitimately ask for it.
+            if (header.number != 0) {
+                evm.processBlock(.{
+                    .number = header.number,
+                    .miner = header.miner,
+                    .transactions = entries.items,
+                    .uncles = uncles.items,
+                    .timestamp = header.timestamp,
+                    .gas_limit = header.gas_limit,
+                    .difficulty = header.difficulty,
+                    .recent_hashes = recent_hashes.items,
+                }) catch |err| {
+                    std.debug.print("block {d} failed: {s}\n", .{ header.number, @errorName(err) });
+                    return err;
+                };
+            }
 
             execute_ns += @intCast(execute_start.durationTo(std.Io.Clock.Timestamp.now(io, .awake)).raw.nanoseconds);
+
+            if (check_gas and evm.block_gas_used != header.gas_used) {
+                std.debug.print(
+                    "BLOCK GAS MISMATCH at block {d}\n  zevm   {d}\n  header {d}\n  (difference {d}, {d} transactions)\n",
+                    .{ header.number, evm.block_gas_used, header.gas_used, @as(i128, evm.block_gas_used) - @as(i128, header.gas_used), entries.items.len },
+                );
+                return error.BlockGasMismatch;
+            }
+
+            if (root_at_block == header.number) {
+                state.releaseJournal();
+                const computed_root = try state.stateRootConsuming(allocator);
+                if (computed_root == header.state_root) {
+                    std.debug.print("ROOT OK at block {d} ({d} accounts)\n", .{ header.number, state.accounts.count() });
+                    return;
+                }
+                std.debug.print(
+                    "ROOT MISMATCH at block {d}\n  computed 0x{x:0>64}\n  header   0x{x:0>64}\n  ({d} accounts)\n",
+                    .{ header.number, computed_root, header.state_root, state.accounts.count() },
+                );
+                return error.StateRootMismatch;
+            }
+
+            if (verify_roots) {
+                // Non-consuming, and the journal stays: unlike every other
+                // root check here, this one runs *mid-replay* and the state
+                // has to survive it intact for the next block.
+                const computed_root = try state.stateRoot(allocator);
+                if (computed_root != header.state_root) {
+                    std.debug.print(
+                        "STATE ROOT MISMATCH at block {d}\n  computed 0x{x:0>64}\n  header   0x{x:0>64}\n  ({d} accounts, {d} transactions in this block)\n",
+                        .{ header.number, computed_root, header.state_root, state.accounts.count(), entries.items.len },
+                    );
+                    return error.StateRootMismatch;
+                }
+            }
 
             // This block's own hash becomes available for BLOCKHASH lookups
             // starting with the *next* block, pushed after the call so
@@ -340,13 +796,42 @@ pub fn main(io: std.Io) anyerror!void {
             if (recent_hashes.items.len > 256) recent_hashes.shrinkRetainingCapacity(256);
 
             blocks_in_file += 1;
+
+            if (dump_at_block == header.number) {
+
+                // Streamed straight to the file rather than built up in a
+                // `Writer.Allocating`: past block ~6M the snapshot runs
+                // ~20GB, and buffering it whole (with a doubling realloc
+                // briefly holding two copies) on top of the ~44GB of live
+                // state peaked over this machine's 62GB and got the replay
+                // OOM-killed mid-run.
+                var dump_file = try std.Io.Dir.cwd().createFile(io, dump_path, .{});
+                defer dump_file.close(io);
+                const dump_buf = try allocator.alloc(u8, 1 << 20);
+                defer allocator.free(dump_buf);
+                var dump_writer = dump_file.writer(io, dump_buf);
+                try state.writeSnapshot(&dump_writer.interface, header.number, recent_hashes.items);
+                try dump_writer.interface.flush();
+                std.debug.print("dumped snapshot at block {d} to {s} ({d} accounts)\n", .{ header.number, dump_path, state.accounts.count() });
+
+                // The root is deliberately NOT checked here. Doing it in
+                // this process means holding the entire live state — hashmap
+                // table, every Account, every storage map — while the trie's
+                // entries are built alongside it, which past ~52M accounts
+                // peaked near 58GB and was killed three times running.
+                // `--snapshot-root` recomputes the same root from this file
+                // by streaming it, at roughly a third of the memory, and
+                // checks it against the era1 header itself. The driver runs
+                // that as its own step before accepting the chunk.
+                return;
+            }
         }
         blocks_processed += blocks_in_file;
         transactions_processed += transactions_in_file;
 
         std.debug.print("[{d}/{d}] {s}: {d} blocks, {d} transactions processed\n", .{
             file_index + 1,
-            files.len,
+            all_files.len,
             file_name,
             blocks_in_file,
             transactions_in_file,

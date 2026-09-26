@@ -2,9 +2,14 @@
 //! protocol-defined set, hence a plain enum rather than something
 //! extensible.
 //!
-//! Only `frontier` through `byzantium` have any actual behavior modeled
+//! Only `frontier` through `petersburg` have any actual behavior modeled
 //! (see `Evm.processBlock`'s guard); the rest exists so the block-to-fork
 //! mapping is complete.
+//!
+//! `constantinople` and `petersburg` share block 7,280,000 on mainnet:
+//! Constantinople shipped, but its EIP-1283 SSTORE repricing was withdrawn
+//! by Petersburg in the same upgrade, so no mainnet block ever ran under
+//! Constantinople's rules alone.
 
 const std = @import("std");
 

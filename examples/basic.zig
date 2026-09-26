@@ -1,8 +1,9 @@
 const std = @import("std");
 const zevm = @import("zevm");
 
-pub fn main(io: std.Io) anyerror!void {
+pub fn main(io: std.Io, args: []const []const u8) anyerror!void {
     _ = io;
+    _ = args;
     var gpa = std.heap.DebugAllocator(.{}){};
     defer std.debug.assert(gpa.deinit() == .ok);
     const allocator = gpa.allocator();

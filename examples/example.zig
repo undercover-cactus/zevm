@@ -5,7 +5,7 @@ const sync = @import("./sync.zig");
 const sync_era1 = @import("./sync_era1.zig");
 const eq = std.mem.eql;
 
-const ExampleProgram = *const fn (std.Io) anyerror!void;
+const ExampleProgram = *const fn (std.Io, []const []const u8) anyerror!void;
 
 fn getExample(example_name: []const u8) ?ExampleProgram {
     if (eq(u8, "basic", example_name)) return basic.main;
@@ -15,10 +15,10 @@ fn getExample(example_name: []const u8) ?ExampleProgram {
     return null;
 }
 
-fn runExample(io: std.Io, example_name: []const u8) !void {
+fn runExample(io: std.Io, example_name: []const u8, extra_args: []const []const u8) !void {
     const example = getExample(example_name);
     if (example) |program| {
-        try program(io);
+        try program(io, extra_args);
     } else {
         std.debug.print("Unknown example {s}\n", .{example_name});
     }
@@ -30,7 +30,12 @@ pub fn main(init: std.process.Init) !void {
 
     const arg = args.next();
     if (arg) |example_name| {
-        try runExample(init.io, example_name);
+        // Whatever's left after the example name, e.g. sync_era1's
+        // `--dump-at`/`--resume-from`. Arena-allocated: freed automatically
+        // on exit, not worth a manual deinit.
+        var extra: std.ArrayList([]const u8) = .empty;
+        while (args.next()) |extra_arg| try extra.append(init.arena.allocator(), extra_arg);
+        try runExample(init.io, example_name, extra.items);
     } else {
         std.debug.print("Usage: zig build example -- <example-name>\n\n", .{});
         std.debug.print("Available examples:\n", .{});

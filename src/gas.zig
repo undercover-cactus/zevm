@@ -53,6 +53,10 @@ pub const balance_150: u64 = 400;
 /// raised this to `extcode_150`.
 pub const extcode: u64 = 20;
 pub const extcode_150: u64 = 700;
+/// `EXTCODEHASH`, EIP-1052 (Constantinople). Its own price, not
+/// `EXTCODESIZE`'s: 400, cheaper than the 700 the other EXTCODE* opcodes
+/// cost after EIP-150, on the grounds that a hash lookup is one trie read.
+pub const extcodehash: u64 = 400;
 pub const blockhash: u64 = 20;
 
 pub const log_base: u64 = 375;

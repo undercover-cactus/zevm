@@ -41,12 +41,16 @@ use std::time::{Duration, Instant};
 
 const BLOCKS_PER_FILE: u64 = 8192;
 
-// Block reward in wei: 5 ETH pre-Byzantium, cut to 3 ETH by EIP-649.
+// Block reward in wei: 5 ETH originally, cut to 3 ETH by EIP-649 at
+// Byzantium and to 2 ETH by EIP-1234 at Constantinople.
 const BLOCK_REWARD_PRE_BYZANTIUM: u128 = 5_000_000_000_000_000_000;
 const BLOCK_REWARD_BYZANTIUM: u128 = 3_000_000_000_000_000_000;
+const BLOCK_REWARD_CONSTANTINOPLE: u128 = 2_000_000_000_000_000_000;
 
-fn block_reward(is_byzantium: bool) -> u128 {
-    if is_byzantium {
+fn block_reward(is_byzantium: bool, is_constantinople: bool) -> u128 {
+    if is_constantinople {
+        BLOCK_REWARD_CONSTANTINOPLE
+    } else if is_byzantium {
         BLOCK_REWARD_BYZANTIUM
     } else {
         BLOCK_REWARD_PRE_BYZANTIUM
@@ -431,6 +435,7 @@ fn main() {
     let mut is_tangerine = false;
     let mut is_spurious_dragon = false;
     let mut is_byzantium = false;
+    let mut is_constantinople = false;
 
     for (i, path) in files.iter().enumerate() {
         let raw = fs::read(path).expect("read era1 file");
@@ -507,6 +512,15 @@ fn main() {
                 ctx.cfg = CfgEnv::new().with_spec_and_mainnet_gas_params(SpecId::BYZANTIUM);
                 evm = ctx.build_mainnet();
                 is_byzantium = true;
+            }
+            // Constantinople and Petersburg activated together at 7,280,000,
+            // so PETERSBURG (Constantinople minus the withdrawn EIP-1283) is
+            // the spec every mainnet block from here on actually ran under.
+            if !is_constantinople && header.number >= 7_280_000 {
+                let mut ctx = evm.ctx;
+                ctx.cfg = CfgEnv::new().with_spec_and_mainnet_gas_params(SpecId::PETERSBURG);
+                evm = ctx.build_mainnet();
+                is_constantinople = true;
             }
             evm.ctx.block.number = U256::from(header.number);
             evm.ctx.block.beneficiary = header.miner;
@@ -608,7 +622,7 @@ fn main() {
             let execute_t0 = Instant::now();
             // Block + uncle rewards: revm only executes transactions, it
             // doesn't know about mining rewards.
-            let reward = U256::from(block_reward(is_byzantium));
+            let reward = U256::from(block_reward(is_byzantium, is_constantinople));
             let mut miner_reward = reward;
             for uncle in &uncles {
                 let distance = header.number - uncle.number;

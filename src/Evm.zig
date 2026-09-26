@@ -1,8 +1,13 @@
 //! Executes a decoded `Transaction` against a `State`.
 //!
-//! Only Frontier through Byzantium are implemented. `processBlock` panics
+//! Only Frontier through Petersburg are implemented. `processBlock` panics
 //! on any block from a later fork (see `Fork`) instead of silently
 //! applying stale rules.
+//!
+//! Constantinople and Petersburg share a block on mainnet (7,280,000):
+//! Constantinople's EIP-1283 SSTORE repricing was withdrawn by Petersburg
+//! before either ever ran, so no block on this chain uses it and it is
+//! deliberately not implemented. `SSTORE` keeps Byzantium's pricing.
 
 const std = @import("std");
 const Address = @import("Address.zig").Address;
@@ -23,13 +28,22 @@ state: *State,
 block: Interpreter.BlockContext = .{},
 /// The transaction currently executing, set by `executeTransaction` itself.
 tx: Interpreter.TxContext = .{},
+/// Total gas used by the last `processBlock`'s transactions. A real block
+/// header commits to this, so comparing the two catches any gas divergence
+/// at the exact block it happens, at full replay speed and without building
+/// a state trie.
+block_gas_used: u64 = 0,
 
 const Evm = @This();
 
 /// Miner reward for a block with no uncles: Frontier's flat 5 ETH, cut to
-/// 3 ETH by EIP-649 at Byzantium.
+/// 3 ETH by EIP-649 at Byzantium and again to 2 ETH by EIP-1234 at
+/// Constantinople. Both EIPs also delayed the difficulty bomb, which is a
+/// mining-difficulty concern and not something this executes.
 fn blockReward(fork: Fork) u256 {
-    return if (fork.atLeast(.byzantium)) 3_000_000_000_000_000_000 else 5_000_000_000_000_000_000;
+    if (fork.atLeast(.constantinople)) return 2_000_000_000_000_000_000;
+    if (fork.atLeast(.byzantium)) return 3_000_000_000_000_000_000;
+    return 5_000_000_000_000_000_000;
 }
 
 pub const Result = struct {
@@ -44,11 +58,30 @@ pub const Result = struct {
     gas_used: u64 = 0,
 };
 
+// DEBUG: era1-replay divergence hunt scaffolding. Emits an EIP-3155 step
+// trace for exactly one transaction of the live replay (real state, no
+// seeding), for diffing against revm's trace of the same transaction.
+// Gated by an explicit boolean, never by the address values alone.
+const debug_trace_tx_enabled = false;
+const debug_trace_tx_block: u64 = 7_753_545;
+const debug_trace_tx_from: Address = 0x151e7f516f1f2002e9fbfaacebe87c4bd346941e;
+const debug_tx_summary_enabled = false;
+
 pub fn executeTransaction(self: *Evm, tx: Transaction, from: Address) !Result {
     // DEBUG: resets Interpreter's step-count safety valve (see its doc
     // comment) so it measures *this* transaction's total, not a running
     // total across the whole replay.
     Interpreter.debug_total_step_count = 0;
+
+    const tracing = debug_trace_tx_enabled and self.block.number == debug_trace_tx_block and from == debug_trace_tx_from;
+    if (tracing) Interpreter.step_trace_enabled = true;
+    defer if (tracing) {
+        Interpreter.step_trace_enabled = false;
+    };
+    // DEBUG: one line per transaction of the target block (gas used and
+    // status), to diff against the real receipts and find which
+    // transaction's execution diverges without tracing all of them.
+    const summarizing = debug_tx_summary_enabled and self.block.number == debug_trace_tx_block;
 
     // A nonce mismatch means we fed transactions out of order, not that the
     // transaction itself is invalid. Worth panicking on immediately.
@@ -123,6 +156,10 @@ pub fn executeTransaction(self: *Evm, tx: Transaction, from: Address) !Result {
     // at the end of a transaction.
     self.state.finalizeTransaction();
 
+    if (summarizing) {
+        std.debug.print("DEBUG txsum from={x} to={?x} nonce={d} gas_used={d} status={s}\n", .{ from, tx.to, tx.nonce, result.gas_used, @tagName(result.status) });
+    }
+
     return result;
 }
 
@@ -132,9 +169,9 @@ pub fn executeTransaction(self: *Evm, tx: Transaction, from: Address) !Result {
 pub fn processBlock(self: *Evm, block: Block) !void {
     State.debug_block_number = block.number;
     const fork = Fork.at(block.number);
-    if (fork.atLeast(.constantinople)) {
+    if (fork.atLeast(.istanbul)) {
         std.debug.panic(
-            "block {d} is past Byzantium (fork: {s}): this Evm only implements up to Byzantium's rules",
+            "block {d} is past Petersburg (fork: {s}): this Evm only implements up to Petersburg's rules",
             .{ block.number, @tagName(fork) },
         );
     }
@@ -157,8 +194,10 @@ pub fn processBlock(self: *Evm, block: Block) !void {
         .fork = fork,
     };
 
+    self.block_gas_used = 0;
     for (block.transactions) |entry| {
         const result = try self.executeTransaction(entry.tx, entry.from);
+        self.block_gas_used += result.gas_used;
         self.allocator.free(result.return_data);
     }
 
@@ -173,6 +212,7 @@ pub fn processBlock(self: *Evm, block: Block) !void {
         miner_reward += reward / 32; // "nephew" bonus for including it
     }
     try self.state.creditBalance(block.miner, miner_reward);
+    self.state.debugDumpBlockAccounts();
 }
 
 fn call(self: *Evm, value: u256, data: []const u8, gas_limit: u64, from: Address, to: Address) !Result {
@@ -251,7 +291,7 @@ fn call(self: *Evm, value: u256, data: []const u8, gas_limit: u64, from: Address
         .tx = self.tx,
         .state = self.state,
         .block = self.block,
-        .jumpdest = self.state.getJumpdest(to),
+        .jumpdest = try self.state.getJumpdest(to),
     });
     defer interp.deinit();
     try interp.run();
@@ -285,6 +325,23 @@ fn gasUsed(status: Interpreter.Status, gas_remaining: u64, refund: u64, executio
 
 fn create(self: *Evm, nonce: u64, value: u256, data: []const u8, gas_limit: u64, from: Address) !Result {
     const new_address = try Interpreter.createAddress(self.allocator, from, nonce);
+
+    // EIP-684, the transaction-level half of the rule `Interpreter.createOp`
+    // enforces for the opcodes (execution-specs checks it in
+    // `process_message_call`, before the creation even begins): an address
+    // that already holds code or a nonzero nonce cannot be created at, and
+    // the attempt forfeits the whole gas limit. A creation transaction
+    // derives its address from the sender's nonce, so reaching this needs a
+    // genuine collision rather than a chosen salt, but the rule is the same.
+    if (self.state.get(new_address).nonce != 0 or self.state.getCode(new_address).len != 0) {
+        return .{
+            .status = .out_of_gas,
+            .return_data = try self.allocator.alloc(u8, 0),
+            .created_address = new_address,
+            .gas_used = gas_limit,
+        };
+    }
+
     const cp = self.state.checkpoint();
 
     // EIP-161, from Spurious Dragon on: a freshly created contract's own
@@ -1079,6 +1136,186 @@ test "a contract whose constructor self-destructs leaves no account behind" {
     try std.testing.expect(!state.exists(created));
 }
 
+test "a reverting creation takes a nested CREATE2's deployed code with it, even to a pre-funded address" {
+    // Mainnet block 7,306,818, tx 26: a creation's init code CREATE2s a
+    // contract at an address someone had already sent ether to, that nested
+    // creation succeeds and deploys code, then the outer init code REVERTs.
+    // Real chain leaves the pre-funded address exactly as it was. zevm
+    // restored its balance and storage through the journal but, with
+    // `setCode` unjournaled, left the deployed code in place. A fresh
+    // address would have hidden this: its `.created` entry makes the revert
+    // delete the whole account. Only a pre-existing target exposes it.
+    const OpCode = @import("OpCode.zig").OpCode;
+
+    // Nested init code: deploy one byte of runtime code (STOP).
+    const inner_init = [_]u8{
+        @intFromEnum(OpCode.PUSH1), 0x00,
+        @intFromEnum(OpCode.PUSH1), 0x00,
+        @intFromEnum(OpCode.MSTORE8),
+        @intFromEnum(OpCode.PUSH1), 0x01,
+        @intFromEnum(OpCode.PUSH1), 0x00,
+        @intFromEnum(OpCode.RETURN),
+    };
+    const salt: u256 = 7;
+
+    // Outer init code: put inner_init in memory, CREATE2 it, then REVERT.
+    var outer: std.ArrayList(u8) = .empty;
+    defer outer.deinit(std.testing.allocator);
+    var word: [32]u8 = [_]u8{0} ** 32;
+    @memcpy(word[32 - inner_init.len ..], &inner_init);
+    try outer.append(std.testing.allocator, @intFromEnum(OpCode.PUSH32));
+    try outer.appendSlice(std.testing.allocator, &word);
+    try outer.appendSlice(std.testing.allocator, &.{
+        @intFromEnum(OpCode.PUSH1), 0x00,
+        @intFromEnum(OpCode.MSTORE),
+        @intFromEnum(OpCode.PUSH1), @intCast(salt),
+        @intFromEnum(OpCode.PUSH1), @intCast(inner_init.len),
+        @intFromEnum(OpCode.PUSH1), @intCast(32 - inner_init.len),
+        @intFromEnum(OpCode.PUSH1), 0x00,
+        @intFromEnum(OpCode.CREATE2),
+        @intFromEnum(OpCode.POP),
+        @intFromEnum(OpCode.PUSH1), 0x00,
+        @intFromEnum(OpCode.PUSH1), 0x00,
+        @intFromEnum(OpCode.REVERT),
+    });
+
+    const sender: Address = 0x1;
+    const outer_address = try Interpreter.createAddress(std.testing.allocator, sender, 0);
+    const target = Interpreter.create2Address(outer_address, salt, &inner_init);
+
+    var state = State.init(std.testing.allocator);
+    defer state.deinit();
+    try state.setBalance(sender, 10_000_000);
+    try state.setBalance(target, 5_000_000_000_000_000); // pre-funded, like mainnet
+
+    var evm = Evm{
+        .allocator = std.testing.allocator,
+        .state = &state,
+        .block = .{ .coinbase = 0xcc, .fork = .constantinople },
+    };
+    var tx = testTx();
+    tx.to = null;
+    tx.data = outer.items;
+
+    const result = try evm.executeTransaction(tx, sender);
+    defer std.testing.allocator.free(result.return_data);
+    try std.testing.expectEqual(Interpreter.Status.reverted, result.status);
+
+    // The target is exactly as it was before: funded, uncoded, nonce 0.
+    try std.testing.expect(state.exists(target));
+    try std.testing.expectEqual(@as(usize, 0), state.getCode(target).len);
+    try std.testing.expectEqual(@as(u256, 5_000_000_000_000_000), state.getBalance(target));
+    try std.testing.expectEqual(@as(u64, 0), state.get(target).nonce);
+    // And the reverted creation itself left nothing behind.
+    try std.testing.expect(!state.exists(outer_address));
+}
+
+test "CREATE2 to an address that already has code forfeits all its gas" {
+    // EIP-684: the creation fails "as if the first byte in the init code
+    // were an invalid opcode", so the init code never runs and every bit of
+    // gas handed to the creation is gone. Not the graceful push-0-and-refund
+    // of the endowment and depth checks. Mainnet block 7,753,545 does this
+    // deliberately: zevm ran the init code real chain had refused and came
+    // out 333,570 gas light on the block.
+    const OpCode = @import("OpCode.zig").OpCode;
+
+    // Init code that would deploy one byte of runtime code, if it ever ran.
+    const inner_init = [_]u8{
+        @intFromEnum(OpCode.PUSH1), 0x00,
+        @intFromEnum(OpCode.PUSH1), 0x00,
+        @intFromEnum(OpCode.MSTORE8),
+        @intFromEnum(OpCode.PUSH1), 0x01,
+        @intFromEnum(OpCode.PUSH1), 0x00,
+        @intFromEnum(OpCode.RETURN),
+    };
+    const salt: u256 = 7;
+
+    var outer: std.ArrayList(u8) = .empty;
+    defer outer.deinit(std.testing.allocator);
+    var word: [32]u8 = [_]u8{0} ** 32;
+    @memcpy(word[32 - inner_init.len ..], &inner_init);
+    try outer.append(std.testing.allocator, @intFromEnum(OpCode.PUSH32));
+    try outer.appendSlice(std.testing.allocator, &word);
+    try outer.appendSlice(std.testing.allocator, &.{
+        @intFromEnum(OpCode.PUSH1), 0x00,
+        @intFromEnum(OpCode.MSTORE),
+        @intFromEnum(OpCode.PUSH1), @intCast(salt),
+        @intFromEnum(OpCode.PUSH1), @intCast(inner_init.len),
+        @intFromEnum(OpCode.PUSH1), @intCast(32 - inner_init.len),
+        @intFromEnum(OpCode.PUSH1), 0x00,
+        @intFromEnum(OpCode.CREATE2),
+        @intFromEnum(OpCode.STOP),
+    });
+
+    const caller: Address = 0xaa;
+    const target = Interpreter.create2Address(caller, salt, &inner_init);
+
+    var state = State.init(std.testing.allocator);
+    defer state.deinit();
+    try state.setCode(caller, outer.items);
+    // The target is already occupied: this is the collision.
+    try state.setCode(target, &.{@intFromEnum(OpCode.STOP)});
+
+    var interp = try Interpreter.initCall(std.testing.allocator, outer.items, 1_000_000, .{
+        .address = caller,
+        .state = &state,
+        .block = .{ .fork = .constantinople },
+    });
+    defer interp.deinit();
+    try interp.run();
+
+    try std.testing.expectEqual(Interpreter.Status.stopped, interp.status);
+    try std.testing.expectEqual(@as(u256, 0), try interp.stack.pop());
+    // Everything forwarded is forfeit, so only the 1/64th reservation is
+    // left. A graceful failure would have refunded nearly all of it.
+    try std.testing.expect(interp.gas_remaining < 20_000);
+    // The occupied account is untouched.
+    try std.testing.expectEqual(@as(usize, 1), state.getCode(target).len);
+}
+
+test "a CREATE2 collision still consumes the creator's nonce" {
+    const OpCode = @import("OpCode.zig").OpCode;
+    const inner_init = [_]u8{@intFromEnum(OpCode.STOP)};
+    const salt: u256 = 3;
+    const caller: Address = 0xaa;
+    const target = Interpreter.create2Address(caller, salt, &inner_init);
+
+    var code: std.ArrayList(u8) = .empty;
+    defer code.deinit(std.testing.allocator);
+    var word: [32]u8 = [_]u8{0} ** 32;
+    word[31] = @intFromEnum(OpCode.STOP);
+    try code.append(std.testing.allocator, @intFromEnum(OpCode.PUSH32));
+    try code.appendSlice(std.testing.allocator, &word);
+    try code.appendSlice(std.testing.allocator, &.{
+        @intFromEnum(OpCode.PUSH1), 0x00,
+        @intFromEnum(OpCode.MSTORE),
+        @intFromEnum(OpCode.PUSH1), @intCast(salt),
+        @intFromEnum(OpCode.PUSH1), 0x01,
+        @intFromEnum(OpCode.PUSH1), 0x1f,
+        @intFromEnum(OpCode.PUSH1), 0x00,
+        @intFromEnum(OpCode.CREATE2),
+        @intFromEnum(OpCode.STOP),
+    });
+
+    var state = State.init(std.testing.allocator);
+    defer state.deinit();
+    try state.setCode(caller, code.items);
+    try state.setNonce(caller, 5);
+    try state.setCode(target, &.{@intFromEnum(OpCode.STOP)});
+
+    var interp = try Interpreter.initCall(std.testing.allocator, code.items, 1_000_000, .{
+        .address = caller,
+        .state = &state,
+        .block = .{ .fork = .constantinople },
+    });
+    defer interp.deinit();
+    try interp.run();
+
+    // The increment happens before the collision check and is outside
+    // anything a revert undoes, same as every other failed creation.
+    try std.testing.expectEqual(@as(u64, 6), state.get(caller).nonce);
+}
+
 test "processBlock with no transactions credits the flat block reward" {
     var state = State.init(std.testing.allocator);
     defer state.deinit();
@@ -1097,6 +1334,48 @@ test "processBlock credits the reduced 3 ETH block reward from Byzantium on" {
     try evm.processBlock(.{ .number = 4_370_000, .miner = 0xaa, .transactions = &.{} });
 
     try std.testing.expectEqual(@as(u256, 3_000_000_000_000_000_000), state.getBalance(0xaa));
+}
+
+test "processBlock credits the reduced 2 ETH block reward from Constantinople on" {
+    var state = State.init(std.testing.allocator);
+    defer state.deinit();
+
+    var evm = Evm{ .allocator = std.testing.allocator, .state = &state };
+    // EIP-1234 cut the reward again at Constantinople (mainnet 7,280,000).
+    try evm.processBlock(.{ .number = 7_280_000, .miner = 0xaa, .transactions = &.{} });
+
+    try std.testing.expectEqual(@as(u256, 2_000_000_000_000_000_000), state.getBalance(0xaa));
+}
+
+test "processBlock still pays 3 ETH on the last block before Constantinople" {
+    var state = State.init(std.testing.allocator);
+    defer state.deinit();
+
+    var evm = Evm{ .allocator = std.testing.allocator, .state = &state };
+    try evm.processBlock(.{ .number = 7_279_999, .miner = 0xaa, .transactions = &.{} });
+
+    try std.testing.expectEqual(@as(u256, 3_000_000_000_000_000_000), state.getBalance(0xaa));
+}
+
+test "processBlock credits Constantinople's uncle rewards and nephew bonus off the reduced 2 ETH reward" {
+    var state = State.init(std.testing.allocator);
+    defer state.deinit();
+
+    var evm = Evm{ .allocator = std.testing.allocator, .state = &state };
+    try evm.processBlock(.{
+        .number = 7_280_000,
+        .miner = 0xaa,
+        .transactions = &.{},
+        .uncles = &.{.{ .number = 7_279_998, .miner = 0xbb }},
+    });
+
+    // Uncle two blocks back: 2 ETH * (8 - 2) / 8.
+    try std.testing.expectEqual(@as(u256, 1_500_000_000_000_000_000), state.getBalance(0xbb));
+    // Miner: 2 ETH plus a 2/32 nephew bonus for including it.
+    try std.testing.expectEqual(
+        @as(u256, 2_000_000_000_000_000_000 + 2_000_000_000_000_000_000 / 32),
+        state.getBalance(0xaa),
+    );
 }
 
 test "processBlock credits Byzantium's uncle rewards and nephew bonus off the reduced 3 ETH reward" {

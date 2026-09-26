@@ -51,7 +51,7 @@ zig build example -- basic
 `sync_era1` and the `rzevm/examples/*_era1.rs` benchmarks below read `.era1` files — [Portal Network](https://github.com/ethereum/portal-network-specs)'s archival format for pre-merge mainnet history (RLP-encoded blocks, Snappy-compressed, in e2store containers, 8,192 blocks per file). Download them with:
 
 ```sh
-make download-era1   # blocks 0..7,274,495
+make download-era1   # blocks 0..9,068,543
 ```
 
 It skips files already present.

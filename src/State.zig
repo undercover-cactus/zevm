@@ -31,10 +31,6 @@ pub const Account = struct {
     nonce: u64 = 0,
     code: []const u8 = &.{},
     storage: std.AutoHashMapUnmanaged(u256, u256) = .empty,
-    /// `code`'s valid-`JUMPDEST` positions, computed once by `setCode`
-    /// rather than by every `CALL` into this account (see
-    /// `Interpreter.analyzeJumpdests`'s doc comment for why that matters).
-    jumpdest: std.DynamicBitSetUnmanaged = .{},
 };
 
 const Change = union(enum) {
@@ -42,6 +38,10 @@ const Change = union(enum) {
     balance: struct { address: Address, old: u256 },
     nonce: struct { address: Address, old: u64 },
     storage: struct { address: Address, slot: u256, old: u256 },
+    /// Code was deployed to `address`, which had none before (`setCode`
+    /// asserts that), so undoing it means clearing it, not restoring an
+    /// older value.
+    code: Address,
     marked_for_destruction: Address,
     touched: Address,
 };
@@ -50,6 +50,22 @@ pub const Checkpoint = usize;
 
 allocator: std.mem.Allocator,
 accounts: std.AutoHashMapUnmanaged(Address, Account) = .empty,
+/// The snapshot mapping a resumed state was built from, if any. Contract
+/// code loaded from it points *into* it rather than being copied onto the
+/// heap: at 10.3M contracts that copy costs 6.8GB of anonymous memory, and
+/// borrowing instead leaves those pages file-backed and evictable. The
+/// caller must keep the mapping alive for the state's lifetime, and code
+/// deployed later during execution is still heap-owned as usual, so every
+/// free goes through `ownsCode` to tell the two apart.
+snapshot_bytes: ?[]const u8 = null,
+/// `JUMPDEST` analyses, computed on first execution of an account's code
+/// rather than for every contract at load. Kept beside the accounts rather
+/// than inside them: as an `Account` field it cost 16 bytes in all 134M
+/// hashmap slots whether or not the account had code at all, and eagerly
+/// analysing 10.3M contracts built 0.85GB of bitsets the vast majority of
+/// which no chunk ever executes. A derived cache, so `setCode` and account
+/// removal invalidate rather than update it.
+jumpdest_cache: std.AutoHashMapUnmanaged(Address, std.DynamicBitSetUnmanaged) = .empty,
 journal: std.ArrayListUnmanaged(Change) = .empty,
 /// Addresses `SELFDESTRUCT`ed during the transaction currently in
 /// progress, appended by `destroyAccount` in lockstep with its
@@ -81,13 +97,26 @@ pub fn init(allocator: std.mem.Allocator) State {
     return .{ .allocator = allocator };
 }
 
+/// Whether `code` is this state's to free, or borrowed from the snapshot
+/// mapping it was loaded from.
+fn ownsCode(self: *const State, code: []const u8) bool {
+    if (code.len == 0) return false;
+    const snapshot = self.snapshot_bytes orelse return true;
+    const start = @intFromPtr(snapshot.ptr);
+    const at = @intFromPtr(code.ptr);
+    return at < start or at >= start + snapshot.len;
+}
+
 pub fn deinit(self: *State) void {
     var it = self.accounts.valueIterator();
     while (it.next()) |account| {
-        if (account.code.len != 0) self.allocator.free(account.code);
-        account.jumpdest.deinit(self.allocator);
+        if (self.ownsCode(account.code)) self.allocator.free(account.code);
         account.storage.deinit(self.allocator);
     }
+    var jd = self.jumpdest_cache.valueIterator();
+    while (jd.next()) |bits| bits.deinit(self.allocator);
+    self.jumpdest_cache.deinit(self.allocator);
+
     self.accounts.deinit(self.allocator);
     self.journal.deinit(self.allocator);
     self.pending_destructions.deinit(self.allocator);
@@ -113,9 +142,9 @@ const rehash_after_deletions: u32 = 100_000;
 /// is indistinguishable from one that was never used.
 fn removeAccount(self: *State, address: Address) void {
     var kv = self.accounts.fetchRemove(address) orelse return;
-    if (kv.value.code.len != 0) self.allocator.free(kv.value.code);
-    kv.value.jumpdest.deinit(self.allocator);
+    if (self.ownsCode(kv.value.code)) self.allocator.free(kv.value.code);
     kv.value.storage.deinit(self.allocator);
+    self.invalidateJumpdest(address);
 
     self.deletions_since_rehash += 1;
     if (self.deletions_since_rehash >= rehash_after_deletions) {
@@ -140,6 +169,17 @@ pub fn finalizeTransaction(self: *State) void {
         if (self.existsAndIsEmpty(address)) self.removeAccount(address);
     }
     self.touched.clearRetainingCapacity();
+
+    // Every `checkpoint` a transaction takes is consumed by a `revertTo`
+    // within that same transaction (see `Evm.call`/`create` and
+    // `Interpreter.call`/`createOp`), so once one ends none of its journal
+    // entries can ever be undone again. Dropping them here bounds the
+    // journal to a single transaction instead of letting it accumulate for
+    // a whole replay: at ~55M accounts a 65,536-block chunk grew it to
+    // several GB on top of an already ~50GB state, which is what pushed the
+    // process past this machine's 62GB and got it OOM-killed. Capacity is
+    // retained, so the next transaction reuses the same buffer.
+    self.journal.clearRetainingCapacity();
 }
 
 pub fn get(self: *const State, address: Address) Account {
@@ -214,6 +254,7 @@ pub fn getCode(self: *const State, address: Address) []const u8 {
 /// its init code, and a constructor that `SELFDESTRUCT`s relies on the
 /// account already existing for the destruction to register at all.
 pub fn touch(self: *State, address: Address) !void {
+    self.debugRecord(address);
     // `getOrPut` does one probe for the check-and-set instead of a separate
     // `contains` + `put` — this is by far the hottest path in a real
     // multi-million-block replay (every zero-value CALL touches its
@@ -223,7 +264,7 @@ pub fn touch(self: *State, address: Address) !void {
     const entry = try self.accounts.getOrPut(self.allocator, address);
     if (entry.found_existing) return;
     entry.value_ptr.* = .{}; // must initialize a freshly created slot regardless
-    if (debug_enabled and address == debug_target) {
+    if (debugOn(address)) {
         std.debug.print("DEBUG block={d} touch({x}): created\n", .{ debug_block_number, address });
     }
     try self.journal.append(self.allocator, .{ .created = address });
@@ -242,11 +283,47 @@ pub fn touch(self: *State, address: Address) !void {
 const debug_enabled = false;
 const debug_target: Address = 0x0;
 pub var debug_block_number: u64 = 0;
+// DEBUG: the other axis of the same hunt. `debug_target` traces one address
+// through every block; this traces every address through one block, for
+// finding which account a state-root mismatch is about when every
+// transaction's gas and status already agree with the receipts.
+const debug_block_enabled = false;
+const debug_block: u64 = 7_398_462;
+
+fn debugOn(address: Address) bool {
+    return (debug_enabled and address == debug_target) or
+        (debug_block_enabled and debug_block_number == debug_block);
+}
+
+/// Every address any mutation touched during `debug_block`, so its final
+/// state can be dumped at block end and diffed against the real chain.
+pub var debug_block_addresses: std.AutoHashMapUnmanaged(Address, void) = .empty;
+
+fn debugRecord(self: *State, address: Address) void {
+    if (debug_block_enabled and debug_block_number == debug_block) {
+        debug_block_addresses.put(self.allocator, address, {}) catch {};
+    }
+}
+
+/// Final state of every address recorded during `debug_block`.
+pub fn debugDumpBlockAccounts(self: *const State) void {
+    if (!(debug_block_enabled and debug_block_number == debug_block)) return;
+    var it = debug_block_addresses.iterator();
+    while (it.next()) |e| {
+        const address = e.key_ptr.*;
+        const account = self.get(address);
+        std.debug.print("DEBUG acct {x:0>40} exists={} balance={d} nonce={d} code_len={d} code_hash={x:0>64}\n", .{
+            address, self.exists(address), account.balance, account.nonce, account.code.len,
+            if (account.code.len == 0) empty_code_hash else keccak256(account.code),
+        });
+    }
+}
 
 pub fn setBalance(self: *State, address: Address, balance: u256) !void {
+    self.debugRecord(address);
     try self.touch(address);
     const account = self.accounts.getPtr(address).?;
-    if (debug_enabled and address == debug_target) {
+    if (debugOn(address)) {
         std.debug.print("DEBUG block={d} setBalance({x}): {d} -> {d}\n", .{ debug_block_number, address, account.balance, balance });
     }
     if (account.balance == balance) return;
@@ -257,14 +334,16 @@ pub fn setBalance(self: *State, address: Address, balance: u256) !void {
 /// Adds `amount` to `address`'s balance without journaling, for callers
 /// that will never revert this specific change (e.g. block/uncle rewards).
 pub fn creditBalance(self: *State, address: Address, amount: u256) !void {
+    self.debugRecord(address);
     const entry = try self.accounts.getOrPutValue(self.allocator, address, .{});
-    if (debug_enabled and address == debug_target) {
+    if (debugOn(address)) {
         std.debug.print("DEBUG block={d} creditBalance({x}): {d} + {d} = {d}\n", .{ debug_block_number, address, entry.value_ptr.balance, amount, entry.value_ptr.balance + amount });
     }
     entry.value_ptr.balance += amount;
 }
 
 pub fn setNonce(self: *State, address: Address, nonce: u64) !void {
+    self.debugRecord(address);
     try self.touch(address);
     const account = self.accounts.getPtr(address).?;
     if (account.nonce == nonce) return;
@@ -279,13 +358,22 @@ pub fn setNonce(self: *State, address: Address, nonce: u64) !void {
 /// actually removes it (see there), and `CREATE` can only ever target a
 /// fresh nonce anyway, never that same still-live account.
 pub fn setCode(self: *State, address: Address, code: []const u8) !void {
+    self.debugRecord(address);
     try self.touch(address);
     const account = self.accounts.getPtr(address).?;
     std.debug.assert(account.code.len == 0);
-    if (code.len != 0) {
-        account.code = try self.allocator.dupe(u8, code);
-        account.jumpdest = try Interpreter.analyzeJumpdests(self.allocator, account.code);
-    }
+    if (code.len == 0) return;
+    account.code = try self.allocator.dupe(u8, code);
+    // Journaled like every other mutation, so an enclosing frame that
+    // reverts after a nested creation *succeeded* takes the deployed code
+    // with it. Without this, `revertTo` restored the account's balance,
+    // nonce, and storage and left the code in place. That stayed invisible
+    // for 7.27M blocks because a plain `CREATE` always lands on a fresh
+    // address, whose `.created` entry makes the revert delete the whole
+    // account, code included. `CREATE2` deploys to a precomputed address
+    // that is routinely pre-funded and so already exists; the first such
+    // revert on mainnet (block 7,306,818) left 357 bytes of code behind.
+    try self.journal.append(self.allocator, .{ .code = address });
 }
 
 /// `address`'s cached `JUMPDEST` analysis (see `Account.jumpdest`), for a
@@ -293,8 +381,24 @@ pub fn setCode(self: *State, address: Address, code: []const u8) !void {
 /// its bytecode. Only meaningful once `getCode(address).len != 0` is
 /// already known — callers skip straight past an empty-code target before
 /// ever needing this (see `Interpreter.call`'s own "no code" shortcut).
-pub fn getJumpdest(self: *const State, address: Address) *const std.DynamicBitSetUnmanaged {
-    return &self.accounts.getPtr(address).?.jumpdest;
+/// `address`'s `JUMPDEST` analysis, computed on first use and cached. The
+/// returned pointer is owned by the cache and stays valid until that entry
+/// is invalidated, which only `setCode` and account removal do.
+pub fn getJumpdest(self: *State, address: Address) !*const std.DynamicBitSetUnmanaged {
+    const entry = try self.jumpdest_cache.getOrPut(self.allocator, address);
+    if (!entry.found_existing) {
+        entry.value_ptr.* = try Interpreter.analyzeJumpdests(self.allocator, self.getCode(address));
+    }
+    return entry.value_ptr;
+}
+
+/// Drops `address`'s cached analysis, because its code changed or the whole
+/// account went away.
+fn invalidateJumpdest(self: *State, address: Address) void {
+    if (self.jumpdest_cache.fetchRemove(address)) |kv| {
+        var bits = kv.value;
+        bits.deinit(self.allocator);
+    }
 }
 
 /// Queues `address` for full removal (code, storage, nonce — all of it)
@@ -306,6 +410,7 @@ pub fn getJumpdest(self: *const State, address: Address) *const std.DynamicBitSe
 /// calling `SELFDESTRUCT` again, which is why this doesn't guard against
 /// being called more than once for the same address.
 pub fn destroyAccount(self: *State, address: Address) !void {
+    self.debugRecord(address);
     if (!self.accounts.contains(address)) return;
     try self.journal.append(self.allocator, .{ .marked_for_destruction = address });
     try self.pending_destructions.append(self.allocator, address);
@@ -317,6 +422,7 @@ pub fn getStorage(self: *const State, address: Address, slot: u256) u256 {
 }
 
 pub fn setStorage(self: *State, address: Address, slot: u256, value: u256) !void {
+    self.debugRecord(address);
     try self.touch(address);
     const account = self.accounts.getPtr(address).?;
     // `getOrPut` does one probe for the check-and-set instead of a separate
@@ -324,7 +430,7 @@ pub fn setStorage(self: *State, address: Address, slot: u256, value: u256) !void
     const entry = try account.storage.getOrPut(self.allocator, slot);
     const old: u256 = if (entry.found_existing) entry.value_ptr.* else 0;
     if (!entry.found_existing) entry.value_ptr.* = 0; // must initialize a freshly created slot regardless
-    if (debug_enabled and address == debug_target) {
+    if (debugOn(address)) {
         std.debug.print("DEBUG block={d} setStorage({x}, slot={d}): {d} -> {d}\n", .{ debug_block_number, address, slot, old, value });
     }
     if (old == value) return;
@@ -367,7 +473,7 @@ pub fn revertTo(self: *State, cp: Checkpoint) void {
                 // time during an era1 divergence hunt: a trace-based bisect
                 // fingered a block whose writes had in fact been correctly
                 // reverted.
-                if (debug_enabled and c.address == debug_target) {
+                if (debugOn(c.address)) {
                     std.debug.print("DEBUG block={d} REVERT balance({x}): -> {d}\n", .{ debug_block_number, c.address, c.old });
                 }
                 self.accounts.getPtr(c.address).?.balance = c.old;
@@ -378,15 +484,23 @@ pub fn revertTo(self: *State, cp: Checkpoint) void {
                 // slot before this entry could exist, so both are
                 // guaranteed present: direct pointer writes avoid a
                 // fallible re-insertion here.
-                if (debug_enabled and c.address == debug_target) {
+                if (debugOn(c.address)) {
                     std.debug.print("DEBUG block={d} REVERT setStorage({x}, slot={d}): -> {d}\n", .{ debug_block_number, c.address, c.slot, c.old });
                 }
                 self.accounts.getPtr(c.address).?.storage.getPtr(c.slot).?.* = c.old;
             },
+            .code => |address| {
+                // Popped before any `.created` for the same account (it was
+                // appended after), so by the time that entry frees the
+                // account these fields are already empty and it frees nothing.
+                const account = self.accounts.getPtr(address).?;
+                if (self.ownsCode(account.code)) self.allocator.free(account.code);
+                account.code = &.{};
+                self.invalidateJumpdest(address);
+            },
             .created => |address| {
                 var kv = self.accounts.fetchRemove(address).?;
-                if (kv.value.code.len != 0) self.allocator.free(kv.value.code);
-                kv.value.jumpdest.deinit(self.allocator);
+                if (self.ownsCode(kv.value.code)) self.allocator.free(kv.value.code);
                 kv.value.storage.deinit(self.allocator);
             },
             .marked_for_destruction => |address| {
@@ -521,10 +635,8 @@ fn computeStateRoot(self: *State, allocator: std.mem.Allocator, consume: bool) !
             // differ. The emptied fields keep `deinit` safe to call after.
             account.storage.deinit(self.allocator);
             account.storage = .empty;
-            if (account.code.len != 0) self.allocator.free(account.code);
+            if (self.ownsCode(account.code)) self.allocator.free(account.code);
             account.code = &.{};
-            account.jumpdest.deinit(self.allocator);
-            account.jumpdest = .{};
         }
     }
 
@@ -820,6 +932,7 @@ pub const Snapshot = struct { state: State, block: u64, recent_hashes: []Hash };
 /// would only pay allocations for.
 pub fn loadSnapshot(allocator: std.mem.Allocator, bytes: []const u8) !Snapshot {
     var state = State.init(allocator);
+    state.snapshot_bytes = bytes;
     errdefer state.deinit();
 
     var pos: usize = 0;
@@ -845,8 +958,8 @@ pub fn loadSnapshot(allocator: std.mem.Allocator, bytes: []const u8) !Snapshot {
 
         var account: Account = .{ .balance = balance, .nonce = nonce };
         if (code_bytes.len != 0) {
-            account.code = try allocator.dupe(u8, code_bytes);
-            account.jumpdest = try Interpreter.analyzeJumpdests(allocator, account.code);
+            // Borrowed from `bytes`, not copied (see `snapshot_bytes`).
+            account.code = code_bytes;
         }
 
         const storage_count = std.mem.readInt(u64, bytes[pos..][0..8], .little);
@@ -938,7 +1051,7 @@ test "setCode precomputes getJumpdest, matching a direct analysis of the same co
     defer state.deinit();
     try state.setCode(0x1, &code);
 
-    const jumpdest = state.getJumpdest(0x1);
+    const jumpdest = try state.getJumpdest(0x1);
     try std.testing.expect(jumpdest.isSet(0));
     try std.testing.expect(!jumpdest.isSet(1));
     try std.testing.expect(!jumpdest.isSet(2));
