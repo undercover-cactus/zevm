@@ -124,9 +124,15 @@ fn deriveSender(allocator: std.mem.Allocator, secp: Secp256k1, fields: []const z
         27, 28 => @intCast(v - 27),
         else => @intCast((v - 35) % 2),
     };
+    return recoverAddress(secp, hash, fields[7].string, fields[8].string, recid);
+}
+
+/// The address that signed `hash`, given the signature's `r`, `s` and
+/// recovery id.
+fn recoverAddress(secp: Secp256k1, hash: secp256k1.Message, r: []const u8, s: []const u8, recid: u8) !zevm.Address {
     var sig: secp256k1.Signature = undefined;
-    sig[0..32].* = padTo32(fields[7].string);
-    sig[32..64].* = padTo32(fields[8].string);
+    sig[0..32].* = padTo32(r);
+    sig[32..64].* = padTo32(s);
     sig[64] = recid;
 
     const pubkey = try secp.recoverPubkey(hash, sig);
@@ -136,9 +142,32 @@ fn deriveSender(allocator: std.mem.Allocator, secp: Secp256k1, fields: []const z
     return @truncate(zevm.keccak256(pubkey[1..65]));
 }
 
+/// Re-encodes a decoded item. Only used to rebuild a typed transaction's
+/// signing payload, whose access list is a nested list; a valid
+/// transaction's encoding is canonical, so this reproduces it exactly.
+fn encodeItem(allocator: std.mem.Allocator, item: zevm.Rlp.Item) ![]u8 {
+    switch (item) {
+        .string => |bytes| return zevm.Rlp.encodeBytes(allocator, bytes),
+        .list => |items| {
+            var parts: std.ArrayList([]const u8) = .empty;
+            defer {
+                for (parts.items) |part| allocator.free(part);
+                parts.deinit(allocator);
+            }
+            for (items) |sub| try parts.append(allocator, try encodeItem(allocator, sub));
+            return zevm.Rlp.encodeList(allocator, parts.items);
+        },
+    }
+}
+
 /// `tx_item`'s string fields borrow directly from the decompressed body
 /// buffer the caller owns, kept alive as long as one block's entries are in use.
-fn parseTransaction(allocator: std.mem.Allocator, secp: Secp256k1, tx_item: zevm.Rlp.Item) !zevm.Block.Entry {
+/// A typed transaction's decoded payload and access list are allocated in
+/// `arena`, which must live as long too.
+fn parseTransaction(allocator: std.mem.Allocator, arena: std.mem.Allocator, secp: Secp256k1, tx_item: zevm.Rlp.Item) !zevm.Block.Entry {
+    // EIP-2718: a typed transaction sits in the body as a byte string,
+    // `type || payload`, where a Legacy one is a bare list.
+    if (tx_item == .string) return parseTypedTransaction(allocator, arena, secp, tx_item.string);
     const fields = tx_item.list;
     const to_bytes = fields[3].string;
     return .{
@@ -153,6 +182,53 @@ fn parseTransaction(allocator: std.mem.Allocator, secp: Secp256k1, tx_item: zevm
             .v = bytesToU64(fields[6].string),
             .r = bytesToU256(fields[7].string),
             .s = bytesToU256(fields[8].string),
+        },
+    };
+}
+
+/// EIP-2930 (type 1, Berlin):
+/// `rlp([chain_id, nonce, gas_price, gas_limit, to, value, data, access_list,
+/// y_parity, r, s])`, signed over `keccak(0x01 || rlp(first eight fields))`.
+fn parseTypedTransaction(allocator: std.mem.Allocator, arena: std.mem.Allocator, secp: Secp256k1, bytes: []const u8) !zevm.Block.Entry {
+    if (bytes.len == 0 or bytes[0] != 0x01) return error.UnsupportedTransactionType;
+    const payload = try zevm.Rlp.decode(arena, bytes[1..]);
+    const fields = payload.list;
+    if (fields.len != 11) return error.MalformedTransaction;
+
+    const signed = try encodeItem(allocator, .{ .list = fields[0..8] });
+    defer allocator.free(signed);
+    const preimage = try allocator.alloc(u8, signed.len + 1);
+    defer allocator.free(preimage);
+    preimage[0] = 0x01;
+    @memcpy(preimage[1..], signed);
+    var hash: secp256k1.Message = undefined;
+    std.mem.writeInt(u256, &hash, zevm.keccak256(preimage), .big);
+
+    const y_parity = bytesToU64(fields[8].string);
+    if (y_parity > 1) return error.MalformedTransaction;
+
+    const entries = try arena.alloc(zevm.AccessListEntry, fields[7].list.len);
+    for (fields[7].list, entries) |item, *entry| {
+        const keys = try arena.alloc(u256, item.list[1].list.len);
+        for (item.list[1].list, keys) |key, *out| out.* = bytesToU256(key.string);
+        entry.* = .{ .address = bytesToAddress(item.list[0].string), .storage_keys = keys };
+    }
+
+    const to_bytes = fields[4].string;
+    return .{
+        .from = try recoverAddress(secp, hash, fields[9].string, fields[10].string, @intCast(y_parity)),
+        .tx = .{
+            .nonce = bytesToU64(fields[1].string),
+            .gas_price = bytesToU256(fields[2].string),
+            .gas_limit = bytesToU64(fields[3].string),
+            .to = if (to_bytes.len == 0) null else bytesToAddress(to_bytes),
+            .value = bytesToU256(fields[5].string),
+            .data = fields[6].string,
+            .v = y_parity,
+            .r = bytesToU256(fields[9].string),
+            .s = bytesToU256(fields[10].string),
+            .chain_id = bytesToU256(fields[0].string),
+            .access_list = entries,
         },
     };
 }
@@ -284,6 +360,19 @@ pub fn main(io: std.Io, args: []const []const u8) anyerror!void {
     // reaches a chunk boundary; loading the same state cold costs far less,
     // which is what makes the very largest checkpoints verifiable at all.
     var snapshot_root_path: ?[]const u8 = null;
+    // Computes a snapshot's root through `loadSnapshot` and `State.stateRoot`
+    // rather than the streaming `snapshotStateRoot`. The two must agree:
+    // `--snapshot-root` reads the file directly, while this exercises the
+    // lazy read-through state and the merged base/overlay scan that the
+    // replay itself depends on. Disagreement means the lazy path is wrong.
+    var lazy_root_path: ?[]const u8 = null;
+    // Reads a snapshot and writes it back out. Exists to migrate checkpoints
+    // written before `writeSnapshot` sorted each account's storage slots:
+    // the read-in-place `State.Base` binary-searches those slots, so an
+    // unsorted file would silently answer wrongly. One-off, and it loads the
+    // old way, so it needs the memory the lazy path exists to avoid.
+    var rewrite_in: ?[]const u8 = null;
+    var rewrite_out: ?[]const u8 = null;
     var dump_path: []const u8 = "";
     var resume_path: ?[]const u8 = null;
     // --scan-miner <address> <end_block>   header-only scan (no state, no
@@ -350,6 +439,13 @@ pub fn main(io: std.Io, args: []const []const u8) anyerror!void {
                     scan_start_block = try std.fmt.parseInt(u64, args[i + 1], 10);
                     i += 1;
                 }
+            } else if (std.mem.eql(u8, args[i], "--rewrite-snapshot") and i + 2 < args.len) {
+                rewrite_in = args[i + 1];
+                rewrite_out = args[i + 2];
+                i += 2;
+            } else if (std.mem.eql(u8, args[i], "--lazy-root") and i + 1 < args.len) {
+                lazy_root_path = args[i + 1];
+                i += 1;
             } else if (std.mem.eql(u8, args[i], "--snapshot-root") and i + 1 < args.len) {
                 snapshot_root_path = args[i + 1];
                 i += 1;
@@ -372,6 +468,66 @@ pub fn main(io: std.Io, args: []const []const u8) anyerror!void {
     // this checkpoint?" without needing @embedFile (which chokes badly at
     // compile time on a multi-hundred-MB dump — confirmed during a real
     // divergence hunt: hours of CPU time for what should be a few seconds).
+    if (rewrite_in) |in_path| {
+        const out_path = rewrite_out.?;
+        var file = try std.Io.Dir.cwd().openFile(io, in_path, .{});
+        defer file.close(io);
+        const bytes = try std.posix.mmap(
+            null,
+            (try file.stat(io)).size,
+            .{ .READ = true },
+            .{ .TYPE = .PRIVATE },
+            file.handle,
+            0,
+        );
+        defer std.posix.munmap(bytes);
+        const snapshot = try zevm.State.loadSnapshot(allocator, bytes);
+        var loaded = snapshot.state;
+        defer loaded.deinit();
+        std.debug.print("loaded block {d} ({d} accounts), rewriting...\n", .{ snapshot.block, loaded.accountCount() });
+
+        var out_file = try std.Io.Dir.cwd().createFile(io, out_path, .{});
+        defer out_file.close(io);
+        const out_buf = try allocator.alloc(u8, 1 << 20);
+        defer allocator.free(out_buf);
+        var out_writer = out_file.writer(io, out_buf);
+        try loaded.writeSnapshot(&out_writer.interface, snapshot.block, snapshot.recent_hashes);
+        try out_writer.interface.flush();
+        allocator.free(snapshot.recent_hashes);
+        std.debug.print("wrote {s}\n", .{out_path});
+        return;
+    }
+
+    if (lazy_root_path) |path| {
+        var file = try std.Io.Dir.cwd().openFile(io, path, .{});
+        defer file.close(io);
+        const bytes = try std.posix.mmap(
+            null,
+            (try file.stat(io)).size,
+            .{ .READ = true },
+            .{ .TYPE = .PRIVATE },
+            file.handle,
+            0,
+        );
+        defer std.posix.munmap(bytes);
+        const snapshot = try zevm.State.loadSnapshot(allocator, bytes);
+        var loaded = snapshot.state;
+        defer loaded.deinit();
+        allocator.free(snapshot.recent_hashes);
+        std.debug.print("indexed block {d} ({d} accounts), computing root through the lazy state...\n", .{ snapshot.block, loaded.accountCount() });
+        const root = try loaded.stateRoot(allocator);
+        const expected = try era1StateRoot(allocator, io, snapshot.block);
+        if (root != expected) {
+            std.debug.print(
+                "LAZY ROOT MISMATCH at block {d}\n  computed 0x{x:0>64}\n  header   0x{x:0>64}\n",
+                .{ snapshot.block, root, expected },
+            );
+            return error.StateRootMismatch;
+        }
+        std.debug.print("lazy state root OK at block {d} (0x{x:0>64})\n", .{ snapshot.block, root });
+        return;
+    }
+
     if (snapshot_root_path) |path| {
         var file = try std.Io.Dir.cwd().openFile(io, path, .{});
         defer file.close(io);
@@ -456,10 +612,11 @@ pub fn main(io: std.Io, args: []const []const u8) anyerror!void {
             return;
         }
 
+        var loaded_state = snapshot.state;
         std.debug.print("block {d}: storage[{d}]={d}\n", .{
             snapshot.block,
             slot,
-            snapshot.state.getStorage(target, slot),
+            loaded_state.getStorage(target, slot),
         });
         return;
     }
@@ -516,8 +673,10 @@ pub fn main(io: std.Io, args: []const []const u8) anyerror!void {
                     }
                 }
 
+                var tx_arena = std.heap.ArenaAllocator.init(allocator);
+                defer tx_arena.deinit();
                 for (body_item.list[0].list) |tx_item| {
-                    const entry = try parseTransaction(allocator, secp, tx_item);
+                    const entry = try parseTransaction(allocator, tx_arena.allocator(), secp, tx_item);
                     if (entry.tx.to == target and entry.tx.value > 0) {
                         in_total += entry.tx.value;
                         std.debug.print("IN:  block {d} from {x} value {d} (running in_total {d})\n", .{ header.number, entry.from, entry.tx.value, in_total });
@@ -560,22 +719,31 @@ pub fn main(io: std.Io, args: []const []const u8) anyerror!void {
             file.handle,
             0,
         );
-        // Deliberately NOT unmapped: the loaded state's contract code points
-        // into this mapping rather than being copied to the heap (see
-        // `State.snapshot_bytes`), so it has to outlive the state. It is
+        // Deliberately NOT unmapped: the loaded state's accounts, code and
+        // storage are all read out of this mapping rather than copied to the
+        // heap (see `State.Base`), so it has to outlive the state. It is
         // released when the process exits, which is the same moment the
         // state is discarded anyway.
         //
-        // No `MADV_SEQUENTIAL` either, for the same reason. The load itself
-        // is one front-to-back pass and would benefit, but the code pages
-        // are read again at random throughout the replay, and advising the
-        // kernel to drop what it has just passed makes every later `CALL`
-        // fault its callee's code back in.
+        // `MADV_WILLNEED` rather than `MADV_SEQUENTIAL`. Both the indexing
+        // pass and the replay read this file, but in opposite patterns: the
+        // index walk is strictly front to back, while account and storage
+        // reads afterwards are scattered. `SEQUENTIAL` serves the first and
+        // actively hurts the second, since it tells the kernel to drop pages
+        // once passed and every later read then faults them back one 4KB
+        // page at a time. Leaving no advice at all was worse still: a chunk
+        // that had been taking ~13 minutes spent 98 minutes at 20% CPU,
+        // waiting on single-page faults against a file too big for what was
+        // left of the page cache. `WILLNEED` asks for the whole thing up
+        // front, which is affordable precisely because these are file-backed
+        // pages the kernel may evict under pressure, unlike the anonymous
+        // copy this design replaced.
+        std.posix.madvise(dump.ptr, dump.len, std.posix.MADV.WILLNEED) catch {};
         const snapshot = try zevm.State.loadSnapshot(allocator, dump);
         state = snapshot.state;
         starting_block = snapshot.block + 1;
         resumed_hashes = snapshot.recent_hashes;
-        std.debug.print("resumed from block {d}, starting at {d} ({d} accounts)\n", .{ snapshot.block, starting_block, state.accounts.count() });
+        std.debug.print("resumed from block {d}, starting at {d} ({d} accounts)\n", .{ snapshot.block, starting_block, state.accountCount() });
     } else {
         state = zevm.State.init(allocator);
 
@@ -594,7 +762,7 @@ pub fn main(io: std.Io, args: []const []const u8) anyerror!void {
 
             try state.setBalance(address, balance);
         }
-        std.debug.print("loaded {d} genesis accounts\n", .{state.accounts.count()});
+        std.debug.print("loaded {d} genesis accounts\n", .{state.accountCount()});
 
         // Mainnet's genesis state root is a published constant, and the
         // genesis allocation is small enough to hash in well under a second.
@@ -703,8 +871,12 @@ pub fn main(io: std.Io, args: []const []const u8) anyerror!void {
             const tx_parse_start = std.Io.Clock.Timestamp.now(io, .awake);
             var entries: std.ArrayList(zevm.Block.Entry) = .empty;
             defer entries.deinit(allocator);
+            // Typed transactions' access lists live here until the block
+            // has executed.
+            var tx_arena = std.heap.ArenaAllocator.init(allocator);
+            defer tx_arena.deinit();
             for (transactions_rlp) |tx_item| {
-                try entries.append(allocator, try parseTransaction(allocator, secp, tx_item));
+                try entries.append(allocator, try parseTransaction(allocator, tx_arena.allocator(), secp, tx_item));
             }
             transactions_in_file += entries.items.len;
 
@@ -763,14 +935,14 @@ pub fn main(io: std.Io, args: []const []const u8) anyerror!void {
 
             if (root_at_block == header.number) {
                 state.releaseJournal();
-                const computed_root = try state.stateRootConsuming(allocator);
+                const computed_root = try state.stateRoot(allocator);
                 if (computed_root == header.state_root) {
-                    std.debug.print("ROOT OK at block {d} ({d} accounts)\n", .{ header.number, state.accounts.count() });
+                    std.debug.print("ROOT OK at block {d} ({d} accounts)\n", .{ header.number, state.accountCount() });
                     return;
                 }
                 std.debug.print(
                     "ROOT MISMATCH at block {d}\n  computed 0x{x:0>64}\n  header   0x{x:0>64}\n  ({d} accounts)\n",
-                    .{ header.number, computed_root, header.state_root, state.accounts.count() },
+                    .{ header.number, computed_root, header.state_root, state.accountCount() },
                 );
                 return error.StateRootMismatch;
             }
@@ -783,7 +955,7 @@ pub fn main(io: std.Io, args: []const []const u8) anyerror!void {
                 if (computed_root != header.state_root) {
                     std.debug.print(
                         "STATE ROOT MISMATCH at block {d}\n  computed 0x{x:0>64}\n  header   0x{x:0>64}\n  ({d} accounts, {d} transactions in this block)\n",
-                        .{ header.number, computed_root, header.state_root, state.accounts.count(), entries.items.len },
+                        .{ header.number, computed_root, header.state_root, state.accountCount(), entries.items.len },
                     );
                     return error.StateRootMismatch;
                 }
@@ -812,7 +984,21 @@ pub fn main(io: std.Io, args: []const []const u8) anyerror!void {
                 var dump_writer = dump_file.writer(io, dump_buf);
                 try state.writeSnapshot(&dump_writer.interface, header.number, recent_hashes.items);
                 try dump_writer.interface.flush();
-                std.debug.print("dumped snapshot at block {d} to {s} ({d} accounts)\n", .{ header.number, dump_path, state.accounts.count() });
+                std.debug.print("dumped snapshot at block {d} to {s} ({d} accounts)\n", .{ header.number, dump_path, state.accountCount() });
+
+                // Same breakdown the end-of-run summary prints. Without it
+                // here, a chunked run (which always leaves through this
+                // `return`) throws its timings away, which is how we ended
+                // up guessing at where the time goes instead of reading it.
+                std.debug.print("  decode (snappy+RLP+ecrecover): {d:.2}ms\n", .{
+                    @as(f64, @floatFromInt(decode_ns)) / 1_000_000.0,
+                });
+                std.debug.print("    snappy:    {d:.2}ms\n", .{@as(f64, @floatFromInt(snappy_ns)) / 1_000_000.0});
+                std.debug.print("    rlp:       {d:.2}ms\n", .{@as(f64, @floatFromInt(rlp_ns)) / 1_000_000.0});
+                std.debug.print("    tx_parse:  {d:.2}ms\n", .{@as(f64, @floatFromInt(tx_parse_ns)) / 1_000_000.0});
+                std.debug.print("  execute (Evm.processBlock):    {d:.2}ms\n", .{
+                    @as(f64, @floatFromInt(execute_ns)) / 1_000_000.0,
+                });
 
                 // The root is deliberately NOT checked here. Doing it in
                 // this process means holding the entire live state — hashmap
@@ -841,7 +1027,7 @@ pub fn main(io: std.Io, args: []const []const u8) anyerror!void {
     std.debug.print("done: {d} blocks, {d} transactions, {d} accounts touched in {d:.2}ms (expected ~{d} blocks)\n", .{
         blocks_processed,
         transactions_processed,
-        state.accounts.count(),
+        state.accountCount(),
         millisSince(io, start),
         files.len * blocks_per_file,
     });

@@ -1,9 +1,12 @@
 //! Static EVM gas costs and the memory-expansion cost formula.
 //!
-//! These are per-opcode base costs only; access-list warm/cold pricing
-//! (EIP-2929) and anything needing the `Host` interface are later milestones.
+//! Per-opcode base costs, plus EIP-2929's warm/cold access prices. Which of
+//! those an access pays depends on what the transaction has touched so far,
+//! which `State` tracks; this file only holds the numbers.
 
 const std = @import("std");
+const Fork = @import("Fork.zig").Fork;
+const AccessListEntry = @import("Transaction.zig").AccessListEntry;
 
 pub const zero: u64 = 0;
 pub const jumpdest: u64 = 1;
@@ -26,6 +29,10 @@ pub const copy_word: u64 = 3;
 /// Pre-EIP-150 value; that fork raised this to `sload_150`.
 pub const sload: u64 = 50;
 pub const sload_150: u64 = 200;
+/// EIP-1884 (Istanbul) raised it again. The pattern behind that EIP is that
+/// opcodes whose cost tracks the size of the state trie had fallen out of
+/// step with how big the trie had actually become.
+pub const sload_1884: u64 = 800;
 /// Setting a zero slot to a nonzero value.
 pub const sstore_set: u64 = 20000;
 /// Any other SSTORE. Frontier's flat rule, not EIP-2200's net-metered successor.
@@ -49,6 +56,8 @@ pub const code_deposit_byte: u64 = 200;
 /// superseded by EIP-2929 warm/cold pricing later still.
 pub const balance: u64 = 20;
 pub const balance_150: u64 = 400;
+/// EIP-1884 (Istanbul).
+pub const balance_1884: u64 = 700;
 /// Pre-EIP-150 value (`EXTCODESIZE`/`EXTCODECOPY`'s base cost); that fork
 /// raised this to `extcode_150`.
 pub const extcode: u64 = 20;
@@ -57,6 +66,9 @@ pub const extcode_150: u64 = 700;
 /// `EXTCODESIZE`'s: 400, cheaper than the 700 the other EXTCODE* opcodes
 /// cost after EIP-150, on the grounds that a hash lookup is one trie read.
 pub const extcodehash: u64 = 400;
+/// EIP-1884 (Istanbul) raised `EXTCODEHASH` to match the other EXTCODE*
+/// opcodes.
+pub const extcodehash_1884: u64 = 700;
 pub const blockhash: u64 = 20;
 
 pub const log_base: u64 = 375;
@@ -85,20 +97,59 @@ pub const sstore_clear_refund: u64 = 15000;
 /// gas used, preventing gas-usage inflation just to farm refunds.
 pub const max_refund_denominator: u64 = 2;
 
+/// EIP-2200 (Istanbul). An `SSTORE` must have more than this left before it
+/// starts, which is what makes the 2300-gas stipend a hard floor: a callee
+/// handed only the stipend cannot write storage at all. This is the guard
+/// EIP-1283 lacked, and the reason that earlier attempt at net metering was
+/// withdrawn by Petersburg after it was shown to enable reentrancy against
+/// contracts that assumed the stipend was unspendable.
+pub const sstore_sentry_2200: u64 = 2300;
+
+/// EIP-2929 (Berlin). The first access to an account or storage slot in a
+/// transaction is "cold" and priced for the trie lookup it really costs;
+/// every later access to the same one is "warm" and nearly free. This
+/// replaces the flat prices of `SLOAD`, `BALANCE`, the `EXTCODE*` family and
+/// the `CALL` family's base cost.
+pub const warm_storage_read_2929: u64 = 100;
+pub const cold_sload_2929: u64 = 2100;
+pub const cold_account_access_2929: u64 = 2600;
+
+/// EIP-2930 (Berlin). Intrinsic gas per entry in a transaction's access
+/// list, paid up front in exchange for those accounts and slots starting
+/// warm. Cheaper than the cold surcharge they avoid, which is the point.
+pub const access_list_address_2930: u64 = 2400;
+pub const access_list_storage_key_2930: u64 = 1900;
+
 /// Flat cost every transaction pays before any of its code runs, for
 /// simply being included in a block.
 pub const tx_base: u64 = 21000;
 pub const tx_data_zero: u64 = 4;
 /// Pre-Istanbul value; Istanbul later reduced this to 16.
 pub const tx_data_nonzero: u64 = 68;
+/// EIP-2028 (Istanbul) cut the nonzero-byte cost to 16, on the evidence that
+/// calldata was priced well above what it actually costs a node. Zero bytes
+/// were left alone.
+pub const tx_data_nonzero_2028: u64 = 16;
 
 /// The gas a transaction must pay before any of its code runs: `tx_base`
 /// plus a per-byte cost for its calldata/init code. A top-level
 /// contract-creation transaction pays no extra surcharge here in Frontier;
 /// that didn't exist until Homestead (EIP-2, block 1,150,000).
-pub fn intrinsicCost(data: []const u8) u64 {
+pub fn intrinsicCost(data: []const u8, fork: Fork) u64 {
+    const nonzero = if (fork.atLeast(.istanbul)) tx_data_nonzero_2028 else tx_data_nonzero;
     var cost = tx_base;
-    for (data) |byte| cost += if (byte == 0) tx_data_zero else tx_data_nonzero;
+    for (data) |byte| cost += if (byte == 0) tx_data_zero else nonzero;
+    return cost;
+}
+
+/// Intrinsic gas for an EIP-2930 access list. Duplicates are charged for:
+/// the EIP prices the list as written, not the set it describes.
+pub fn accessListCost(access_list: []const AccessListEntry) u64 {
+    var cost: u64 = 0;
+    for (access_list) |entry| {
+        cost += access_list_address_2930;
+        cost += access_list_storage_key_2930 * @as(u64, entry.storage_keys.len);
+    }
     return cost;
 }
 
@@ -136,11 +187,19 @@ pub fn memoryExpansionCost(old_len: usize, offset: usize, size: usize) u64 {
 }
 
 test "intrinsicCost of a plain call with no data is just the flat base" {
-    try std.testing.expectEqual(@as(u64, 21000), intrinsicCost(&.{}));
+    try std.testing.expectEqual(@as(u64, 21000), intrinsicCost(&.{}, .frontier));
+    try std.testing.expectEqual(@as(u64, 21000), intrinsicCost(&.{}, .istanbul));
 }
 
 test "intrinsicCost charges zero and nonzero data bytes differently" {
-    try std.testing.expectEqual(@as(u64, 21000 + 4 + 68), intrinsicCost(&.{ 0, 1 }));
+    try std.testing.expectEqual(@as(u64, 21000 + 4 + 68), intrinsicCost(&.{ 0, 1 }, .frontier));
+}
+
+test "EIP-2028 cuts the nonzero calldata byte to 16 at Istanbul, leaving zeros alone" {
+    // One zero byte and one nonzero: the zero stays at 4 either side of the
+    // fork, the nonzero drops from 68 to 16.
+    try std.testing.expectEqual(@as(u64, 21000 + 4 + 68), intrinsicCost(&.{ 0, 1 }, .petersburg));
+    try std.testing.expectEqual(@as(u64, 21000 + 4 + 16), intrinsicCost(&.{ 0, 1 }, .istanbul));
 }
 
 test "byteLength of zero is zero" {

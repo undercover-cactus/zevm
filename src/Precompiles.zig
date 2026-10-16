@@ -24,6 +24,7 @@ const Kind = enum {
     ecadd,
     ecmul,
     ecpairing,
+    blake2f,
 
     /// Addresses 5-8 (Byzantium's MODEXP/ECADD/ECMUL/ECPAIRING) only
     /// resolve to a precompile from Byzantium on; before that, real
@@ -40,6 +41,7 @@ const Kind = enum {
             6 => if (byzantium) .ecadd else null,
             7 => if (byzantium) .ecmul else null,
             8 => if (byzantium) .ecpairing else null,
+            9 => if (fork.atLeast(.istanbul)) .blake2f else null,
             else => null,
         };
     }
@@ -49,20 +51,196 @@ const Kind = enum {
     /// size (its input is always exactly 128 bytes' worth of fixed fields).
     /// `ECADD`/`ECMUL` are flat fees too; `ECPAIRING` is flat-per-pair;
     /// `MODEXP`'s formula is complex enough to live in its own function.
-    fn gasCost(kind: Kind, input: []const u8) u64 {
+    fn gasCost(kind: Kind, input: []const u8, fork: Fork) u64 {
+        // EIP-1108 (Istanbul) cut the alt_bn128 costs hard, on the basis
+        // that faster implementations had made the Byzantium prices a large
+        // overcharge. The arithmetic is unchanged; only the fee moved.
+        const istanbul = fork.atLeast(.istanbul);
         const words = (input.len + 31) / 32;
         return switch (kind) {
             .ecrecover => 3000,
             .sha256 => 60 + 12 * words,
             .ripemd160 => 600 + 120 * words,
             .identity => 15 + 3 * words,
-            .modexp => modexpGasCost(input),
-            .ecadd => 500,
-            .ecmul => 40000,
-            .ecpairing => 100000 + 80000 * (input.len / 192),
+            .modexp => modexpGasCost(input, fork),
+            .ecadd => if (istanbul) 150 else 500,
+            .ecmul => if (istanbul) 6000 else 40000,
+            .ecpairing => if (istanbul)
+                45000 + 34000 * (input.len / 192)
+            else
+                100000 + 80000 * (input.len / 192),
+            // EIP-152: one gas per round, and the round count is attacker
+            // chosen, so the price has to scale with it. A malformed input
+            // is charged nothing because it never gets this far.
+            .blake2f => if (input.len == 213) std.mem.readInt(u32, input[0..4], .big) else 0,
         };
     }
 };
+
+/// BLAKE2b's compression function `F` (RFC 7693 section 3.2), which is what
+/// EIP-152's precompile exposes: not a hash, one call to the round function
+/// over a caller-supplied state, message block, offset counters and final
+/// flag. The round count is a parameter rather than BLAKE2b's fixed 12, which
+/// is the whole point (it lets a contract verify another chain's BLAKE2b
+/// work at a chosen cost) and also why the gas is charged per round.
+const blake2b_iv = [8]u64{
+    0x6a09e667f3bcc908, 0xbb67ae8584caa73b, 0x3c6ef372fe94f82b, 0xa54ff53a5f1d36f1,
+    0x510e527fade682d1, 0x9b05688c2b3e6c1f, 0x1f83d9abfb41bd6b, 0x5be0cd19137e2179,
+};
+
+const blake2b_sigma = [10][16]u8{
+    .{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 },
+    .{ 14, 10, 4, 8, 9, 15, 13, 6, 1, 12, 0, 2, 11, 7, 5, 3 },
+    .{ 11, 8, 12, 0, 5, 2, 15, 13, 10, 14, 3, 6, 7, 1, 9, 4 },
+    .{ 7, 9, 3, 1, 13, 12, 11, 14, 2, 6, 5, 10, 4, 0, 15, 8 },
+    .{ 9, 0, 5, 7, 2, 4, 10, 15, 14, 1, 11, 12, 6, 8, 3, 13 },
+    .{ 2, 12, 6, 10, 0, 11, 8, 3, 4, 13, 7, 5, 15, 14, 1, 9 },
+    .{ 12, 5, 1, 15, 14, 13, 4, 10, 0, 7, 6, 3, 9, 2, 8, 11 },
+    .{ 13, 11, 7, 14, 12, 1, 3, 9, 5, 0, 15, 4, 8, 6, 2, 10 },
+    .{ 6, 15, 14, 9, 11, 3, 0, 8, 12, 2, 13, 7, 1, 4, 10, 5 },
+    .{ 10, 2, 8, 4, 7, 6, 1, 5, 15, 11, 9, 14, 3, 12, 13, 0 },
+};
+
+fn blake2bMix(v: *[16]u64, a: usize, b: usize, c: usize, d: usize, x: u64, y: u64) void {
+    v[a] = v[a] +% v[b] +% x;
+    v[d] = std.math.rotr(u64, v[d] ^ v[a], 32);
+    v[c] = v[c] +% v[d];
+    v[b] = std.math.rotr(u64, v[b] ^ v[c], 24);
+    v[a] = v[a] +% v[b] +% y;
+    v[d] = std.math.rotr(u64, v[d] ^ v[a], 16);
+    v[c] = v[c] +% v[d];
+    v[b] = std.math.rotr(u64, v[b] ^ v[c], 63);
+}
+
+/// Applies `rounds` rounds of `F` to `h` in place.
+fn blake2bCompress(rounds: u32, h: *[8]u64, m: [16]u64, t: [2]u64, final: bool) void {
+    var v: [16]u64 = undefined;
+    @memcpy(v[0..8], h);
+    @memcpy(v[8..16], &blake2b_iv);
+    v[12] ^= t[0];
+    v[13] ^= t[1];
+    if (final) v[14] = ~v[14];
+
+    var round: u32 = 0;
+    while (round < rounds) : (round += 1) {
+        // The schedule repeats every ten rounds, which is what lets the
+        // round count exceed BLAKE2b's own twelve.
+        const sigma = blake2b_sigma[round % 10];
+        blake2bMix(&v, 0, 4, 8, 12, m[sigma[0]], m[sigma[1]]);
+        blake2bMix(&v, 1, 5, 9, 13, m[sigma[2]], m[sigma[3]]);
+        blake2bMix(&v, 2, 6, 10, 14, m[sigma[4]], m[sigma[5]]);
+        blake2bMix(&v, 3, 7, 11, 15, m[sigma[6]], m[sigma[7]]);
+        blake2bMix(&v, 0, 5, 10, 15, m[sigma[8]], m[sigma[9]]);
+        blake2bMix(&v, 1, 6, 11, 12, m[sigma[10]], m[sigma[11]]);
+        blake2bMix(&v, 2, 7, 8, 13, m[sigma[12]], m[sigma[13]]);
+        blake2bMix(&v, 3, 4, 9, 14, m[sigma[14]], m[sigma[15]]);
+    }
+
+    for (h, 0..) |*word, i| word.* ^= v[i] ^ v[i + 8];
+}
+
+/// EIP-152's layout: 4 bytes of rounds big-endian, then 64 bytes of state,
+/// 128 of message, 16 of offset counters, and one final-block flag, all
+/// little-endian. Anything else about the input is invalid, and invalid
+/// means an exceptional halt that forfeits the forwarded gas rather than a
+/// soft failure, same as the curve precompiles.
+fn blake2fOutput(allocator: std.mem.Allocator, input: []const u8) ![]const u8 {
+    if (input.len != 213) return error.InvalidInput;
+    const flag = input[212];
+    if (flag > 1) return error.InvalidInput;
+
+    const rounds = std.mem.readInt(u32, input[0..4], .big);
+    var h: [8]u64 = undefined;
+    for (&h, 0..) |*word, i| word.* = std.mem.readInt(u64, input[4 + i * 8 ..][0..8], .little);
+    var m: [16]u64 = undefined;
+    for (&m, 0..) |*word, i| word.* = std.mem.readInt(u64, input[68 + i * 8 ..][0..8], .little);
+    const t = [2]u64{
+        std.mem.readInt(u64, input[196..][0..8], .little),
+        std.mem.readInt(u64, input[204..][0..8], .little),
+    };
+
+    blake2bCompress(rounds, &h, m, t, flag == 1);
+
+    const out = try allocator.alloc(u8, 64);
+    for (h, 0..) |word, i| std.mem.writeInt(u64, out[i * 8 ..][0..8], word, .little);
+    return out;
+}
+
+test "BLAKE2F's compression function reproduces BLAKE2b-512 of \"abc\"" {
+    // Checked against std's BLAKE2b rather than a copied vector, so this
+    // tests the implementation rather than my transcription. Hashing a
+    // single short message is exactly one call to `F`: the state starts at
+    // the IV with the parameter block mixed in, the message block is the
+    // input zero-padded to 128 bytes, the counter is the byte length, and
+    // the final-block flag is set.
+    const message = "abc";
+    var input: [213]u8 = [_]u8{0} ** 213;
+    std.mem.writeInt(u32, input[0..4], 12, .big); // BLAKE2b's own round count
+
+    // Parameter block for an unkeyed 64-byte digest: fanout 1, depth 1.
+    var h = blake2b_iv;
+    h[0] ^= 0x01010040;
+    for (h, 0..) |word, i| std.mem.writeInt(u64, input[4 + i * 8 ..][0..8], word, .little);
+    @memcpy(input[68..][0..message.len], message);
+    std.mem.writeInt(u64, input[196..][0..8], message.len, .little);
+    input[212] = 1; // final block
+
+    const out = try blake2fOutput(std.testing.allocator, &input);
+    defer std.testing.allocator.free(out);
+
+    var expected: [64]u8 = undefined;
+    std.crypto.hash.blake2.Blake2b512.hash(message, &expected, .{});
+    try std.testing.expectEqualSlices(u8, &expected, out);
+}
+
+test "BLAKE2F with zero rounds still folds the state and the IV together" {
+    // Zero rounds is legal and is not a no-op: `F` always finishes by
+    // XORing the two halves of the working vector back into the state.
+    var input: [213]u8 = [_]u8{0} ** 213;
+    std.mem.writeInt(u32, input[0..4], 0, .big);
+    for (blake2b_iv, 0..) |word, i| std.mem.writeInt(u64, input[4 + i * 8 ..][0..8], word, .little);
+
+    const out = try blake2fOutput(std.testing.allocator, &input);
+    defer std.testing.allocator.free(out);
+
+    // v[0..8] is h and v[8..16] is the IV, both the IV here, so every word
+    // XORs with itself twice and the state is unchanged.
+    for (blake2b_iv, 0..) |word, i| {
+        try std.testing.expectEqual(word, std.mem.readInt(u64, out[i * 8 ..][0..8], .little));
+    }
+}
+
+test "BLAKE2F rejects a malformed input rather than failing softly" {
+    // EIP-152 requires exactly 213 bytes and a final flag of 0 or 1.
+    var short: [212]u8 = [_]u8{0} ** 212;
+    try std.testing.expectError(error.InvalidInput, blake2fOutput(std.testing.allocator, &short));
+    var long: [214]u8 = [_]u8{0} ** 214;
+    try std.testing.expectError(error.InvalidInput, blake2fOutput(std.testing.allocator, &long));
+
+    var bad_flag: [213]u8 = [_]u8{0} ** 213;
+    bad_flag[212] = 2;
+    try std.testing.expectError(error.InvalidInput, blake2fOutput(std.testing.allocator, &bad_flag));
+
+    // And through `call`, a malformed input forfeits the whole forwarded
+    // amount rather than returning a failed-but-cheap result.
+    const result = (try call(std.testing.allocator, 9, &bad_flag, 100_000, .istanbul)).?;
+    try std.testing.expect(!result.success);
+    try std.testing.expectEqual(@as(u64, 0), result.gas_remaining);
+}
+
+test "BLAKE2F is not a precompile before Istanbul, and costs one gas per round" {
+    var input: [213]u8 = [_]u8{0} ** 213;
+    std.mem.writeInt(u32, input[0..4], 7, .big);
+
+    // Address 9 is nothing at all until Istanbul, so the caller falls back
+    // to running whatever code is there (none).
+    try std.testing.expectEqual(@as(?Result, null), try call(std.testing.allocator, 9, &input, 1000, .petersburg));
+
+    const result = (try call(std.testing.allocator, 9, &input, 1000, .istanbul)).?;
+    defer std.testing.allocator.free(result.output);
+    try std.testing.expect(result.success);
+    try std.testing.expectEqual(@as(u64, 1000 - 7), result.gas_remaining);
+}
 
 pub const Result = struct {
     success: bool,
@@ -77,7 +255,7 @@ pub const Result = struct {
 /// ordinary bytecode.
 pub fn call(allocator: std.mem.Allocator, address: Address, input: []const u8, gas_limit: u64, fork: Fork) !?Result {
     const kind = Kind.fromAddress(address, fork) orelse return null;
-    const cost = kind.gasCost(input);
+    const cost = kind.gasCost(input, fork);
     // Insufficient gas forfeits the whole forwarded amount, not just `cost`
     // (see `Evm.gasUsed`'s doc comment for the same rule one layer up). Also
     // where MODEXP/ECADD/ECMUL/ECPAIRING's "invalid input" failures land:
@@ -103,6 +281,10 @@ pub fn call(allocator: std.mem.Allocator, address: Address, input: []const u8, g
         },
         .ecpairing => bn128PairingOutput(allocator, input) catch |err| switch (err) {
             error.InvalidPoint => return .{ .success = false, .gas_remaining = 0, .output = &.{} },
+            else => |e| return e,
+        },
+        .blake2f => blake2fOutput(allocator, input) catch |err| switch (err) {
+            error.InvalidInput => return .{ .success = false, .gas_remaining = 0, .output = &.{} },
             else => |e| return e,
         },
     };
@@ -211,13 +393,20 @@ fn readLength(data: []const u8, offset: usize) u256 {
 /// attacker-chosen length that could otherwise approach 2^256.
 const modexp_length_cap: u256 = 1 << 40;
 
-/// `mult_complexity` from EIP-198, verbatim (this is Byzantium's original
-/// formula — EIP-2565's Berlin repricing changed both this and
-/// `GQUADDIVISOR`, but that's a later fork this Evm doesn't implement yet).
+/// `mult_complexity` from EIP-198, verbatim: Byzantium's original formula,
+/// replaced at Berlin by `mulComplexity2565`.
 fn mulComplexity(x: u512) u512 {
     if (x <= 64) return x * x;
     if (x <= 1024) return x * x / 4 + 96 * x - 3072;
     return x * x / 16 + 480 * x - 199680;
+}
+
+/// EIP-2565 (Berlin): the square of the operand length in 64-bit words.
+/// EIP-198's piecewise curve modelled schoolbook multiplication on bytes and
+/// overpriced every realistic input.
+fn mulComplexity2565(x: u512) u512 {
+    const words = (x + 7) / 8;
+    return words * words;
 }
 
 fn bitLength(x: u256) u32 {
@@ -283,14 +472,19 @@ const ModexpLayout = struct {
     }
 };
 
-fn modexpGasCost(input: []const u8) u64 {
+fn modexpGasCost(input: []const u8, fork: Fork) u64 {
     const layout = ModexpLayout.parse(input);
     if (layout.too_large) return std.math.maxInt(u64);
 
     const max_length: u512 = @max(layout.base_length, layout.modulus_length);
-    const complexity = mulComplexity(max_length);
     const iters = iterationsCount(layout.exp_length, layout.exp_head);
-    const cost_wide: u512 = (complexity * iters) / 20;
+    // EIP-2565 (Berlin) swaps the complexity curve, divides by 3 instead of
+    // 20, and puts a 200 floor under the result. The iteration count is
+    // unchanged.
+    const cost_wide: u512 = if (fork.atLeast(.berlin))
+        @max(200, (mulComplexity2565(max_length) * iters) / 3)
+    else
+        (mulComplexity(max_length) * iters) / 20;
     return if (cost_wide > std.math.maxInt(u64)) std.math.maxInt(u64) else @intCast(cost_wide);
 }
 
@@ -464,7 +658,11 @@ fn bn128MulOutput(allocator: std.mem.Allocator, input: []const u8) ![]const u8 {
 fn bn128PairingOutput(allocator: std.mem.Allocator, input: []const u8) ![]const u8 {
     if (input.len % 192 != 0) return error.InvalidPoint;
 
-    var result = bn128.Fq12.one;
+    // The Miller loops are accumulated and exponentiated once at the end
+    // rather than per pair: `e(a,b) * e(c,d) == (ML(a,b) * ML(c,d))^exponent`,
+    // and the final exponentiation is the expensive half of a pairing. A
+    // Groth16 proof is four pairs, so this is four of them down to one.
+    var accumulated = bn128.Fq12.one;
     var i: usize = 0;
     while (i < input.len) : (i += 192) {
         const p = try decodeG1Checked(input, i);
@@ -476,8 +674,9 @@ fn bn128PairingOutput(allocator: std.mem.Allocator, input: []const u8) ![]const 
         // the spec exactly.
         if (bn128.multiply(bn128.Fq, p, bn128.curve_order) != null) return error.InvalidPoint;
         if (bn128.multiply(bn128.Fq2, q, bn128.curve_order) != null) return error.InvalidPoint;
-        result = result.mul(bn128.pairing(q, p));
+        accumulated = accumulated.mul(bn128.millerLoop(q, p));
     }
+    const result = bn128.finalExponentiate(accumulated);
 
     const out = try allocator.alloc(u8, 32);
     @memset(out, 0);
@@ -730,4 +929,75 @@ test "ECADD, ECMUL, ECPAIRING charge Byzantium's original flat gas costs, not a 
     const pairing_underfunded = (try call(std.testing.allocator, 8, &.{}, 99999, .byzantium)).?;
     defer std.testing.allocator.free(pairing_underfunded.output);
     try std.testing.expect(!pairing_underfunded.success);
+}
+
+test "ECPAIRING checks a product of pairings, not each pairing separately" {
+    // Exercises the accumulate-then-exponentiate-once path with real input.
+    // Built from the generators rather than transcribed hex, so the G2
+    // coefficient order here cannot silently disagree with the decoder's.
+    const bn = bn128;
+    var pair: [192]u8 = undefined;
+    const writeG1 = struct {
+        fn f(buf: []u8, pt: bn.G1Point) void {
+            std.mem.writeInt(u256, buf[0..32], pt.x.n, .big);
+            std.mem.writeInt(u256, buf[32..64], pt.y.n, .big);
+        }
+    }.f;
+    const writeG2 = struct {
+        fn f(buf: []u8, pt: bn.G2Point) void {
+            std.mem.writeInt(u256, buf[0..32], pt.x.coeffs[1].n, .big);
+            std.mem.writeInt(u256, buf[32..64], pt.x.coeffs[0].n, .big);
+            std.mem.writeInt(u256, buf[64..96], pt.y.coeffs[1].n, .big);
+            std.mem.writeInt(u256, buf[96..128], pt.y.coeffs[0].n, .big);
+        }
+    }.f;
+
+    // A single pair: e(G1, G2) is not 1, so the result word is 0.
+    writeG1(pair[0..64], bn.g1);
+    writeG2(pair[64..192], bn.g2);
+    const one_pair = (try call(std.testing.allocator, 8, &pair, 1_000_000, .istanbul)).?;
+    defer std.testing.allocator.free(one_pair.output);
+    try std.testing.expect(one_pair.success);
+    try std.testing.expectEqual(@as(u8, 0), one_pair.output[31]);
+
+    // Two pairs whose product is 1: e(G1, G2) * e(-G1, G2) == 1.
+    var two: [384]u8 = undefined;
+    @memcpy(two[0..192], &pair);
+    writeG1(two[192..256], .{ .x = bn.g1.x, .y = bn.g1.y.neg() });
+    writeG2(two[256..384], bn.g2);
+    const two_pairs = (try call(std.testing.allocator, 8, &two, 1_000_000, .istanbul)).?;
+    defer std.testing.allocator.free(two_pairs.output);
+    try std.testing.expect(two_pairs.success);
+    try std.testing.expectEqual(@as(u8, 1), two_pairs.output[31]);
+
+    // Empty input is an empty product, which is 1.
+    const empty = (try call(std.testing.allocator, 8, &.{}, 1_000_000, .istanbul)).?;
+    defer std.testing.allocator.free(empty.output);
+    try std.testing.expect(empty.success);
+    try std.testing.expectEqual(@as(u8, 1), empty.output[31]);
+}
+
+test "EIP-2565 puts a 200 floor under MODEXP and reprices it at Berlin" {
+    // base, exponent and modulus each one byte long: 3^1 mod 5.
+    var input = [_]u8{0} ** (96 + 3);
+    input[31] = 1;
+    input[63] = 1;
+    input[95] = 1;
+    input[96] = 3;
+    input[97] = 1;
+    input[98] = 5;
+    // EIP-198 prices this at 1 * 1 / 20 = 0; EIP-2565 at max(200, 1 * 1 / 3).
+    try std.testing.expectEqual(@as(u64, 0), modexpGasCost(&input, .istanbul));
+    try std.testing.expectEqual(@as(u64, 200), modexpGasCost(&input, .berlin));
+
+    // 64-byte base and modulus, 32-byte exponent with its top bit set, so
+    // 255 iterations. EIP-2565: ceil(64 / 8)^2 * 255 / 3 = 64 * 255 / 3.
+    var big = [_]u8{0} ** (96 + 64 + 32 + 64);
+    big[31] = 64;
+    big[63] = 32;
+    big[95] = 64;
+    big[96 + 64] = 0x80;
+    try std.testing.expectEqual(@as(u64, 64 * 255 / 3), modexpGasCost(&big, .berlin));
+    // EIP-198 for the same input: mult_complexity(64) = 64^2, / 20.
+    try std.testing.expectEqual(@as(u64, 64 * 64 * 255 / 20), modexpGasCost(&big, .istanbul));
 }

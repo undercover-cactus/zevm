@@ -58,10 +58,10 @@ export fn zevm_state_get_balance(
     std.mem.writeInt(u256, out_balance, balance, .big);
 }
 
-/// Mirrors `state.accounts.count()`, the summary both `examples/sync.zig`
+/// Mirrors `state.accountCount()`, the summary both `examples/sync.zig`
 /// and `rzevm/examples/sync.rs` print at the end of a replay.
 export fn zevm_state_accounts_count(handle: *anyopaque) callconv(.c) usize {
-    return stateFromHandle(handle).accounts.count();
+    return stateFromHandle(handle).accountCount();
 }
 
 export fn zevm_evm_create(state_handle: *anyopaque) callconv(.c) ?*anyopaque {

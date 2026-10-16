@@ -30,8 +30,23 @@ pub const Account = struct {
     balance: u256 = 0,
     nonce: u64 = 0,
     code: []const u8 = &.{},
+    /// Only the slots this account has *written* while loaded from a `base`
+    /// snapshot. Unwritten slots still live in the snapshot and are read
+    /// through, so this is the account's whole storage only when
+    /// `base_storage_void` says so.
     storage: std.AutoHashMapUnmanaged(u256, u256) = .empty,
+    /// Overlay bookkeeping, not consensus state. False once the account has
+    /// been erased, which is how a deletion overrides a `base` that still
+    /// holds the account.
+    present: bool = true,
+    /// Whether `base`'s slots for this address must be ignored. True for an
+    /// account that never existed in `base`, and true again after a
+    /// destruction: a `SELFDESTRUCT`ed account recreated at the same address
+    /// by `CREATE2` must not see the storage its predecessor was carrying.
+    base_storage_void: bool = true,
 };
+
+pub const SlotKey = struct { address: Address, slot: u256 };
 
 const Change = union(enum) {
     created: Address,
@@ -44,12 +59,28 @@ const Change = union(enum) {
     code: Address,
     marked_for_destruction: Address,
     touched: Address,
+    /// A tombstoned account was written to again, reviving it. Undoing that
+    /// restores the tombstone rather than removing the overlay entry, which
+    /// would let `base` answer for the address and resurrect the account
+    /// a `SELFDESTRUCT` had erased.
+    revived: Address,
+    /// EIP-2929: an address or slot was accessed for the first time in this
+    /// transaction. Undone like any other change, because a reverted frame's
+    /// accesses never happened as far as later pricing is concerned.
+    warmed_address: Address,
+    warmed_slot: SlotKey,
 };
 
 pub const Checkpoint = usize;
 
 allocator: std.mem.Allocator,
+/// Accounts that have been written since `base` was loaded, plus any read
+/// that had to be materialised. Everything else is read straight out of
+/// `base`, so this holds a chunk's working set rather than the whole chain.
 accounts: std.AutoHashMapUnmanaged(Address, Account) = .empty,
+/// The snapshot this state was resumed from, read in place. Null for a state
+/// built from genesis, in which case `accounts` is the whole story.
+base: ?Base = null,
 /// The snapshot mapping a resumed state was built from, if any. Contract
 /// code loaded from it points *into* it rather than being copied onto the
 /// heap: at 10.3M contracts that copy costs 6.8GB of anonymous memory, and
@@ -66,6 +97,33 @@ snapshot_bytes: ?[]const u8 = null,
 /// which no chunk ever executes. A derived cache, so `setCode` and account
 /// removal invalidate rather than update it.
 jumpdest_cache: std.AutoHashMapUnmanaged(Address, std.DynamicBitSetUnmanaged) = .empty,
+/// Each slot's value as of the start of the current transaction, recorded
+/// the first time that transaction writes it. EIP-2200 prices an `SSTORE`
+/// on how *original*, current and new relate, so "what was this before
+/// anything in this transaction touched it" has to be answerable even after
+/// several writes. Cleared by `finalizeTransaction`, which is exactly the
+/// boundary the word "original" refers to.
+originals: std.AutoHashMapUnmanaged(SlotKey, u256) = .empty,
+/// Slots already looked up in `base`, remembered so a hot one is searched
+/// for once rather than on every access. Finding a slot in the snapshot
+/// means a binary search over its account's region, and `SLOAD` is the
+/// hottest opcode there is: without this, a chunk at depth took over two
+/// hours at 99% CPU against the ~13 minutes the fully materialised state
+/// managed, because a slot read a thousand times was searched for a
+/// thousand times.
+///
+/// Needs no invalidation. A written slot lives in the overlay, which
+/// `getStorage` consults first, and a destroyed or recreated account returns
+/// before the cache is reached. Entries are therefore only ever the
+/// snapshot's own unchanged values.
+slot_cache: std.AutoHashMapUnmanaged(SlotKey, u256) = .empty,
+/// EIP-2929's accessed addresses and storage keys for the transaction in
+/// progress: whatever is in here is "warm" and pays the small price. Seeded
+/// per transaction by `Evm.executeTransaction` and cleared by
+/// `finalizeTransaction`. Kept here rather than in the interpreter so the
+/// journal can undo a reverted frame's additions with everything else.
+warm_addresses: std.AutoHashMapUnmanaged(Address, void) = .empty,
+warm_slots: std.AutoHashMapUnmanaged(SlotKey, void) = .empty,
 journal: std.ArrayListUnmanaged(Change) = .empty,
 /// Addresses `SELFDESTRUCT`ed during the transaction currently in
 /// progress, appended by `destroyAccount` in lockstep with its
@@ -113,6 +171,12 @@ pub fn deinit(self: *State) void {
         if (self.ownsCode(account.code)) self.allocator.free(account.code);
         account.storage.deinit(self.allocator);
     }
+    self.originals.deinit(self.allocator);
+    self.slot_cache.deinit(self.allocator);
+    self.warm_addresses.deinit(self.allocator);
+    self.warm_slots.deinit(self.allocator);
+    if (self.base) |*base| base.deinit(self.allocator);
+
     var jd = self.jumpdest_cache.valueIterator();
     while (jd.next()) |bits| bits.deinit(self.allocator);
     self.jumpdest_cache.deinit(self.allocator);
@@ -141,10 +205,27 @@ const rehash_after_deletions: u32 = 100_000;
 /// (`pending_destructions` and `touched`) so a later call to that address
 /// is indistinguishable from one that was never used.
 fn removeAccount(self: *State, address: Address) void {
-    var kv = self.accounts.fetchRemove(address) orelse return;
-    if (self.ownsCode(kv.value.code)) self.allocator.free(kv.value.code);
-    kv.value.storage.deinit(self.allocator);
     self.invalidateJumpdest(address);
+    const in_base = if (self.base) |*b| b.contains(address) else false;
+
+    if (self.accounts.getPtr(address)) |overlaid| {
+        if (self.ownsCode(overlaid.code)) self.allocator.free(overlaid.code);
+        overlaid.storage.deinit(self.allocator);
+        if (in_base) {
+            // A tombstone, not a removal: dropping the entry would let
+            // `base` answer for this address again and resurrect the
+            // account. `base_storage_void` also stops a later recreation at
+            // the same address (a `CREATE2` after `SELFDESTRUCT`) from
+            // seeing its predecessor's slots.
+            overlaid.* = .{ .present = false, .base_storage_void = true };
+            return;
+        }
+        _ = self.accounts.remove(address);
+    } else if (in_base) {
+        // Never materialised, so the tombstone is all there is to write.
+        self.accounts.put(self.allocator, address, .{ .present = false, .base_storage_void = true }) catch return;
+        return;
+    } else return;
 
     self.deletions_since_rehash += 1;
     if (self.deletions_since_rehash >= rehash_after_deletions) {
@@ -180,14 +261,127 @@ pub fn finalizeTransaction(self: *State) void {
     // process past this machine's 62GB and got it OOM-killed. Capacity is
     // retained, so the next transaction reuses the same buffer.
     self.journal.clearRetainingCapacity();
+    // A new transaction means a new notion of "original".
+    self.originals.clearRetainingCapacity();
+    // And everything is cold again.
+    self.warm_addresses.clearRetainingCapacity();
+    self.warm_slots.clearRetainingCapacity();
 }
 
+/// Marks `address` warm (EIP-2929), returning whether it already was. The
+/// caller prices the access from the answer: warm costs
+/// `gas.warm_storage_read_2929`, cold costs `gas.cold_account_access_2929`.
+pub fn warmAddress(self: *State, address: Address) !bool {
+    const entry = try self.warm_addresses.getOrPut(self.allocator, address);
+    if (entry.found_existing) return true;
+    try self.journal.append(self.allocator, .{ .warmed_address = address });
+    return false;
+}
+
+/// `warmAddress` for one storage slot of `address`.
+pub fn warmSlot(self: *State, address: Address, slot: u256) !bool {
+    const key: SlotKey = .{ .address = address, .slot = slot };
+    const entry = try self.warm_slots.getOrPut(self.allocator, key);
+    if (entry.found_existing) return true;
+    try self.journal.append(self.allocator, .{ .warmed_slot = key });
+    return false;
+}
+
+/// `slot`'s value as of the start of the current transaction, which is the
+/// current value when this transaction has not written it yet.
+pub fn originalStorage(self: *State, address: Address, slot: u256) u256 {
+    if (self.originals.get(.{ .address = address, .slot = slot })) |original| return original;
+    return self.getStorage(address, slot);
+}
+
+/// `address`'s balance, nonce and code, from the overlay if it has been
+/// written and from `base` otherwise.
+///
+/// The returned `storage` is NOT the account's storage: a base-backed
+/// account's unwritten slots stay in the snapshot. Read slots through
+/// `getStorage`, which knows how to look there. Nothing outside this file
+/// reads `.storage` off a `get`, and nothing should start.
 pub fn get(self: *const State, address: Address) Account {
-    return self.accounts.get(address) orelse .{};
+    if (self.accounts.get(address)) |overlaid| {
+        return if (overlaid.present) overlaid else .{};
+    }
+    if (self.base) |*base| {
+        if (base.get(address)) |record| return .{
+            .balance = record.balance,
+            .nonce = record.nonce,
+            .code = record.code,
+            .base_storage_void = false,
+        };
+    }
+    return .{};
 }
 
 pub fn exists(self: *const State, address: Address) bool {
-    return self.accounts.contains(address);
+    if (self.accounts.get(address)) |overlaid| return overlaid.present;
+    if (self.base) |*base| return base.contains(address);
+    return false;
+}
+
+/// How many accounts the state holds, overlay and `base` merged. O(overlay),
+/// since the only corrections needed are for overlay entries that either
+/// shadow a base account or erase one.
+pub fn accountCount(self: *const State) usize {
+    const base = if (self.base) |*b| b else return self.accounts.count();
+    var total = base.count();
+    var it = self.accounts.iterator();
+    while (it.next()) |entry| {
+        const in_base = base.contains(entry.key_ptr.*);
+        if (entry.value_ptr.present and !in_base) total += 1;
+        if (!entry.value_ptr.present and in_base) total -= 1;
+    }
+    return total;
+}
+
+/// The overlay entry for `address`, materialising it from `base` on first
+/// write. Every mutation goes through this, which is what keeps the overlay
+/// holding only a chunk's working set.
+/// `journal_creation` false for the callers whose write a revert must not
+/// undo (block rewards, gas fees). Those materialise the entry but leave no
+/// `.created` behind, so `revertTo` has nothing to remove and the credit
+/// stands, matching the unjournaled behaviour `creditBalance` has always had.
+fn materialiseMaybeJournaled(self: *State, address: Address, journal_creation: bool) !*Account {
+    const entry = try self.accounts.getOrPut(self.allocator, address);
+    if (entry.found_existing) {
+        if (entry.value_ptr.present) return entry.value_ptr;
+        // Writing to a tombstoned address brings it back as a brand-new
+        // account. `base_storage_void` stays set, so none of the erased
+        // account's slots come with it.
+        entry.value_ptr.* = .{ .present = true, .base_storage_void = true };
+        if (journal_creation) try self.journal.append(self.allocator, .{ .revived = address });
+        return entry.value_ptr;
+    }
+
+    // Copied out of `base` if it is there, so later writes layer onto the
+    // real values; `base_storage_void` stays false so unwritten slots are
+    // still read through to the snapshot.
+    if (self.base) |*base| {
+        if (base.get(address)) |record| {
+            entry.value_ptr.* = .{
+                .balance = record.balance,
+                .nonce = record.nonce,
+                .code = record.code,
+                .base_storage_void = false,
+            };
+            if (journal_creation) try self.journal.append(self.allocator, .{ .created = address });
+            return entry.value_ptr;
+        }
+    }
+
+    entry.value_ptr.* = .{};
+    if (debugOn(address)) {
+        std.debug.print("DEBUG block={d} touch({x}): created\n", .{ debug_block_number, address });
+    }
+    if (journal_creation) try self.journal.append(self.allocator, .{ .created = address });
+    return entry.value_ptr;
+}
+
+fn materialise(self: *State, address: Address) !*Account {
+    return self.materialiseMaybeJournaled(address, true);
 }
 
 fn isEmptyAccount(account: Account) bool {
@@ -255,19 +449,7 @@ pub fn getCode(self: *const State, address: Address) []const u8 {
 /// account already existing for the destruction to register at all.
 pub fn touch(self: *State, address: Address) !void {
     self.debugRecord(address);
-    // `getOrPut` does one probe for the check-and-set instead of a separate
-    // `contains` + `put` — this is by far the hottest path in a real
-    // multi-million-block replay (every zero-value CALL touches its
-    // target), so the redundant second lookup shows up as roughly half of
-    // total wall time once the account count reaches the millions. Mirrors
-    // `setStorage`'s identical fix.
-    const entry = try self.accounts.getOrPut(self.allocator, address);
-    if (entry.found_existing) return;
-    entry.value_ptr.* = .{}; // must initialize a freshly created slot regardless
-    if (debugOn(address)) {
-        std.debug.print("DEBUG block={d} touch({x}): created\n", .{ debug_block_number, address });
-    }
-    try self.journal.append(self.allocator, .{ .created = address });
+    _ = try self.materialise(address);
 }
 
 // DEBUG: era1-replay divergence hunt scaffolding. Edit `debug_target` and
@@ -321,8 +503,7 @@ pub fn debugDumpBlockAccounts(self: *const State) void {
 
 pub fn setBalance(self: *State, address: Address, balance: u256) !void {
     self.debugRecord(address);
-    try self.touch(address);
-    const account = self.accounts.getPtr(address).?;
+    const account = try self.materialise(address);
     if (debugOn(address)) {
         std.debug.print("DEBUG block={d} setBalance({x}): {d} -> {d}\n", .{ debug_block_number, address, account.balance, balance });
     }
@@ -335,17 +516,19 @@ pub fn setBalance(self: *State, address: Address, balance: u256) !void {
 /// that will never revert this specific change (e.g. block/uncle rewards).
 pub fn creditBalance(self: *State, address: Address, amount: u256) !void {
     self.debugRecord(address);
-    const entry = try self.accounts.getOrPutValue(self.allocator, address, .{});
+    // Materialised so a base-backed account is credited on top of the
+    // balance it actually has rather than from zero, but without journaling
+    // the creation: these credits survive reverts by design.
+    const account = try self.materialiseMaybeJournaled(address, false);
     if (debugOn(address)) {
-        std.debug.print("DEBUG block={d} creditBalance({x}): {d} + {d} = {d}\n", .{ debug_block_number, address, entry.value_ptr.balance, amount, entry.value_ptr.balance + amount });
+        std.debug.print("DEBUG block={d} creditBalance({x}): {d} + {d} = {d}\n", .{ debug_block_number, address, account.balance, amount, account.balance + amount });
     }
-    entry.value_ptr.balance += amount;
+    account.balance += amount;
 }
 
 pub fn setNonce(self: *State, address: Address, nonce: u64) !void {
     self.debugRecord(address);
-    try self.touch(address);
-    const account = self.accounts.getPtr(address).?;
+    const account = try self.materialise(address);
     if (account.nonce == nonce) return;
     try self.journal.append(self.allocator, .{ .nonce = .{ .address = address, .old = account.nonce } });
     account.nonce = nonce;
@@ -359,8 +542,7 @@ pub fn setNonce(self: *State, address: Address, nonce: u64) !void {
 /// fresh nonce anyway, never that same still-live account.
 pub fn setCode(self: *State, address: Address, code: []const u8) !void {
     self.debugRecord(address);
-    try self.touch(address);
-    const account = self.accounts.getPtr(address).?;
+    const account = try self.materialise(address);
     std.debug.assert(account.code.len == 0);
     if (code.len == 0) return;
     account.code = try self.allocator.dupe(u8, code);
@@ -411,25 +593,49 @@ fn invalidateJumpdest(self: *State, address: Address) void {
 /// being called more than once for the same address.
 pub fn destroyAccount(self: *State, address: Address) !void {
     self.debugRecord(address);
-    if (!self.accounts.contains(address)) return;
+    if (!self.exists(address)) return;
     try self.journal.append(self.allocator, .{ .marked_for_destruction = address });
     try self.pending_destructions.append(self.allocator, address);
 }
 
-pub fn getStorage(self: *const State, address: Address, slot: u256) u256 {
-    const account = self.accounts.get(address) orelse return 0;
-    return account.storage.get(slot) orelse 0;
+pub fn getStorage(self: *State, address: Address, slot: u256) u256 {
+    if (self.accounts.getPtr(address)) |overlaid| {
+        if (!overlaid.present) return 0;
+        // A written slot is authoritative, including when it was written to
+        // zero, which is why presence in the map decides rather than value.
+        if (overlaid.storage.get(slot)) |written| return written;
+        if (overlaid.base_storage_void) return 0;
+    }
+    const base = if (self.base) |*b| b else return 0;
+
+    const key: SlotKey = .{ .address = address, .slot = slot };
+    if (self.slot_cache.get(key)) |cached| return cached;
+
+    const record = base.get(address) orelse return 0;
+    const value = record.storage(slot);
+    // Cached even when zero: "this account has no such slot" is just as
+    // expensive to establish, and just as worth remembering.
+    self.slot_cache.put(self.allocator, key, value) catch return value;
+    return value;
 }
 
 pub fn setStorage(self: *State, address: Address, slot: u256, value: u256) !void {
     self.debugRecord(address);
-    try self.touch(address);
-    const account = self.accounts.getPtr(address).?;
+    // Read the effective old value before materialising anything: for a
+    // base-backed account an unwritten slot's previous value is in the
+    // snapshot, not in the overlay, and the journal has to record that one
+    // or a revert would restore a zero that was never there.
+    const old = self.getStorage(address, slot);
+    const account = try self.materialise(address);
     // `getOrPut` does one probe for the check-and-set instead of a separate
     // `get` + `put`. SSTORE is by far the hottest caller of this.
+    // Recorded before the write, and only once per transaction, so repeated
+    // writes to the same slot keep pointing at the value it had on entry.
+    const original_entry = try self.originals.getOrPut(self.allocator, .{ .address = address, .slot = slot });
+    if (!original_entry.found_existing) original_entry.value_ptr.* = old;
+
     const entry = try account.storage.getOrPut(self.allocator, slot);
-    const old: u256 = if (entry.found_existing) entry.value_ptr.* else 0;
-    if (!entry.found_existing) entry.value_ptr.* = 0; // must initialize a freshly created slot regardless
+    if (!entry.found_existing) entry.value_ptr.* = old;
     if (debugOn(address)) {
         std.debug.print("DEBUG block={d} setStorage({x}, slot={d}): {d} -> {d}\n", .{ debug_block_number, address, slot, old, value });
     }
@@ -508,12 +714,20 @@ pub fn revertTo(self: *State, cp: Checkpoint) void {
                 // `destroyAccount`, so it's always the list's last item here.
                 std.debug.assert(self.pending_destructions.pop().? == address);
             },
+            .revived => |address| {
+                const account = self.accounts.getPtr(address).?;
+                if (self.ownsCode(account.code)) self.allocator.free(account.code);
+                account.storage.deinit(self.allocator);
+                account.* = .{ .present = false, .base_storage_void = true };
+            },
             .touched => |address| {
                 // Appended in lockstep with this journal entry in
                 // `markTouchedIfEmpty`, so it's always the list's last item
                 // here.
                 std.debug.assert(self.touched.pop().? == address);
             },
+            .warmed_address => |address| _ = self.warm_addresses.remove(address),
+            .warmed_slot => |key| _ = self.warm_slots.remove(key),
         }
     }
 }
@@ -530,7 +744,132 @@ pub fn releaseJournal(self: *State) void {
     self.pending_destructions.clearAndFree(self.allocator);
 }
 
-/// `keccak256("")` — the code hash every account without code carries in
+/// One account's complete state with `base` and the overlay merged, as the
+/// full scans that write a snapshot or compute a state root need it.
+pub const Merged = struct {
+    address: Address,
+    balance: u256,
+    nonce: u64,
+    code: []const u8,
+    /// `base`'s slot region for this account, ascending, empty when the
+    /// account is overlay-only or its base storage has been voided.
+    base_slots: []const u8,
+    /// The overlay's written slots, or null when the account is base-only.
+    written: ?*const std.AutoHashMapUnmanaged(u256, u256),
+
+    /// Yields every slot this account holds, ascending, with written values
+    /// overriding `base`. Two passes are cheaper than buffering the union:
+    /// the largest contract on this chain carries 11.95M slots.
+    pub const Slots = struct {
+        base_slots: []const u8,
+        sorted_written: []const SlotPair,
+        base_at: usize = 0,
+        written_at: usize = 0,
+
+        pub fn next(self: *Slots) ?SlotPair {
+            const base_left = self.base_at * 64 < self.base_slots.len;
+            const written_left = self.written_at < self.sorted_written.len;
+            if (!base_left and !written_left) return null;
+            if (!base_left) {
+                defer self.written_at += 1;
+                return self.sorted_written[self.written_at];
+            }
+            const entry = self.base_slots[self.base_at * 64 ..];
+            const base_slot = std.mem.readInt(u256, entry[0..32], .little);
+            if (!written_left) {
+                defer self.base_at += 1;
+                return .{ .slot = base_slot, .value = std.mem.readInt(u256, entry[32..64], .little) };
+            }
+            const written = self.sorted_written[self.written_at];
+            if (written.slot < base_slot) {
+                self.written_at += 1;
+                return written;
+            }
+            if (written.slot == base_slot) {
+                // The written value wins, and the base entry is consumed so
+                // the slot is not emitted twice.
+                self.base_at += 1;
+                self.written_at += 1;
+                return written;
+            }
+            self.base_at += 1;
+            return .{ .slot = base_slot, .value = std.mem.readInt(u256, entry[32..64], .little) };
+        }
+    };
+
+    /// `scratch` is filled with this account's written slots, sorted, and
+    /// borrowed by the returned iterator.
+    pub fn slots(self: Merged, allocator: std.mem.Allocator, scratch: *std.ArrayListUnmanaged(SlotPair)) !Slots {
+        scratch.clearRetainingCapacity();
+        if (self.written) |map| {
+            try scratch.ensureTotalCapacity(allocator, map.count());
+            var it = map.iterator();
+            while (it.next()) |e| scratch.appendAssumeCapacity(.{ .slot = e.key_ptr.*, .value = e.value_ptr.* });
+            std.mem.sort(SlotPair, scratch.items, {}, lessThanSlot);
+        }
+        return .{ .base_slots = self.base_slots, .sorted_written = scratch.items };
+    }
+};
+
+/// Every account in the state, exactly once: first a front-to-back walk of
+/// `base` (skipping what the overlay has erased, merging what it has
+/// changed), then the overlay entries `base` never held.
+pub const Scan = struct {
+    state: *const State,
+    base_walk: ?Base.Walk,
+    overlay: std.AutoHashMapUnmanaged(Address, Account).Iterator,
+
+    pub fn next(self: *Scan) ?Merged {
+        if (self.base_walk) |*walk| {
+            while (walk.next()) |item| {
+                if (self.state.accounts.getPtr(item.address)) |overlaid| {
+                    if (!overlaid.present) continue; // erased
+                    return .{
+                        .address = item.address,
+                        .balance = overlaid.balance,
+                        .nonce = overlaid.nonce,
+                        .code = overlaid.code,
+                        .base_slots = if (overlaid.base_storage_void) &.{} else item.record.slots,
+                        .written = &overlaid.storage,
+                    };
+                }
+                return .{
+                    .address = item.address,
+                    .balance = item.record.balance,
+                    .nonce = item.record.nonce,
+                    .code = item.record.code,
+                    .base_slots = item.record.slots,
+                    .written = null,
+                };
+            }
+            self.base_walk = null;
+        }
+        while (self.overlay.next()) |entry| {
+            if (!entry.value_ptr.present) continue;
+            // Already emitted during the base walk.
+            if (self.state.base) |*base| if (base.contains(entry.key_ptr.*)) continue;
+            return .{
+                .address = entry.key_ptr.*,
+                .balance = entry.value_ptr.balance,
+                .nonce = entry.value_ptr.nonce,
+                .code = entry.value_ptr.code,
+                .base_slots = &.{},
+                .written = &entry.value_ptr.storage,
+            };
+        }
+        return null;
+    }
+};
+
+pub fn scan(self: *const State) Scan {
+    return .{
+        .state = self,
+        .base_walk = if (self.base) |*b| b.walk() else null,
+        .overlay = self.accounts.iterator(),
+    };
+}
+
+/// `keccak256("")` — the code hash every account without code carries in/// `keccak256("")` — the code hash every account without code carries in
 /// the state trie. Not zero: an account with no code still commits to the
 /// hash of empty code.
 pub const empty_code_hash: Hash = 0xc5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470;
@@ -548,24 +887,10 @@ pub const empty_code_hash: Hash = 0xc5d2460186f7233c927e7db2dcc703c0e500b653ca82
 /// and takes minutes at mainnet scale. That's the deliberate trade for not
 /// maintaining a persistent trie: call it at checkpoints, never per block.
 pub fn stateRoot(self: *State, allocator: std.mem.Allocator) !Hash {
-    return self.computeStateRoot(allocator, false);
+    return self.computeStateRoot(allocator);
 }
 
-/// The same root as `stateRoot`, but dismantles the state while computing it:
-/// each account's storage map and code are freed the moment they have been
-/// folded into that account's trie leaf. The state is left unusable — only
-/// call this when the process is about to exit or the state is about to be
-/// discarded.
-///
-/// This exists because the non-consuming version needs the whole state *and*
-/// the whole entry set live at once, which at ~52M accounts came to roughly
-/// 58GB and got the replay killed one chunk from the end. Freeing as it goes
-/// means the entries grow into space the accounts are vacating.
-pub fn stateRootConsuming(self: *State, allocator: std.mem.Allocator) !Hash {
-    return self.computeStateRoot(allocator, true);
-}
-
-fn computeStateRoot(self: *State, allocator: std.mem.Allocator, consume: bool) !Hash {
+fn computeStateRoot(self: *State, allocator: std.mem.Allocator) !Hash {
     // Account keys and values must all stay alive until the final hash, so
     // they share one arena. Storage tries don't: each is consumed as soon as
     // its root is folded into an account, so they reuse a second arena that
@@ -578,27 +903,28 @@ fn computeStateRoot(self: *State, allocator: std.mem.Allocator, consume: bool) !
     defer storage_arena.deinit();
 
     var entries: std.ArrayListUnmanaged(Trie.Entry) = .empty;
-    try entries.ensureTotalCapacity(account_allocator, self.accounts.count());
+    try entries.ensureTotalCapacity(account_allocator, self.accountCount());
 
-    var accounts = self.accounts.iterator();
-    while (accounts.next()) |account_entry| {
-        const account = account_entry.value_ptr;
+    var slot_scratch: std.ArrayListUnmanaged(SlotPair) = .empty;
+    defer slot_scratch.deinit(allocator);
 
+    var accounts = self.scan();
+    while (accounts.next()) |account| {
         _ = storage_arena.reset(.retain_capacity);
         const storage_allocator = storage_arena.allocator();
         var slots: std.ArrayListUnmanaged(Trie.Entry) = .empty;
-        var stored = account.storage.iterator();
-        while (stored.next()) |slot| {
+        var stored = try account.slots(allocator, &slot_scratch);
+        while (stored.next()) |pair| {
             // A slot set back to zero is *absent* from the trie, not present
-            // holding zero — the map keeps the entry, the trie must not.
-            if (slot.value_ptr.* == 0) continue;
+            // holding zero — the state keeps the entry, the trie must not.
+            if (pair.value == 0) continue;
             var slot_bytes: [32]u8 = undefined;
-            std.mem.writeInt(u256, &slot_bytes, slot.key_ptr.*, .big);
+            std.mem.writeInt(u256, &slot_bytes, pair.slot, .big);
             const key = try storage_allocator.alloc(u8, 32);
             std.mem.writeInt(u256, key[0..32], keccak256(&slot_bytes), .big);
             try slots.append(storage_allocator, .{
                 .key = key,
-                .value = try Rlp.encodeInt(storage_allocator, slot.value_ptr.*),
+                .value = try Rlp.encodeInt(storage_allocator, pair.value),
             });
         }
         // `hashRoot` frees as it goes, so it gets the real allocator rather
@@ -614,7 +940,7 @@ fn computeStateRoot(self: *State, allocator: std.mem.Allocator, consume: bool) !
             keccak256(account.code), .big);
 
         var address_bytes: [20]u8 = undefined;
-        std.mem.writeInt(u160, &address_bytes, account_entry.key_ptr.*, .big);
+        std.mem.writeInt(u160, &address_bytes, account.address, .big);
         const key = try account_allocator.alloc(u8, 32);
         std.mem.writeInt(u256, key[0..32], keccak256(&address_bytes), .big);
 
@@ -628,16 +954,6 @@ fn computeStateRoot(self: *State, allocator: std.mem.Allocator, consume: bool) !
             }),
         });
 
-        if (consume) {
-            // Everything this account contributes is now captured in the
-            // entry above. Freed with `self.allocator`, which is what
-            // allocated them — not the caller's `allocator`, which may
-            // differ. The emptied fields keep `deinit` safe to call after.
-            account.storage.deinit(self.allocator);
-            account.storage = .empty;
-            if (self.ownsCode(account.code)) self.allocator.free(account.code);
-            account.code = &.{};
-        }
     }
 
     return Trie.hashRoot(allocator, entries.items);
@@ -807,6 +1123,274 @@ pub fn snapshotStateRoot(allocator: std.mem.Allocator, bytes: []const u8) !Snaps
     return .{ .block = block, .root = try Trie.hashRoot(allocator, entries.items) };
 }
 
+test "a snapshot writes each account's storage slots in ascending order" {
+    // A reader locates one slot inside an account's region by binary search,
+    // with no index, so the ordering is load-bearing rather than cosmetic.
+    var state = State.init(std.testing.allocator);
+    defer state.deinit();
+    // Inserted deliberately out of order, and spread far enough apart that
+    // hash-map iteration order is very unlikely to be ascending by accident.
+    try state.setStorage(0xaa, 500, 1);
+    try state.setStorage(0xaa, 3, 2);
+    try state.setStorage(0xaa, std.math.maxInt(u256), 3);
+    try state.setStorage(0xaa, 77, 4);
+    try state.setStorage(0xaa, 0, 5);
+
+    var out = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer out.deinit();
+    try state.writeSnapshot(&out.writer, 1, &.{});
+    const bytes = out.writer.buffered();
+
+    // Walk to this account's slot region: header, then address, balance,
+    // nonce, code length (no code here), then the slot count.
+    var pos: usize = 8 + 8 + 20 + 32 + 8;
+    const code_len = std.mem.readInt(u32, bytes[pos..][0..4], .little);
+    try std.testing.expectEqual(@as(u32, 0), code_len);
+    pos += 4;
+    const count = std.mem.readInt(u64, bytes[pos..][0..8], .little);
+    pos += 8;
+    try std.testing.expectEqual(@as(u64, 5), count);
+
+    var previous: u256 = 0;
+    var i: u64 = 0;
+    while (i < count) : (i += 1) {
+        const slot = std.mem.readInt(u256, bytes[pos..][0..32], .little);
+        pos += 64; // slot and its value
+        if (i != 0) try std.testing.expect(slot > previous);
+        previous = slot;
+    }
+    try std.testing.expectEqual(@as(u256, std.math.maxInt(u256)), previous);
+}
+
+test "a cached base slot still loses to a later write, and to erasure" {
+    // The read cache must never outrank the overlay. Reading first (which
+    // caches) and writing after is the ordering that would expose a cache
+    // consulted too early.
+    var origin = State.init(std.testing.allocator);
+    defer origin.deinit();
+    try origin.setStorage(0xaa, 1, 11);
+    try origin.setStorage(0xaa, 2, 22);
+
+    var out = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer out.deinit();
+    try origin.writeSnapshot(&out.writer, 1, &.{});
+
+    var loaded = (try loadSnapshot(std.testing.allocator, out.writer.buffered())).state;
+    defer loaded.deinit();
+
+    // Populate the cache, including the "no such slot" answer.
+    try std.testing.expectEqual(@as(u256, 11), loaded.getStorage(0xaa, 1));
+    try std.testing.expectEqual(@as(u256, 0), loaded.getStorage(0xaa, 99));
+    try std.testing.expectEqual(@as(u256, 11), loaded.getStorage(0xaa, 1)); // served from cache
+
+    // A write wins over the cached value.
+    try loaded.setStorage(0xaa, 1, 111);
+    try std.testing.expectEqual(@as(u256, 111), loaded.getStorage(0xaa, 1));
+    // Including a write to zero.
+    try loaded.setStorage(0xaa, 2, 0);
+    try std.testing.expectEqual(@as(u256, 0), loaded.getStorage(0xaa, 2));
+    // And a slot the snapshot never had.
+    try loaded.setStorage(0xaa, 99, 9);
+    try std.testing.expectEqual(@as(u256, 9), loaded.getStorage(0xaa, 99));
+
+    // Erasure beats the cache too: these slots were cached from base, and
+    // must not come back once the account is gone.
+    try loaded.destroyAccount(0xaa);
+    loaded.finalizeTransaction();
+    try std.testing.expectEqual(@as(u256, 0), loaded.getStorage(0xaa, 1));
+    try std.testing.expectEqual(@as(u256, 0), loaded.getStorage(0xaa, 2));
+
+    // And a recreation at the same address sees none of them.
+    try loaded.setBalance(0xaa, 1);
+    try std.testing.expectEqual(@as(u256, 0), loaded.getStorage(0xaa, 1));
+}
+
+test "the read cache does not disturb the state root" {
+    var origin = State.init(std.testing.allocator);
+    defer origin.deinit();
+    try origin.setStorage(0xaa, 1, 11);
+    try origin.setStorage(0xaa, 2, 22);
+    try origin.setBalance(0xbb, 5);
+    const expected = try origin.stateRoot(std.testing.allocator);
+
+    var out = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer out.deinit();
+    try origin.writeSnapshot(&out.writer, 1, &.{});
+
+    var loaded = (try loadSnapshot(std.testing.allocator, out.writer.buffered())).state;
+    defer loaded.deinit();
+    // Read everything, so the cache is fully populated before the root is
+    // computed. A cache that leaked into the overlay would show up here as
+    // duplicated or shadowed slots.
+    _ = loaded.getStorage(0xaa, 1);
+    _ = loaded.getStorage(0xaa, 2);
+    _ = loaded.getStorage(0xaa, 3);
+    _ = loaded.getStorage(0xbb, 1);
+    try std.testing.expectEqual(expected, try loaded.stateRoot(std.testing.allocator));
+}
+
+test "a state resumed from a snapshot reads through to it, and writes layer on top" {
+    var origin = State.init(std.testing.allocator);
+    defer origin.deinit();
+    try origin.setBalance(0xaa, 100);
+    try origin.setNonce(0xaa, 7);
+    try origin.setCode(0xaa, &.{ 0x60, 0x01 });
+    try origin.setStorage(0xaa, 1, 11);
+    try origin.setStorage(0xaa, 2, 22);
+    try origin.setBalance(0xbb, 5);
+
+    var out = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer out.deinit();
+    try origin.writeSnapshot(&out.writer, 77, &.{});
+
+    var loaded = (try loadSnapshot(std.testing.allocator, out.writer.buffered())).state;
+    defer loaded.deinit();
+
+    // Nothing materialised yet: every one of these is answered from the file.
+    try std.testing.expectEqual(@as(usize, 0), loaded.accounts.count());
+    try std.testing.expectEqual(@as(usize, 2), loaded.accountCount());
+    try std.testing.expect(loaded.exists(0xaa));
+    try std.testing.expect(!loaded.exists(0xcc));
+    try std.testing.expectEqual(@as(u256, 100), loaded.getBalance(0xaa));
+    try std.testing.expectEqual(@as(u64, 7), loaded.get(0xaa).nonce);
+    try std.testing.expectEqualSlices(u8, &.{ 0x60, 0x01 }, loaded.getCode(0xaa));
+    try std.testing.expectEqual(@as(u256, 11), loaded.getStorage(0xaa, 1));
+    try std.testing.expectEqual(@as(u256, 0), loaded.getStorage(0xaa, 99));
+
+    // A write materialises just that account, and unwritten slots keep
+    // reading through.
+    try loaded.setStorage(0xaa, 2, 222);
+    try std.testing.expectEqual(@as(usize, 1), loaded.accounts.count());
+    try std.testing.expectEqual(@as(u256, 222), loaded.getStorage(0xaa, 2));
+    try std.testing.expectEqual(@as(u256, 11), loaded.getStorage(0xaa, 1));
+    try std.testing.expectEqual(@as(u256, 100), loaded.getBalance(0xaa));
+
+    // A slot written to zero is authoritative, not a fall-through.
+    try loaded.setStorage(0xaa, 1, 0);
+    try std.testing.expectEqual(@as(u256, 0), loaded.getStorage(0xaa, 1));
+
+    // An account the snapshot never held.
+    try loaded.setBalance(0xcc, 9);
+    try std.testing.expect(loaded.exists(0xcc));
+    try std.testing.expectEqual(@as(usize, 3), loaded.accountCount());
+}
+
+test "a resumed state's root is unchanged by what it has or has not materialised" {
+    var origin = State.init(std.testing.allocator);
+    defer origin.deinit();
+    try origin.setBalance(0xaa, 100);
+    try origin.setStorage(0xaa, 1, 11);
+    try origin.setStorage(0xaa, 2, 22);
+    try origin.setCode(0xbb, &.{0x00});
+    try origin.setBalance(0xcc, 1);
+    const expected = try origin.stateRoot(std.testing.allocator);
+
+    var out = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer out.deinit();
+    try origin.writeSnapshot(&out.writer, 1, &.{});
+
+    // Untouched: entirely read through.
+    var cold = (try loadSnapshot(std.testing.allocator, out.writer.buffered())).state;
+    defer cold.deinit();
+    try std.testing.expectEqual(expected, try cold.stateRoot(std.testing.allocator));
+
+    // Materialised by a write-then-revert, which must leave the root alone.
+    var warm = (try loadSnapshot(std.testing.allocator, out.writer.buffered())).state;
+    defer warm.deinit();
+    const cp = warm.checkpoint();
+    try warm.setStorage(0xaa, 1, 999);
+    try warm.setBalance(0xaa, 12345);
+    warm.revertTo(cp);
+    try std.testing.expectEqual(expected, try warm.stateRoot(std.testing.allocator));
+}
+
+test "a resumed snapshot round-trips through writeSnapshot unchanged" {
+    var origin = State.init(std.testing.allocator);
+    defer origin.deinit();
+    try origin.setBalance(0xaa, 100);
+    try origin.setStorage(0xaa, 5, 55);
+    try origin.setStorage(0xaa, 3, 33);
+    try origin.setBalance(0xbb, 7);
+
+    var first = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer first.deinit();
+    try origin.writeSnapshot(&first.writer, 42, &.{});
+
+    var loaded = (try loadSnapshot(std.testing.allocator, first.writer.buffered())).state;
+    defer loaded.deinit();
+    // One written slot, one new account, so the dump has to merge.
+    try loaded.setStorage(0xaa, 4, 44);
+    try loaded.setBalance(0xcc, 3);
+
+    var second = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer second.deinit();
+    try loaded.writeSnapshot(&second.writer, 43, &.{});
+
+    const expected = try loaded.stateRoot(std.testing.allocator);
+    const reloaded = try snapshotStateRoot(std.testing.allocator, second.writer.buffered());
+    try std.testing.expectEqual(@as(u64, 43), reloaded.block);
+    try std.testing.expectEqual(expected, reloaded.root);
+}
+
+test "an account erased from a resumed state stays erased, storage included" {
+    var origin = State.init(std.testing.allocator);
+    defer origin.deinit();
+    try origin.setBalance(0xaa, 100);
+    try origin.setStorage(0xaa, 1, 11);
+
+    var out = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer out.deinit();
+    try origin.writeSnapshot(&out.writer, 1, &.{});
+
+    var loaded = (try loadSnapshot(std.testing.allocator, out.writer.buffered())).state;
+    defer loaded.deinit();
+    try loaded.destroyAccount(0xaa);
+    loaded.finalizeTransaction();
+
+    // The snapshot still holds it; the tombstone must win, and its storage
+    // must not come back when the address is reused.
+    try std.testing.expect(!loaded.exists(0xaa));
+    try std.testing.expectEqual(@as(u256, 0), loaded.getBalance(0xaa));
+    try std.testing.expectEqual(@as(u256, 0), loaded.getStorage(0xaa, 1));
+    try std.testing.expectEqual(@as(usize, 0), loaded.accountCount());
+
+    // Recreated at the same address, as CREATE2 after SELFDESTRUCT does.
+    try loaded.setBalance(0xaa, 5);
+    try std.testing.expect(loaded.exists(0xaa));
+    try std.testing.expectEqual(@as(u256, 0), loaded.getStorage(0xaa, 1));
+    try std.testing.expectEqual(Trie.empty_root, try storageRootOf(&loaded, 0xaa));
+}
+
+/// Just this account's storage trie root, for asserting a recreated account
+/// carries none of its predecessor's slots.
+fn storageRootOf(state: *State, address: Address) !Hash {
+    var scratch: std.ArrayListUnmanaged(SlotPair) = .empty;
+    defer scratch.deinit(state.allocator);
+    var it = state.scan();
+    while (it.next()) |account| {
+        if (account.address != address) continue;
+        var slots: std.ArrayListUnmanaged(Trie.Entry) = .empty;
+        defer {
+            for (slots.items) |e| {
+                state.allocator.free(e.key);
+                state.allocator.free(e.value);
+            }
+            slots.deinit(state.allocator);
+        }
+        var stored = try account.slots(state.allocator, &scratch);
+        while (stored.next()) |pair| {
+            if (pair.value == 0) continue;
+            var slot_bytes: [32]u8 = undefined;
+            std.mem.writeInt(u256, &slot_bytes, pair.slot, .big);
+            const key = try state.allocator.alloc(u8, 32);
+            std.mem.writeInt(u256, key[0..32], keccak256(&slot_bytes), .big);
+            try slots.append(state.allocator, .{ .key = key, .value = try Rlp.encodeInt(state.allocator, pair.value) });
+        }
+        return Trie.hashRoot(state.allocator, slots.items);
+    }
+    return Trie.empty_root;
+}
+
 test "a snapshot's streamed state root matches the state it came from" {
     var state = State.init(std.testing.allocator);
     defer state.deinit();
@@ -872,19 +1456,33 @@ test "an empty snapshot streams to the empty trie root" {
 /// into balances far past the 256-block window itself before it's ever
 /// noticed — this was chased down as a real false-positive `InsufficientBalance`
 /// failure during era1 validation before landing here.
+const SlotPair = struct { slot: u256, value: u256 };
+
+fn lessThanSlot(_: void, a: SlotPair, b: SlotPair) bool {
+    return a.slot < b.slot;
+}
+
+/// Writes the snapshot. Each account's storage slots are emitted in
+/// ascending slot order, which costs a per-account sort here and buys a
+/// binary search later: a reader can find one slot inside an account's
+/// region of the file without an index and without scanning, which matters
+/// because the largest contract on this chain holds 11.95M slots. Accounts
+/// themselves stay in hash-map order; they are found through an in-memory
+/// offset index instead, so sorting 74M of them would buy nothing.
 pub fn writeSnapshot(self: *const State, writer: *std.Io.Writer, block: u64, recent_hashes: []const Hash) !void {
     var buf8: [8]u8 = undefined;
     std.mem.writeInt(u64, &buf8, block, .little);
     try writer.writeAll(&buf8);
-    std.mem.writeInt(u64, &buf8, self.accounts.count(), .little);
+    std.mem.writeInt(u64, &buf8, self.accountCount(), .little);
     try writer.writeAll(&buf8);
 
-    var it = self.accounts.iterator();
-    while (it.next()) |entry| {
-        const account = entry.value_ptr;
+    var sorted_slots: std.ArrayListUnmanaged(SlotPair) = .empty;
+    defer sorted_slots.deinit(self.allocator);
 
+    var it = self.scan();
+    while (it.next()) |account| {
         var addr_buf: [20]u8 = undefined;
-        std.mem.writeInt(u160, &addr_buf, entry.key_ptr.*, .big);
+        std.mem.writeInt(u160, &addr_buf, account.address, .big);
         try writer.writeAll(&addr_buf);
 
         var buf32: [32]u8 = undefined;
@@ -899,13 +1497,20 @@ pub fn writeSnapshot(self: *const State, writer: *std.Io.Writer, block: u64, rec
         try writer.writeAll(&buf4);
         try writer.writeAll(account.code);
 
-        std.mem.writeInt(u64, &buf8, account.storage.count(), .little);
+        // Counted with one pass and written with a second, rather than
+        // buffering the merged union: the largest contract here holds
+        // 11.95M slots, which would be a 768MB scratch buffer.
+        var counting = try account.slots(self.allocator, &sorted_slots);
+        var total: u64 = 0;
+        while (counting.next()) |_| total += 1;
+        std.mem.writeInt(u64, &buf8, total, .little);
         try writer.writeAll(&buf8);
-        var storage_it = account.storage.iterator();
-        while (storage_it.next()) |slot| {
-            std.mem.writeInt(u256, &buf32, slot.key_ptr.*, .little);
+
+        var writing = try account.slots(self.allocator, &sorted_slots);
+        while (writing.next()) |pair| {
+            std.mem.writeInt(u256, &buf32, pair.slot, .little);
             try writer.writeAll(&buf32);
-            std.mem.writeInt(u256, &buf32, slot.value_ptr.*, .little);
+            std.mem.writeInt(u256, &buf32, pair.value, .little);
             try writer.writeAll(&buf32);
         }
     }
@@ -921,6 +1526,219 @@ pub fn writeSnapshot(self: *const State, writer: *std.Io.Writer, block: u64, rec
 
 /// `recent_hashes` is allocator-owned (same allocator as `loadSnapshot` was
 /// given) — the caller frees it once done, same as `state`.
+/// A loaded snapshot, read in place rather than materialised.
+///
+/// Accounts are located through `index` (address to the byte offset of its
+/// record); an account's storage slots are then found by binary search
+/// inside that account's own region of the file, which is what
+/// `writeSnapshot`'s per-account slot ordering exists for.
+///
+/// The point is memory. Materialising the state costs ~105 bytes for every
+/// one of the hash map's power-of-two slots plus ~100 bytes per storage
+/// slot; indexing it costs ~41 bytes per account and leaves the data itself
+/// in file-backed pages the kernel can evict. At 74M accounts and 321M
+/// slots that is roughly 6GB against 48GB, and it stops growing with the
+/// chain the way the materialised form does.
+pub const Base = struct {
+    /// The snapshot's bytes, owned by the caller and outliving this.
+    bytes: []const u8,
+    index: std.AutoHashMapUnmanaged(Address, u64) = .empty,
+    block: u64 = 0,
+
+    /// One account, pointing into `bytes`.
+    pub const Record = struct {
+        balance: u256,
+        nonce: u64,
+        code: []const u8,
+        /// The account's slots, 64 bytes each (slot then value, both
+        /// little-endian), in ascending slot order.
+        slots: []const u8,
+
+        pub fn slotCount(self: Record) usize {
+            return self.slots.len / 64;
+        }
+
+        /// `slot`'s value, or 0 if this account has no entry for it.
+        /// Binary search, so the 11.95M-slot contract on this chain costs
+        /// 24 probes rather than a scan.
+        pub fn storage(self: Record, slot: u256) u256 {
+            var low: usize = 0;
+            var high: usize = self.slotCount();
+            while (low < high) {
+                const mid = low + (high - low) / 2;
+                const entry = self.slots[mid * 64 ..];
+                const key = std.mem.readInt(u256, entry[0..32], .little);
+                if (key == slot) return std.mem.readInt(u256, entry[32..64], .little);
+                if (key < slot) low = mid + 1 else high = mid;
+            }
+            return 0;
+        }
+    };
+
+    /// Indexes `bytes` in a single pass, the same pass `loadSnapshot` makes
+    /// to materialise it, so this is no more expensive to produce.
+    pub fn init(allocator: std.mem.Allocator, bytes: []const u8) !Base {
+        var self: Base = .{ .bytes = bytes };
+        errdefer self.index.deinit(allocator);
+
+        var pos: usize = 0;
+        self.block = std.mem.readInt(u64, bytes[pos..][0..8], .little);
+        pos += 8;
+        const total = std.mem.readInt(u64, bytes[pos..][0..8], .little);
+        pos += 8;
+        try self.index.ensureTotalCapacity(allocator, @intCast(total));
+
+        var i: u64 = 0;
+        while (i < total) : (i += 1) {
+            const start = pos;
+            const address = std.mem.readInt(u160, bytes[pos..][0..20], .big);
+            pos += 20 + 32 + 8;
+            const code_len = std.mem.readInt(u32, bytes[pos..][0..4], .little);
+            pos += 4 + code_len;
+            const slot_count = std.mem.readInt(u64, bytes[pos..][0..8], .little);
+            pos += 8 + slot_count * 64;
+            self.index.putAssumeCapacityNoClobber(address, start);
+        }
+        return self;
+    }
+
+    pub fn deinit(self: *Base, allocator: std.mem.Allocator) void {
+        self.index.deinit(allocator);
+    }
+
+    pub fn count(self: *const Base) usize {
+        return self.index.count();
+    }
+
+    pub fn contains(self: *const Base, address: Address) bool {
+        return self.index.contains(address);
+    }
+
+    /// `address`'s record, or null if the snapshot has no such account.
+    pub fn get(self: *const Base, address: Address) ?Record {
+        const offset = self.index.get(address) orelse return null;
+        return self.at(offset);
+    }
+
+    /// Walks the file front to back, which is both how it was written and
+    /// the cheapest order to read it: sequential pages, and the address
+    /// comes out of the record rather than needing the index.
+    pub const Walk = struct {
+        base: *const Base,
+        pos: usize = 16, // past block and count
+        left: u64,
+
+        pub fn next(self: *Walk) ?struct { address: Address, record: Record } {
+            if (self.left == 0) return null;
+            self.left -= 1;
+            const start = self.pos;
+            const address = std.mem.readInt(u160, self.base.bytes[start..][0..20], .big);
+            const record = self.base.at(start);
+            self.pos = start + 20 + 32 + 8 + 4 + record.code.len + 8 + record.slots.len;
+            return .{ .address = address, .record = record };
+        }
+    };
+
+    pub fn walk(self: *const Base) Walk {
+        return .{ .base = self, .left = @intCast(self.index.count()) };
+    }
+
+    /// The record starting at `offset`. Used both by `get` and by the
+    /// sequential walks that produce a state root or a new snapshot.
+    pub fn at(self: *const Base, offset: u64) Record {
+        var pos: usize = @intCast(offset);
+        pos += 20; // address, already known by whoever has the offset
+        const balance = std.mem.readInt(u256, self.bytes[pos..][0..32], .little);
+        pos += 32;
+        const nonce = std.mem.readInt(u64, self.bytes[pos..][0..8], .little);
+        pos += 8;
+        const code_len = std.mem.readInt(u32, self.bytes[pos..][0..4], .little);
+        pos += 4;
+        const code = self.bytes[pos..][0..code_len];
+        pos += code_len;
+        const slot_count = std.mem.readInt(u64, self.bytes[pos..][0..8], .little);
+        pos += 8;
+        return .{
+            .balance = balance,
+            .nonce = nonce,
+            .code = code,
+            .slots = self.bytes[pos..][0 .. slot_count * 64],
+        };
+    }
+};
+
+test "a Base finds every account the snapshot it indexed contains" {
+    var state = State.init(std.testing.allocator);
+    defer state.deinit();
+    try state.setBalance(0xaa, 100);
+    try state.setNonce(0xaa, 7);
+    try state.setCode(0xaa, &.{ 0x60, 0x01 });
+    try state.setBalance(0xbb, 0);
+    try state.setNonce(0xcc, 3);
+
+    var out = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer out.deinit();
+    try state.writeSnapshot(&out.writer, 4242, &.{});
+
+    var base = try Base.init(std.testing.allocator, out.writer.buffered());
+    defer base.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u64, 4242), base.block);
+    try std.testing.expectEqual(@as(usize, 3), base.count());
+    try std.testing.expect(base.contains(0xaa));
+    try std.testing.expect(!base.contains(0xdd));
+    try std.testing.expectEqual(@as(?Base.Record, null), base.get(0xdd));
+
+    const a = base.get(0xaa).?;
+    try std.testing.expectEqual(@as(u256, 100), a.balance);
+    try std.testing.expectEqual(@as(u64, 7), a.nonce);
+    try std.testing.expectEqualSlices(u8, &.{ 0x60, 0x01 }, a.code);
+
+    const c = base.get(0xcc).?;
+    try std.testing.expectEqual(@as(u64, 3), c.nonce);
+    try std.testing.expectEqual(@as(usize, 0), c.code.len);
+}
+
+test "a Base binary-searches an account's storage slots" {
+    var state = State.init(std.testing.allocator);
+    defer state.deinit();
+    // Deliberately inserted out of order and spread wide, so a search that
+    // assumed ordering wrongly, or scanned, would show up.
+    const slots = [_]u256{ 500, 3, std.math.maxInt(u256), 77, 0, 1 << 200, 42 };
+    for (slots, 0..) |slot, i| try state.setStorage(0xaa, slot, @as(u256, i) + 1);
+
+    var out = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer out.deinit();
+    try state.writeSnapshot(&out.writer, 1, &.{});
+
+    var base = try Base.init(std.testing.allocator, out.writer.buffered());
+    defer base.deinit(std.testing.allocator);
+
+    const record = base.get(0xaa).?;
+    try std.testing.expectEqual(@as(usize, slots.len), record.slotCount());
+    for (slots, 0..) |slot, i| {
+        try std.testing.expectEqual(@as(u256, @as(u256, i) + 1), record.storage(slot));
+    }
+    // Absent slots read as zero, including ones bracketed by present ones.
+    try std.testing.expectEqual(@as(u256, 0), record.storage(4));
+    try std.testing.expectEqual(@as(u256, 0), record.storage(499));
+    try std.testing.expectEqual(@as(u256, 0), record.storage(std.math.maxInt(u256) - 1));
+}
+
+test "a Base over an empty snapshot holds nothing" {
+    var state = State.init(std.testing.allocator);
+    defer state.deinit();
+    var out = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer out.deinit();
+    try state.writeSnapshot(&out.writer, 9, &.{});
+
+    var base = try Base.init(std.testing.allocator, out.writer.buffered());
+    defer base.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), base.count());
+    try std.testing.expectEqual(@as(u64, 9), base.block);
+    try std.testing.expect(!base.contains(0xaa));
+}
+
 pub const Snapshot = struct { state: State, block: u64, recent_hashes: []Hash };
 
 /// The inverse of `writeSnapshot`. Builds a fresh `State` from scratch (the
@@ -935,47 +1753,20 @@ pub fn loadSnapshot(allocator: std.mem.Allocator, bytes: []const u8) !Snapshot {
     state.snapshot_bytes = bytes;
     errdefer state.deinit();
 
-    var pos: usize = 0;
-    const block = std.mem.readInt(u64, bytes[pos..][0..8], .little);
-    pos += 8;
-    const account_count = std.mem.readInt(u64, bytes[pos..][0..8], .little);
-    pos += 8;
+    // Indexed, not materialised. The accounts stay in `bytes` and are read
+    // through `base`; the overlay starts empty and fills with whatever this
+    // chunk actually touches. At 74M accounts and 321M storage slots that is
+    // the difference between ~6GB of anonymous memory and ~48GB, and unlike
+    // the materialised form it does not grow with the chain.
+    state.base = try Base.init(allocator, bytes);
+    const block = state.base.?.block;
 
-    try state.accounts.ensureTotalCapacity(allocator, @intCast(account_count));
-
-    var i: u64 = 0;
-    while (i < account_count) : (i += 1) {
-        const address: Address = std.mem.readInt(u160, bytes[pos..][0..20], .big);
-        pos += 20;
-        const balance = std.mem.readInt(u256, bytes[pos..][0..32], .little);
-        pos += 32;
-        const nonce = std.mem.readInt(u64, bytes[pos..][0..8], .little);
-        pos += 8;
-        const code_len = std.mem.readInt(u32, bytes[pos..][0..4], .little);
-        pos += 4;
-        const code_bytes = bytes[pos..][0..code_len];
-        pos += code_len;
-
-        var account: Account = .{ .balance = balance, .nonce = nonce };
-        if (code_bytes.len != 0) {
-            // Borrowed from `bytes`, not copied (see `snapshot_bytes`).
-            account.code = code_bytes;
-        }
-
-        const storage_count = std.mem.readInt(u64, bytes[pos..][0..8], .little);
-        pos += 8;
-        try account.storage.ensureTotalCapacity(allocator, @intCast(storage_count));
-        var s: u64 = 0;
-        while (s < storage_count) : (s += 1) {
-            const slot = std.mem.readInt(u256, bytes[pos..][0..32], .little);
-            pos += 32;
-            const value = std.mem.readInt(u256, bytes[pos..][0..32], .little);
-            pos += 32;
-            account.storage.putAssumeCapacityNoClobber(slot, value);
-        }
-
-        try state.accounts.putNoClobber(allocator, address, account);
-    }
+    // The recent block hashes trail the accounts, so their offset is wherever
+    // the last account's record ends.
+    var pos: usize = 16;
+    var walk = state.base.?.walk();
+    while (walk.next()) |_| {}
+    pos = walk.pos;
 
     const hash_count = std.mem.readInt(u64, bytes[pos..][0..8], .little);
     pos += 8;
@@ -1262,4 +2053,25 @@ test "revertTo restores a slot's prior value, not just zero" {
     state.revertTo(cp);
 
     try std.testing.expectEqual(@as(u256, 100), state.getStorage(0x1, 1));
+}
+
+test "a reverted frame's warm accesses go cold again, earlier ones stay warm" {
+    var state = State.init(std.testing.allocator);
+    defer state.deinit();
+
+    try std.testing.expect(!try state.warmAddress(0xaa));
+    const cp = state.checkpoint();
+    try std.testing.expect(!try state.warmAddress(0xbb));
+    try std.testing.expect(!try state.warmSlot(0xaa, 7));
+    // Already warm: no new journal entry, so nothing for the revert to undo.
+    try std.testing.expect(try state.warmAddress(0xaa));
+    state.revertTo(cp);
+
+    try std.testing.expect(try state.warmAddress(0xaa));
+    try std.testing.expect(!try state.warmAddress(0xbb));
+    try std.testing.expect(!try state.warmSlot(0xaa, 7));
+
+    // And a new transaction starts with everything cold.
+    state.finalizeTransaction();
+    try std.testing.expect(!try state.warmAddress(0xaa));
 }

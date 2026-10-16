@@ -85,7 +85,11 @@ gas_remaining: u64,
 /// Accumulated gas refund (Frontier's flat `SSTORE`-clears-a-slot rule, see
 /// `sstore`). Not capped here, since the cap only makes sense relative to a
 /// transaction's total gas used, which this frame alone doesn't know.
-refund: u64 = 0,
+/// Signed, because EIP-2200 can take a refund back: a nested frame that
+/// writes a slot its caller had cleared subtracts the clear refund, and that
+/// frame's own counter starts at zero, so it legitimately goes negative
+/// before being folded into the caller's.
+refund: i64 = 0,
 status: Status = .running,
 jumpdest: std.DynamicBitSetUnmanaged,
 
@@ -429,13 +433,19 @@ fn step(self: *Interpreter) !void {
             self.pc += 1;
         },
         .BALANCE => {
-            if (!self.chargeGas(if (self.block.fork.atLeast(.tangerine_whistle)) gas.balance_150 else gas.balance)) return;
             const address256 = self.popStack() orelse return;
             const state = self.state orelse {
                 self.status = .invalid_opcode;
                 return;
             };
-            self.pushStack(state.getBalance(@truncate(address256)));
+            const address: Address = @truncate(address256);
+            if (!self.chargeGas(try self.accountAccessCost(state, address, if (self.block.fork.atLeast(.istanbul))
+                gas.balance_1884
+            else if (self.block.fork.atLeast(.tangerine_whistle))
+                gas.balance_150
+            else
+                gas.balance))) return;
+            self.pushStack(state.getBalance(address));
             self.pc += 1;
         },
         .ORIGIN => {
@@ -472,13 +482,14 @@ fn step(self: *Interpreter) !void {
             self.pc += 1;
         },
         .EXTCODESIZE => {
-            if (!self.chargeGas(if (self.block.fork.atLeast(.tangerine_whistle)) gas.extcode_150 else gas.extcode)) return;
             const address256 = self.popStack() orelse return;
             const state = self.state orelse {
                 self.status = .invalid_opcode;
                 return;
             };
-            self.pushStack(@as(u256, state.getCode(@truncate(address256)).len));
+            const address: Address = @truncate(address256);
+            if (!self.chargeGas(try self.accountAccessCost(state, address, if (self.block.fork.atLeast(.tangerine_whistle)) gas.extcode_150 else gas.extcode))) return;
+            self.pushStack(@as(u256, state.getCode(address).len));
             self.pc += 1;
         },
         .EXTCODECOPY => try self.extcodecopy(),
@@ -509,13 +520,13 @@ fn step(self: *Interpreter) !void {
             // 400 per EIP-1052, not `gas.extcode`: that is Frontier's 20 for
             // EXTCODESIZE, and charging it here undercharged every
             // EXTCODEHASH by 380 gas. Found at mainnet block 7,398,462.
-            if (!self.chargeGas(gas.extcodehash)) return;
             const address256 = self.popStack() orelse return;
             const state = self.state orelse {
                 self.status = .invalid_opcode;
                 return;
             };
             const address: Address = @truncate(address256);
+            if (!self.chargeGas(try self.accountAccessCost(state, address, if (self.block.fork.atLeast(.istanbul)) gas.extcodehash_1884 else gas.extcodehash))) return;
             // EIP-1052 returns 0 for an account that "does not exist or is
             // empty (as defined by EIP-161)" — so `isAlive`, not `exists`.
             // An existing-but-empty account (zero nonce, zero balance, no
@@ -654,6 +665,14 @@ fn step(self: *Interpreter) !void {
 }
 
 // --- gas / stack helpers ---
+
+/// What touching `address` costs from Berlin on (EIP-2929): warm or cold,
+/// warming it either way. Before Berlin there was no access tracking, and
+/// the opcode's own flat `pre_berlin` price applies instead.
+fn accountAccessCost(self: *Interpreter, state: *State, address: Address, pre_berlin: u64) !u64 {
+    if (!self.block.fork.atLeast(.berlin)) return pre_berlin;
+    return if (try state.warmAddress(address)) gas.warm_storage_read_2929 else gas.cold_account_access_2929;
+}
 
 fn chargeGas(self: *Interpreter, amount: u64) bool {
     if (self.gas_remaining < amount) {
@@ -911,7 +930,6 @@ fn codecopy(self: *Interpreter) !void {
 }
 
 fn extcodecopy(self: *Interpreter) !void {
-    if (!self.chargeGas(if (self.block.fork.atLeast(.tangerine_whistle)) gas.extcode_150 else gas.extcode)) return;
     const address256 = self.popStack() orelse return;
     const dest256 = self.popStack() orelse return;
     const offset256 = self.popStack() orelse return;
@@ -920,7 +938,9 @@ fn extcodecopy(self: *Interpreter) !void {
         self.status = .invalid_opcode;
         return;
     };
-    try self.copyToMemory(state.getCode(@truncate(address256)), dest256, offset256, size256);
+    const address: Address = @truncate(address256);
+    if (!self.chargeGas(try self.accountAccessCost(state, address, if (self.block.fork.atLeast(.tangerine_whistle)) gas.extcode_150 else gas.extcode))) return;
+    try self.copyToMemory(state.getCode(address), dest256, offset256, size256);
 }
 
 /// Unlike `CALLDATACOPY`/`CODECOPY`, `RETURNDATACOPY` doesn't zero-pad past
@@ -966,12 +986,20 @@ fn haltWithOutput(self: *Interpreter, status: Status) !void {
 // re-set" bookkeeping, just a flat refund every time a slot clears.
 
 fn sload(self: *Interpreter) !void {
-    if (!self.chargeGas(if (self.block.fork.atLeast(.tangerine_whistle)) gas.sload_150 else gas.sload)) return;
     const slot = self.popStack() orelse return;
     const state = self.state orelse {
         self.status = .invalid_opcode;
         return;
     };
+    const cost = if (self.block.fork.atLeast(.berlin))
+        if (try state.warmSlot(self.address, slot)) gas.warm_storage_read_2929 else gas.cold_sload_2929
+    else if (self.block.fork.atLeast(.istanbul))
+        gas.sload_1884
+    else if (self.block.fork.atLeast(.tangerine_whistle))
+        gas.sload_150
+    else
+        gas.sload;
+    if (!self.chargeGas(cost)) return;
     self.pushStack(state.getStorage(self.address, slot));
     self.pc += 1;
 }
@@ -987,11 +1015,75 @@ fn sstore(self: *Interpreter) !void {
         self.status = .invalid_opcode;
         return;
     };
-    const old = state.getStorage(self.address, slot);
-    if (!self.chargeGas(if (old == 0 and value != 0) gas.sstore_set else gas.sstore_reset)) return;
-    if (old != 0 and value == 0) {
-        self.refund += gas.sstore_clear_refund;
+    const current = state.getStorage(self.address, slot);
+
+    if (self.block.fork.atLeast(.istanbul)) {
+        // EIP-2200's sentry: an SSTORE needs strictly more than the 2300-gas
+        // stipend in hand before it may begin. Checked before any charge,
+        // and an exceptional halt rather than a graceful stop.
+        if (self.gas_remaining <= gas.sstore_sentry_2200) {
+            self.status = .out_of_gas;
+            self.gas_remaining = 0;
+            return;
+        }
+
+        // EIP-2929 (Berlin) keeps EIP-2200's structure and reprices it: a
+        // cold slot pays the cold surcharge once, up front; "looking" costs
+        // a warm read; and a real reset is cheaper by exactly the cold
+        // surcharge, since that lookup has already been paid for. The
+        // restore refunds below are written as differences between these,
+        // which is what makes them land on the EIP's 19,900 and 2,800.
+        const berlin = self.block.fork.atLeast(.berlin);
+        if (berlin and !try state.warmSlot(self.address, slot)) {
+            if (!self.chargeGas(gas.cold_sload_2929)) return;
+        }
+        const original = state.originalStorage(self.address, slot);
+        const sload_cost = if (berlin) gas.warm_storage_read_2929 else gas.sload_1884;
+        const reset_cost = if (berlin) gas.sstore_reset - gas.cold_sload_2929 else gas.sstore_reset;
+
+        if (current == value) {
+            // A write that changes nothing pays only for having looked.
+            if (!self.chargeGas(sload_cost)) return;
+        } else if (original == current) {
+            // First change to this slot in this transaction, so the slot is
+            // genuinely moving and is priced as a real write.
+            if (original == 0) {
+                if (!self.chargeGas(gas.sstore_set)) return;
+            } else {
+                if (!self.chargeGas(reset_cost)) return;
+                if (value == 0) self.refund += @intCast(gas.sstore_clear_refund);
+            }
+        } else {
+            // The slot has already been changed in this transaction, so the
+            // expensive part is paid for; this write costs a lookup, and the
+            // refund bookkeeping is corrected for where the slot ends up.
+            if (!self.chargeGas(sload_cost)) return;
+            if (original != 0) {
+                // A refund granted when the slot was cleared is taken back
+                // if it is being filled again, and granted if it is being
+                // cleared now. This is the subtraction that lets a nested
+                // frame's counter go negative.
+                if (current == 0) self.refund -= @intCast(gas.sstore_clear_refund);
+                if (value == 0) self.refund += @intCast(gas.sstore_clear_refund);
+            }
+            if (original == value) {
+                // Put back exactly as it was found, so the difference between
+                // what a real write would have cost and what was actually
+                // charged along the way is returned.
+                if (original == 0) {
+                    self.refund += @intCast(gas.sstore_set - sload_cost);
+                } else {
+                    self.refund += @intCast(reset_cost - sload_cost);
+                }
+            }
+        }
+    } else {
+        if (!self.chargeGas(if (current == 0 and value != 0) gas.sstore_set else gas.sstore_reset)) return;
+        if (current != 0 and value == 0) {
+            self.refund += @intCast(gas.sstore_clear_refund);
+        }
     }
+
     try state.setStorage(self.address, slot, value);
     self.pc += 1;
 }
@@ -1006,7 +1098,7 @@ const CallKind = enum { call, callcode, staticcall, delegatecall };
 const CallOutcome = struct {
     status: Status,
     gas_remaining: u64,
-    refund: u64 = 0,
+    refund: i64 = 0,
     /// Always allocator-owned (a fresh copy either way), freed once by the
     /// caller; this outcome has no `deinit` of its own to rely on.
     return_data: []const u8,
@@ -1055,7 +1147,10 @@ fn call(self: *Interpreter, kind: CallKind) !void {
 
     const is_tangerine_whistle = self.block.fork.atLeast(.tangerine_whistle);
     const is_spurious_dragon = self.block.fork.atLeast(.spurious_dragon);
-    var cost: u64 = if (is_tangerine_whistle) gas.call_base_150 else gas.call_base;
+    // From Berlin (EIP-2929) the base cost is the access price of the code
+    // address, whichever variant this is: DELEGATECALL and CALLCODE still
+    // have to load `target`'s code even though they run as this frame.
+    var cost: u64 = try self.accountAccessCost(state, target, if (is_tangerine_whistle) gas.call_base_150 else gas.call_base);
     if (value != 0) cost += gas.call_value;
     // Pre-Spurious-Dragon, the new-account surcharge and the value-transfer
     // surcharge are independent (execution-specs' `calculate_message_call_gas`):
@@ -1329,6 +1424,10 @@ fn createOp(self: *Interpreter, kind: CreateKind) !void {
         .create => try createAddress(self.allocator, self.address, state.get(self.address).nonce),
         .create2 => create2Address(self.address, salt, init_code),
     };
+    // EIP-2929 (Berlin): the new address is warm from here on, whether or
+    // not the creation goes ahead. Warmed in this frame, before the child's
+    // checkpoint below, so a failed creation does not cool it again.
+    if (self.block.fork.atLeast(.berlin)) _ = try state.warmAddress(new_address);
 
     // Order matters here, and it isn't the obvious one (see
     // execution-specs' `create`): the endowment and depth checks come
@@ -1523,6 +1622,12 @@ fn selfdestruct(self: *Interpreter) !void {
     const is_tangerine_whistle = self.block.fork.atLeast(.tangerine_whistle);
     const is_spurious_dragon = self.block.fork.atLeast(.spurious_dragon);
     var cost: u64 = if (is_tangerine_whistle) gas.selfdestruct_base_150 else gas.selfdestruct_base;
+    // EIP-2929 (Berlin): a cold beneficiary adds the cold surcharge. Unlike
+    // the other account-touching opcodes there is no warm price to replace,
+    // just this addition to the 5000 base.
+    if (self.block.fork.atLeast(.berlin) and !try state.warmAddress(beneficiary)) {
+        cost += gas.cold_account_access_2929;
+    }
     // From Spurious Dragon on (EIP-161), the new-account surcharge swaps
     // `exists` for `isAlive` (an existing-but-empty beneficiary still
     // counts as "not really there"), and only applies if there's actually
@@ -1565,7 +1670,7 @@ fn selfdestruct(self: *Interpreter) !void {
     // every repeat.
     const already_marked = state.isPendingDestruction(self.address);
     try state.destroyAccount(self.address);
-    if (!already_marked) self.refund += gas.selfdestruct_refund;
+    if (!already_marked) self.refund += @intCast(gas.selfdestruct_refund);
     self.status = .stopped;
 }
 
@@ -3434,7 +3539,7 @@ test "SSTORE clearing a nonzero slot to zero accumulates a refund" {
     try interp.run();
 
     try std.testing.expectEqual(Status.stopped, interp.status);
-    try std.testing.expectEqual(gas.sstore_clear_refund, interp.refund);
+    try std.testing.expectEqual(@as(i64, gas.sstore_clear_refund), interp.refund);
 }
 
 test "SSTORE writing a nonzero value accumulates no refund" {
@@ -3454,7 +3559,7 @@ test "SSTORE writing a nonzero value accumulates no refund" {
     defer interp.deinit();
     try interp.run();
 
-    try std.testing.expectEqual(@as(u64, 0), interp.refund);
+    try std.testing.expectEqual(@as(i64, 0), interp.refund);
 }
 
 test "SSTORE clearing an already-zero slot accumulates no refund" {
@@ -3474,7 +3579,7 @@ test "SSTORE clearing an already-zero slot accumulates no refund" {
     defer interp.deinit();
     try interp.run();
 
-    try std.testing.expectEqual(@as(u64, 0), interp.refund);
+    try std.testing.expectEqual(@as(i64, 0), interp.refund);
 }
 
 test "a nested CALL's refund propagates to the caller on success" {
@@ -3510,7 +3615,7 @@ test "a nested CALL's refund propagates to the caller on success" {
     try interp.run();
 
     try std.testing.expectEqual(Status.stopped, interp.status);
-    try std.testing.expectEqual(gas.sstore_clear_refund, interp.refund);
+    try std.testing.expectEqual(@as(i64, gas.sstore_clear_refund), interp.refund);
 }
 
 test "a reverted nested CALL's refund is dropped, not propagated" {
@@ -3548,7 +3653,7 @@ test "a reverted nested CALL's refund is dropped, not propagated" {
     try interp.run();
 
     try std.testing.expectEqual(Status.stopped, interp.status);
-    try std.testing.expectEqual(@as(u64, 0), interp.refund);
+    try std.testing.expectEqual(@as(i64, 0), interp.refund);
     try std.testing.expectEqual(@as(u256, 99), state.getStorage(0xdd, 1)); // reverted, unchanged
 }
 
@@ -3936,6 +4041,196 @@ test "EXTCODEHASH of a codeless account holding a balance is the hash of empty c
 
     try std.testing.expectEqual(Status.stopped, interp.status);
     try std.testing.expectEqual(keccak256(""), try interp.stack.pop());
+}
+
+/// Runs `writes` as consecutive SSTOREs to one slot under `fork`, starting
+/// from `initial`, and reports what the whole sequence cost and refunded.
+fn runSstoreSequence(fork: Fork, initial: u256, writes: []const u256) !struct { spent: u64, refund: i64 } {
+    var code: std.ArrayList(u8) = .empty;
+    defer code.deinit(std.testing.allocator);
+    for (writes) |value| {
+        // PUSH32 value, PUSH1 slot, SSTORE
+        try code.append(std.testing.allocator, @intFromEnum(OpCode.PUSH32));
+        var word: [32]u8 = undefined;
+        std.mem.writeInt(u256, &word, value, .big);
+        try code.appendSlice(std.testing.allocator, &word);
+        try code.appendSlice(std.testing.allocator, &.{ @intFromEnum(OpCode.PUSH1), 0x01, @intFromEnum(OpCode.SSTORE) });
+    }
+    try code.append(std.testing.allocator, @intFromEnum(OpCode.STOP));
+
+    var state = State.init(std.testing.allocator);
+    defer state.deinit();
+    if (initial != 0) try state.setStorage(0xaa, 1, initial);
+    // The slot's value now counts as its transaction-start value.
+    state.finalizeTransaction();
+
+    const limit: u64 = 1_000_000;
+    var interp = try Interpreter.initCall(std.testing.allocator, code.items, limit, .{
+        .address = 0xaa,
+        .state = &state,
+        .block = .{ .fork = fork },
+    });
+    defer interp.deinit();
+    try interp.run();
+    try std.testing.expectEqual(Status.stopped, interp.status);
+
+    // Each write costs a PUSH32 and a PUSH1 beyond the SSTORE itself.
+    const pushes = 6 * writes.len;
+    return .{ .spent = limit - interp.gas_remaining - @as(u64, @intCast(pushes)), .refund = interp.refund };
+}
+
+test "EIP-2200 prices a first write by what the slot was, not what it becomes" {
+    // Zero to nonzero is a real new entry in the trie: full price.
+    var r = try runSstoreSequence(.istanbul, 0, &.{7});
+    try std.testing.expectEqual(@as(u64, gas.sstore_set), r.spent);
+    try std.testing.expectEqual(@as(i64, 0), r.refund);
+
+    // Nonzero to nonzero only rewrites an entry already there.
+    r = try runSstoreSequence(.istanbul, 5, &.{7});
+    try std.testing.expectEqual(@as(u64, gas.sstore_reset), r.spent);
+    try std.testing.expectEqual(@as(i64, 0), r.refund);
+
+    // Nonzero to zero removes it, and earns the clear refund.
+    r = try runSstoreSequence(.istanbul, 5, &.{0});
+    try std.testing.expectEqual(@as(u64, gas.sstore_reset), r.spent);
+    try std.testing.expectEqual(@as(i64, gas.sstore_clear_refund), r.refund);
+}
+
+test "EIP-2200 charges a no-op write the price of a lookup" {
+    // This is the heart of net metering: writing a slot the value it already
+    // holds is not a state change and must not be charged as one.
+    const r = try runSstoreSequence(.istanbul, 7, &.{7});
+    try std.testing.expectEqual(@as(u64, gas.sload_1884), r.spent);
+    try std.testing.expectEqual(@as(i64, 0), r.refund);
+}
+
+test "EIP-2200 charges only a lookup for repeated writes to an already-dirty slot" {
+    // The first write pays the real price; the second has nothing left to
+    // pay for, because the slot is already dirty in this transaction.
+    const r = try runSstoreSequence(.istanbul, 0, &.{ 1, 2 });
+    try std.testing.expectEqual(@as(u64, gas.sstore_set + gas.sload_1884), r.spent);
+    try std.testing.expectEqual(@as(i64, 0), r.refund);
+}
+
+test "EIP-2200 refunds the difference when a slot is put back as it was found" {
+    // Changed and then restored: the transaction leaves no trace, so the
+    // difference between what a real write cost and what the lookups cost
+    // comes back.
+    var r = try runSstoreSequence(.istanbul, 0, &.{ 1, 0 });
+    try std.testing.expectEqual(@as(u64, gas.sstore_set + gas.sload_1884), r.spent);
+    try std.testing.expectEqual(@as(i64, gas.sstore_set - gas.sload_1884), r.refund);
+
+    r = try runSstoreSequence(.istanbul, 5, &.{ 9, 5 });
+    try std.testing.expectEqual(@as(u64, gas.sstore_reset + gas.sload_1884), r.spent);
+    try std.testing.expectEqual(@as(i64, gas.sstore_reset - gas.sload_1884), r.refund);
+}
+
+test "EIP-2200 takes the clear refund back when a cleared slot is filled again" {
+    // Clearing earns 15000; filling it again in the same transaction must
+    // give that back, or a contract could farm refunds by thrashing a slot.
+    const r = try runSstoreSequence(.istanbul, 5, &.{ 0, 9 });
+    try std.testing.expectEqual(@as(u64, gas.sstore_reset + gas.sload_1884), r.spent);
+    try std.testing.expectEqual(@as(i64, 0), r.refund);
+}
+
+test "EIP-2200's sentry stops an SSTORE that has only the call stipend" {
+    // The guard EIP-1283 lacked. With 2300 gas or less in hand an SSTORE is
+    // an exceptional halt, which is what lets a contract keep treating the
+    // stipend as unable to change state.
+    const code = [_]u8{
+        @intFromEnum(OpCode.PUSH1), 0x07,
+        @intFromEnum(OpCode.PUSH1), 0x01,
+        @intFromEnum(OpCode.SSTORE),
+        @intFromEnum(OpCode.STOP),
+    };
+    var state = State.init(std.testing.allocator);
+    defer state.deinit();
+
+    // Exactly the stipend, plus the two pushes, so the SSTORE begins with
+    // precisely 2300 and must refuse.
+    var interp = try Interpreter.initCall(std.testing.allocator, &code, gas.sstore_sentry_2200 + 6, .{
+        .address = 0xaa,
+        .state = &state,
+        .block = .{ .fork = .istanbul },
+    });
+    defer interp.deinit();
+    try interp.run();
+    try std.testing.expectEqual(Status.out_of_gas, interp.status);
+    try std.testing.expectEqual(@as(u256, 0), state.getStorage(0xaa, 1));
+
+    // One more gas and it goes through.
+    var ok = try Interpreter.initCall(std.testing.allocator, &code, 1_000_000, .{
+        .address = 0xaa,
+        .state = &state,
+        .block = .{ .fork = .istanbul },
+    });
+    defer ok.deinit();
+    try ok.run();
+    try std.testing.expectEqual(Status.stopped, ok.status);
+    try std.testing.expectEqual(@as(u256, 7), state.getStorage(0xaa, 1));
+}
+
+test "SSTORE keeps the flat pre-Istanbul pricing before the fork" {
+    // Petersburg withdrew EIP-1283, so nothing between Byzantium and
+    // Istanbul uses net metering: a no-op write still costs a full reset.
+    const code = [_]u8{
+        @intFromEnum(OpCode.PUSH1), 0x07,
+        @intFromEnum(OpCode.PUSH1), 0x01,
+        @intFromEnum(OpCode.SSTORE),
+        @intFromEnum(OpCode.STOP),
+    };
+    var state = State.init(std.testing.allocator);
+    defer state.deinit();
+    try state.setStorage(0xaa, 1, 7);
+    state.finalizeTransaction();
+
+    const limit: u64 = 1_000_000;
+    var interp = try Interpreter.initCall(std.testing.allocator, &code, limit, .{
+        .address = 0xaa,
+        .state = &state,
+        .block = .{ .fork = .petersburg },
+    });
+    defer interp.deinit();
+    try interp.run();
+    try std.testing.expectEqual(Status.stopped, interp.status);
+    try std.testing.expectEqual(@as(u64, gas.sstore_reset + 6), limit - interp.gas_remaining);
+}
+
+test "EIP-1884 reprices SLOAD, BALANCE and EXTCODEHASH at Istanbul" {
+    // All three read state whose size had grown well past what their
+    // Byzantium-era prices assumed, which is the whole premise of EIP-1884.
+    const cases = [_]struct { op: OpCode, before: u64, after: u64 }{
+        .{ .op = .SLOAD, .before = 200, .after = 800 },
+        .{ .op = .BALANCE, .before = 400, .after = 700 },
+        .{ .op = .EXTCODEHASH, .before = 400, .after = 700 },
+    };
+    for (cases) |case| {
+        const code = [_]u8{
+            @intFromEnum(OpCode.PUSH1), 0x01,
+            @intFromEnum(case.op),
+            @intFromEnum(OpCode.STOP),
+        };
+        for ([_]struct { fork: Fork, cost: u64 }{
+            .{ .fork = .petersburg, .cost = case.before },
+            .{ .fork = .istanbul, .cost = case.after },
+        }) |variant| {
+            var state = State.init(std.testing.allocator);
+            defer state.deinit();
+            try state.setBalance(0x01, 1);
+
+            var interp = try Interpreter.initCall(std.testing.allocator, &code, 1_000_000, .{
+                .address = 0xaa,
+                .state = &state,
+                .block = .{ .fork = variant.fork },
+            });
+            defer interp.deinit();
+            try interp.run();
+
+            try std.testing.expectEqual(Status.stopped, interp.status);
+            // PUSH1 is 3; the rest is the opcode under test.
+            try std.testing.expectEqual(@as(u64, 1_000_000 - 3 - variant.cost), interp.gas_remaining);
+        }
+    }
 }
 
 test "EXTCODEHASH costs 400 gas, its own EIP-1052 price" {
@@ -4374,7 +4669,7 @@ test "SELFDESTRUCT transfers balance to the beneficiary immediately, but its cod
     try std.testing.expectEqual(Status.stopped, interp.status);
     try std.testing.expectEqual(@as(u256, 0), state.getBalance(0xaa));
     try std.testing.expectEqual(@as(u256, 510), state.getBalance(0xbb));
-    try std.testing.expectEqual(gas.selfdestruct_refund, interp.refund);
+    try std.testing.expectEqual(@as(i64, gas.selfdestruct_refund), interp.refund);
 
     // Balance moves immediately, but real Ethereum only deletes the
     // account itself (code included) once the transaction fully commits —
@@ -4617,7 +4912,7 @@ test "a CALL to an address that just self-destructed, within the same transactio
     // self-destruct itself, like this real-world mainnet pattern, would
     // otherwise rack up an inflated refund, hit the per-transaction cap,
     // and badly under-report gas_used.
-    try std.testing.expectEqual(gas.selfdestruct_refund, interp.refund);
+    try std.testing.expectEqual(@as(i64, gas.selfdestruct_refund), interp.refund);
 }
 
 test "a CALL to a previously-self-destructed address pays the new-account surcharge again" {
@@ -4720,4 +5015,73 @@ test "SELFDESTRUCT inside a reverted CALL restores the destroyed account's code"
     try std.testing.expectEqual(Status.reverted, interp.status);
     try std.testing.expectEqual(@as(u256, 500), state.getBalance(0xcc));
     try std.testing.expectEqualSlices(u8, &callee_code, state.getCode(0xcc));
+}
+
+test "EIP-2929 reprices SSTORE: cold surcharge once, warm reads, cheaper resets" {
+    // The slot starts cold in every sequence below. Numbers are the EIP's,
+    // written out rather than derived from the constants they test.
+    var r = try runSstoreSequence(.berlin, 0, &.{7});
+    try std.testing.expectEqual(@as(u64, 2100 + 20000), r.spent);
+    try std.testing.expectEqual(@as(i64, 0), r.refund);
+
+    // A reset is 5000 in total once the cold lookup is counted in.
+    r = try runSstoreSequence(.berlin, 5, &.{7});
+    try std.testing.expectEqual(@as(u64, 5000), r.spent);
+
+    r = try runSstoreSequence(.berlin, 5, &.{0});
+    try std.testing.expectEqual(@as(u64, 5000), r.spent);
+    try std.testing.expectEqual(@as(i64, 15000), r.refund);
+
+    // A write that changes nothing pays the cold lookup and a warm read.
+    r = try runSstoreSequence(.berlin, 5, &.{5});
+    try std.testing.expectEqual(@as(u64, 2100 + 100), r.spent);
+
+    // Restoring the original value refunds what the round trip overpaid:
+    // 19,900 from an empty slot, 2,800 from an occupied one.
+    r = try runSstoreSequence(.berlin, 0, &.{ 7, 0 });
+    try std.testing.expectEqual(@as(u64, 2100 + 20000 + 100), r.spent);
+    try std.testing.expectEqual(@as(i64, 19900), r.refund);
+
+    r = try runSstoreSequence(.berlin, 5, &.{ 7, 5 });
+    try std.testing.expectEqual(@as(u64, 5000 + 100), r.spent);
+    try std.testing.expectEqual(@as(i64, 2800), r.refund);
+}
+
+test "EIP-2929: SLOAD and BALANCE are cold the first time and warm after" {
+    var state = State.init(std.testing.allocator);
+    defer state.deinit();
+    try state.setStorage(0xaa, 1, 42);
+    state.finalizeTransaction();
+
+    // PUSH1 1, SLOAD, POP, twice over.
+    const sload_code = [_]u8{
+        @intFromEnum(OpCode.PUSH1), 0x01, @intFromEnum(OpCode.SLOAD), @intFromEnum(OpCode.POP),
+        @intFromEnum(OpCode.PUSH1), 0x01, @intFromEnum(OpCode.SLOAD), @intFromEnum(OpCode.POP),
+        @intFromEnum(OpCode.STOP),
+    };
+    var interp = try Interpreter.initCall(std.testing.allocator, &sload_code, 100_000, .{
+        .address = 0xaa,
+        .state = &state,
+        .block = .{ .fork = .berlin },
+    });
+    defer interp.deinit();
+    try interp.run();
+    try std.testing.expectEqual(Status.stopped, interp.status);
+    try std.testing.expectEqual(@as(u64, (3 + 2100 + 2) + (3 + 100 + 2)), 100_000 - interp.gas_remaining);
+
+    // PUSH1 0xbb, BALANCE, POP, twice over.
+    const balance_code = [_]u8{
+        @intFromEnum(OpCode.PUSH1), 0xbb, @intFromEnum(OpCode.BALANCE), @intFromEnum(OpCode.POP),
+        @intFromEnum(OpCode.PUSH1), 0xbb, @intFromEnum(OpCode.BALANCE), @intFromEnum(OpCode.POP),
+        @intFromEnum(OpCode.STOP),
+    };
+    var interp2 = try Interpreter.initCall(std.testing.allocator, &balance_code, 100_000, .{
+        .address = 0xaa,
+        .state = &state,
+        .block = .{ .fork = .berlin },
+    });
+    defer interp2.deinit();
+    try interp2.run();
+    try std.testing.expectEqual(Status.stopped, interp2.status);
+    try std.testing.expectEqual(@as(u64, (3 + 2600 + 2) + (3 + 100 + 2)), 100_000 - interp2.gas_remaining);
 }

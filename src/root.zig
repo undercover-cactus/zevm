@@ -7,6 +7,7 @@ pub const State = @import("State.zig");
 pub const Rlp = @import("Rlp.zig");
 pub const Trie = @import("Trie.zig");
 pub const Transaction = @import("Transaction.zig").Transaction;
+pub const AccessListEntry = @import("Transaction.zig").AccessListEntry;
 pub const Block = @import("Block.zig").Block;
 pub const Fork = @import("Fork.zig").Fork;
 pub const Evm = @import("Evm.zig");

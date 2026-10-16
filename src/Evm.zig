@@ -1,8 +1,8 @@
 //! Executes a decoded `Transaction` against a `State`.
 //!
-//! Only Frontier through Petersburg are implemented. `processBlock` panics
-//! on any block from a later fork (see `Fork`) instead of silently
-//! applying stale rules.
+//! Frontier through Berlin are implemented (Muir Glacier changes nothing
+//! this executes). `processBlock` panics on any block from a later fork (see
+//! `Fork`) instead of silently applying stale rules.
 //!
 //! Constantinople and Petersburg share a block on mainnet (7,280,000):
 //! Constantinople's EIP-1283 SSTORE repricing was withdrawn by Petersburg
@@ -14,6 +14,7 @@ const Address = @import("Address.zig").Address;
 const State = @import("State.zig");
 const Interpreter = @import("Interpreter.zig");
 const Transaction = @import("Transaction.zig").Transaction;
+const AccessListEntry = @import("Transaction.zig").AccessListEntry;
 const Block = @import("Block.zig").Block;
 const Fork = @import("Fork.zig").Fork;
 const DaoFork = @import("DaoFork.zig");
@@ -103,6 +104,10 @@ pub fn executeTransaction(self: *Evm, tx: Transaction, from: Address) !Result {
         const tx_chain_id: u256 = (tx.v - 35) / 2;
         if (tx_chain_id != self.block.chain_id) return error.WrongChainId;
     }
+    // A typed transaction (EIP-2718) states its chain id outright.
+    if (tx.chain_id) |tx_chain_id| {
+        if (tx_chain_id != self.block.chain_id) return error.WrongChainId;
+    }
 
     // Real Ethereum reserves the full potential fee up front and refunds
     // what's unused after execution. The sender must be able to cover the
@@ -137,10 +142,25 @@ pub fn executeTransaction(self: *Evm, tx: Transaction, from: Address) !Result {
 
     self.tx = .{ .origin = from, .gas_price = tx.gas_price };
 
+    // EIP-2929/2930 (Berlin): the sender, every precompile and everything in
+    // the access list start warm. The target (or the address being created)
+    // is warmed inside `call`/`create`, which know it. None of this is ever
+    // reverted: it all precedes the checkpoint either of them takes.
+    if (self.block.fork.atLeast(.berlin)) {
+        _ = try self.state.warmAddress(from);
+        var precompile: Address = 1;
+        while (precompile <= 9) : (precompile += 1) _ = try self.state.warmAddress(precompile);
+        for (tx.access_list) |entry| {
+            _ = try self.state.warmAddress(entry.address);
+            for (entry.storage_keys) |key| _ = try self.state.warmSlot(entry.address, key);
+        }
+    }
+    const access_list_cost = gas.accessListCost(tx.access_list);
+
     const result = if (tx.to) |to|
-        try self.call(tx.value, tx.data, tx.gas_limit, from, to)
+        try self.call(tx.value, tx.data, access_list_cost, tx.gas_limit, from, to)
     else
-        try self.create(tx.nonce, tx.value, tx.data, tx.gas_limit, from);
+        try self.create(tx.nonce, tx.value, tx.data, access_list_cost, tx.gas_limit, from);
 
     // Refund unused gas, then pay the miner, via `creditBalance` (unjournaled,
     // like block rewards): a transaction's gas fee is never undone by a revert.
@@ -169,9 +189,11 @@ pub fn executeTransaction(self: *Evm, tx: Transaction, from: Address) !Result {
 pub fn processBlock(self: *Evm, block: Block) !void {
     State.debug_block_number = block.number;
     const fork = Fork.at(block.number);
-    if (fork.atLeast(.istanbul)) {
+    // Muir Glacier delayed the difficulty bomb and changed nothing this
+    // executes, so Istanbul's rules carry through it unchanged.
+    if (fork.atLeast(.london)) {
         std.debug.panic(
-            "block {d} is past Petersburg (fork: {s}): this Evm only implements up to Petersburg's rules",
+            "block {d} is past Berlin (fork: {s}): this Evm only implements up to Berlin's rules",
             .{ block.number, @tagName(fork) },
         );
     }
@@ -215,12 +237,13 @@ pub fn processBlock(self: *Evm, block: Block) !void {
     self.state.debugDumpBlockAccounts();
 }
 
-fn call(self: *Evm, value: u256, data: []const u8, gas_limit: u64, from: Address, to: Address) !Result {
+fn call(self: *Evm, value: u256, data: []const u8, access_list_cost: u64, gas_limit: u64, from: Address, to: Address) !Result {
+    if (self.block.fork.atLeast(.berlin)) _ = try self.state.warmAddress(to);
     const cp = self.state.checkpoint();
 
     // The intrinsic cost is paid before any code runs; real Ethereum
     // forfeits the whole limit if gas_limit can't cover it.
-    const intrinsic = gas.intrinsicCost(data);
+    const intrinsic = gas.intrinsicCost(data, self.block.fork) + access_list_cost;
     if (gas_limit < intrinsic) {
         self.state.revertTo(cp);
         return .{
@@ -313,18 +336,22 @@ fn call(self: *Evm, value: u256, data: []const u8, gas_limit: u64, from: Address
 /// halts (`.out_of_gas`, `.invalid_opcode`, `.invalid_jump`,
 /// `.stack_overflow`, `.stack_underflow`) forfeit the entire limit;
 /// `.reverted` is the exception that only spends what actually ran.
-fn gasUsed(status: Interpreter.Status, gas_remaining: u64, refund: u64, execution_gas_limit: u64, intrinsic: u64) u64 {
+fn gasUsed(status: Interpreter.Status, gas_remaining: u64, refund: i64, execution_gas_limit: u64, intrinsic: u64) u64 {
     switch (status) {
         .out_of_gas, .invalid_opcode, .invalid_jump, .stack_overflow, .stack_underflow => return execution_gas_limit + intrinsic,
         else => {},
     }
     const spent = intrinsic + (execution_gas_limit - gas_remaining);
     if (status != .stopped) return spent;
-    return spent - @min(refund, spent / gas.max_refund_denominator);
+    // A negative counter means more refund was taken back than granted,
+    // which refunds nothing rather than charging extra.
+    if (refund <= 0) return spent;
+    return spent - @min(@as(u64, @intCast(refund)), spent / gas.max_refund_denominator);
 }
 
-fn create(self: *Evm, nonce: u64, value: u256, data: []const u8, gas_limit: u64, from: Address) !Result {
+fn create(self: *Evm, nonce: u64, value: u256, data: []const u8, access_list_cost: u64, gas_limit: u64, from: Address) !Result {
     const new_address = try Interpreter.createAddress(self.allocator, from, nonce);
+    if (self.block.fork.atLeast(.berlin)) _ = try self.state.warmAddress(new_address);
 
     // EIP-684, the transaction-level half of the rule `Interpreter.createOp`
     // enforces for the opcodes (execution-specs checks it in
@@ -352,7 +379,7 @@ fn create(self: *Evm, nonce: u64, value: u256, data: []const u8, gas_limit: u64,
     // EIP-2 (Homestead): a top-level contract-creation transaction pays an
     // extra `create_base` surcharge on top of the usual intrinsic cost.
     // Nested `CREATE`/`CREATE2` (`Interpreter.createOp`) are unaffected.
-    var intrinsic = gas.intrinsicCost(data);
+    var intrinsic = gas.intrinsicCost(data, self.block.fork) + access_list_cost;
     if (self.block.fork != .frontier) intrinsic += gas.create_base;
     if (gas_limit < intrinsic) {
         self.state.revertTo(cp);
@@ -1497,4 +1524,34 @@ test "processBlock exposes its block context to the transactions it runs" {
     });
 
     try std.testing.expectEqual(@as(u256, 46147), state.getStorage(0xdd, 0));
+}
+
+test "EIP-2930: an access list costs intrinsic gas and makes its entries start warm" {
+    // 0xdd's code: PUSH1 1, SLOAD, POP, STOP.
+    const code = [_]u8{ 0x60, 0x01, 0x54, 0x50, 0x00 };
+    const keys = [_]u256{1};
+    const list = [_]AccessListEntry{.{ .address = 0xdd, .storage_keys = &keys }};
+
+    for ([_]bool{ false, true }) |with_list| {
+        var state = State.init(std.testing.allocator);
+        defer state.deinit();
+        try state.setBalance(0x1, 1000);
+        try state.setCode(0xdd, &code);
+        state.finalizeTransaction();
+
+        var evm = Evm{ .allocator = std.testing.allocator, .state = &state };
+        evm.block.fork = .berlin;
+        var tx = testTx();
+        tx.to = 0xdd;
+        if (with_list) tx.access_list = &list;
+
+        const result = try evm.executeTransaction(tx, 0x1);
+        defer std.testing.allocator.free(result.return_data);
+        try std.testing.expectEqual(Interpreter.Status.stopped, result.status);
+
+        // PUSH1 + POP either way; the SLOAD is cold (2100) without the list
+        // and warm (100) with it, which costs 2400 + 1900 up front.
+        const expected: u64 = if (with_list) 21000 + 2400 + 1900 + 3 + 100 + 2 else 21000 + 3 + 2100 + 2;
+        try std.testing.expectEqual(expected, result.gas_used);
+    }
 }

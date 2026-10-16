@@ -70,27 +70,44 @@ pub const Fq = struct {
         return a.mul(scalar);
     }
 
-    /// Extended Euclidean algorithm, mirroring `bn128_field_elements.py`'s
-    /// module-level `inv(a, n)` exactly (specialized here to `n =
-    /// field_modulus`, the only modulus it's ever called with).
+    /// Binary extended GCD. Same value as `bn128_field_elements.py`'s
+    /// module-level `inv(a, n)` (the test below checks it against Fermat's
+    /// `a^(p-2)`, an independent route), but every step is a shift, a
+    /// comparison or a subtraction.
+    ///
+    /// The reference's division-based Euclid needs signed intermediates
+    /// wider than the modulus, which meant `i512` and a 512-bit
+    /// `@divFloor` on each of ~254 iterations. Inversions were 60% of a
+    /// pairing's time once the exponentiations were gone, and nearly all of
+    /// it was that division: `Fqp.inv`'s polynomial Euclid calls this
+    /// several times per extension-field inversion.
+    ///
+    /// Everything stays in `[0, field_modulus)`, and `field_modulus` is 254
+    /// bits, so the `+ field_modulus` halving steps cannot overflow `u256`.
     pub fn inv(a: Fq) Fq {
         if (a.n == 0) return a;
-        var lm: i512 = 1;
-        var hm: i512 = 0;
-        var low: i512 = @intCast(a.n % field_modulus);
-        var high: i512 = @intCast(field_modulus);
-        while (low > 1) {
-            const r = @divFloor(high, low);
-            const nm = hm - lm * r;
-            const new = high - low * r;
-            hm = lm;
-            high = low;
-            lm = nm;
-            low = new;
+        var u: u256 = a.n;
+        var v: u256 = field_modulus;
+        var x1: u256 = 1;
+        var x2: u256 = 0;
+        while (u != 1 and v != 1) {
+            while (u & 1 == 0) {
+                u >>= 1;
+                x1 = if (x1 & 1 == 0) x1 >> 1 else (x1 + field_modulus) >> 1;
+            }
+            while (v & 1 == 0) {
+                v >>= 1;
+                x2 = if (x2 & 1 == 0) x2 >> 1 else (x2 + field_modulus) >> 1;
+            }
+            if (u >= v) {
+                u -= v;
+                x1 = (Fq{ .n = x1 }).sub(.{ .n = x2 }).n;
+            } else {
+                v -= u;
+                x2 = (Fq{ .n = x2 }).sub(.{ .n = x1 }).n;
+            }
         }
-        var result = @mod(lm, @as(i512, @intCast(field_modulus)));
-        if (result < 0) result += @intCast(field_modulus);
-        return .{ .n = @intCast(result) };
+        return .{ .n = if (u == 1) x1 else x2 };
     }
 
     pub fn div(a: Fq, b: Fq) Fq {
@@ -241,11 +258,34 @@ pub fn Fqp(comptime degree: usize, comptime modulus_coeffs: [degree]i64) type {
             }
         }
 
+        /// Inverse. For a degree-2 extension with no linear term in its
+        /// modulus (which is `Fq2`, whose modulus is `x^2 + 1`) this is one
+        /// `Fq` inversion; otherwise it falls back to `invGeneric`.
+        ///
+        /// `x^2 == -modulus_coeffs[0]`, so `(a0 + a1 x)(a0 - a1 x)` lands
+        /// back in `Fq` as `a0^2 + modulus_coeffs[0] * a1^2`, and dividing
+        /// the conjugate by that norm inverts `a`. The generic polynomial
+        /// Euclid below reaches the same answer via several `Fq` inversions
+        /// and a pile of polynomial bookkeeping; `Fq2` inversions are hot
+        /// enough in G2 arithmetic to be worth the special case.
+        pub fn inv(a: Self) Self {
+            if (comptime degree == 2 and modulus_coeffs[1] == 0) {
+                const norm = a.coeffs[0].mul(a.coeffs[0])
+                    .add(mod_coeffs[0].mul(a.coeffs[1].mul(a.coeffs[1])));
+                const norm_inv = norm.inv();
+                return .{ .coeffs = .{
+                    a.coeffs[0].mul(norm_inv),
+                    a.coeffs[1].neg().mul(norm_inv),
+                } };
+            }
+            return a.invGeneric();
+        }
+
         /// Extended Euclidean algorithm over polynomials, mirroring
         /// `FQP.inv()` exactly: `lm`/`hm`/`low`/`high` are all
         /// `degree + 1`-length coefficient arrays (the modulus polynomial's
         /// implied leading `1` makes `high` one longer than `coeffs`).
-        pub fn inv(a: Self) Self {
+        pub fn invGeneric(a: Self) Self {
             var lm: [degree + 1]Fq = undefined;
             var hm: [degree + 1]Fq = undefined;
             var low: [degree + 1]Fq = undefined;
@@ -300,6 +340,76 @@ pub fn Fqp(comptime degree: usize, comptime modulus_coeffs: [degree]i64) type {
 
 pub const Fq2 = Fqp(2, .{ 1, 0 });
 pub const Fq12 = Fqp(12, .{ 82, 0, 0, 0, 0, 0, -18, 0, 0, 0, 0, 0 });
+
+/// `(x^p)^i` for `i` in `0..12`, generated offline from
+/// `Fq12.initInts(x).pow(u256, field_modulus)` — the test below re-derives
+/// them against that same reference and asserts they match.
+///
+/// Every coefficient of an `Fq12` element lives in `Fq`, where `a^p == a`,
+/// so the p-power Frobenius is `Fq`-linear:
+///
+///     (sum a_i x^i)^p == sum a_i (x^p)^i == sum a_i gamma[i]
+///
+/// Each `gamma[i]` turns out to have only two nonzero coefficients, so the
+/// whole map is 24 `Fq` multiplications. Reaching it by square-and-multiply
+/// over `field_modulus` instead costs ~380 `Fq12` multiplications, and the
+/// Miller loop does it four times per pairing: 26% of a pairing's time went
+/// here before this existed.
+const frobenius_gamma: [12][12]u256 = .{
+    .{ 0x1, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, }, // gamma^0
+    .{ 0x0, 0x1d8c8daef3eee1e81b2522ec5eb28ded6895e1cdfde6a43f5daa971f3fa65955, 0x0, 0x0, 0x0, 0x0, 0x0, 0x246996f3b4fae7e6a6327cfe12150b8e747992778eeec7e5ca5cf05f80f362ac, 0x0, 0x0, 0x0, 0x0, }, // gamma^1
+    .{ 0x0, 0x0, 0x242b719062f6737b8481d22c6934ce844d72f250fd28d102c0d147b2f4d521a7, 0x0, 0x0, 0x0, 0x0, 0x0, 0x16c9e55061ebae204ba4cc8bd75a079432ae2a1d0b7c9dce1665d51c640fcba2, 0x0, 0x0, 0x0, }, // gamma^2
+    .{ 0x0, 0x0, 0x0, 0x21436d48fcb50cc60dd4ef1e69a0c1f0dd2949fa6df7b44cbb259ef7cb58d5ed, 0x0, 0x0, 0x0, 0x0, 0x0, 0x7c03cbcac41049a0704b5a7ec796f2b21807dc98fa25bd282d37f632623b0e3, 0x0, 0x0, }, // gamma^3
+    .{ 0x0, 0x0, 0x0, 0x0, 0x2c84bbad27c3671562b7adefd44038ab3c0bbad96fc008e7d6998c82f7fc048b, 0x0, 0x0, 0x0, 0x0, 0x0, 0x2c145edbe7fd8aee9f3a80b03b0b1c923685d2ea1bdec763c13b4711cd2b8126, 0x0, }, // gamma^4
+    .{ 0x0, 0x0, 0x0, 0x0, 0x0, 0x1b007294a55accce13fe08bea73305ff6bdac77c5371c546d428780a6e3dcfa8, 0x0, 0x0, 0x0, 0x0, 0x0, 0x12acf2ca76fd0675a27fb246c7729f7db080cb99678e2ac024c6b8ee6e0c2c4b, }, // gamma^5
+    .{ 0x12, 0x0, 0x0, 0x0, 0x0, 0x0, 0x30644e72e131a029b85045b68181585d97816a916871ca8d3c208c16d87cfd46, 0x0, 0x0, 0x0, 0x0, 0x0, }, // gamma^6
+    .{ 0x0, 0x217e400dc9351e774e34e2ac06ead4000d14d1e242b29c567e9c385ce480a71a, 0x0, 0x0, 0x0, 0x0, 0x0, 0x12d7c0c3ed42be419d2b22ca22ceca702eeb88c36a8b264dde75f4f798d6a3f2, 0x0, 0x0, 0x0, 0x0, }, // gamma^7
+    .{ 0x0, 0x0, 0x359809094bd5c8e1b9c22d81246ffc2e794e17643ac198484b8d9094aa82536, 0x0, 0x0, 0x0, 0x0, 0x0, 0xc38dce27e3b2cae33ce738a184c89d94a0e78406b48f98a7b4f4463e3a7dba0, 0x0, 0x0, 0x0, }, // gamma^8
+    .{ 0x0, 0x0, 0x0, 0x18857a58f3b5bb3038a4311a86919d9c7c6c15f88a4f4f0831364cf35f78f771, 0x0, 0x0, 0x0, 0x0, 0x0, 0xf20e129e47c9363aa7b569817e0966cba582096fa7a164080faed1f0d24275a, 0x0, 0x0, }, // gamma^9
+    .{ 0x0, 0x0, 0x0, 0x0, 0xc33b1c70e4fd11b6d1eab6fcd18b99ad4afd096a8697e0c9c36d8ca3339a7b5, 0x0, 0x0, 0x0, 0x0, 0x0, 0x3df92c5b96e3914559897c6ad411fb25b75afb7f8b1c1a56586ff93e080f8bc, 0x0, }, // gamma^10
+    .{ 0x0, 0x0, 0x0, 0x0, 0x0, 0x215d42e7ac7bd17cefe88dd8e6965b3adae92c974f501fe811493d72543a3977, 0x0, 0x0, 0x0, 0x0, 0x0, 0x1563dbde3bd6d35ba4523cf7da4e525e2ba6a3151500054667f8140c6a3f2d9f, }, // gamma^11
+};
+
+/// `a^field_modulus`, the p-power Frobenius endomorphism of `Fq12`.
+pub fn frobenius(a: Fq12) Fq12 {
+    var out: [12]Fq = .{Fq.zero} ** 12;
+    inline for (0..12) |i| {
+        inline for (0..12) |j| {
+            if (comptime frobenius_gamma[i][j] != 0) {
+                out[j] = out[j].add(a.coeffs[i].mul(.{ .n = frobenius_gamma[i][j] }));
+            }
+        }
+    }
+    return .{ .coeffs = out };
+}
+
+/// `a^(field_modulus^n)`, by `n` applications of `frobenius`.
+fn frobeniusPow(a: Fq12, comptime n: usize) Fq12 {
+    var out = a;
+    inline for (0..n) |_| out = frobenius(out);
+    return out;
+}
+
+/// `(field_modulus^4 - field_modulus^2 + 1) / curve_order`, the only factor
+/// of `final_exponent` that still needs a real exponentiation. 761 bits
+/// against the whole exponent's 2790.
+const hard_exponent: u761 = 10486551571378427818905133077457505975217533156541166536005452068033223782873764572151541189142778783267711471998854717549389605644966361077867290379973073897271417449614939788000730910148473503528371060814157528868116901618729649;
+
+/// `f^((field_modulus^12 - 1) / curve_order)`, the pairing's final
+/// exponentiation.
+///
+/// That exponent factors as `(p^6 - 1) * (p^2 + 1) * (p^4 - p^2 + 1)/r`
+/// (asserted in the test below). The first two factors cost a Frobenius and
+/// a single inversion each; only the third is exponentiated, and it is a
+/// quarter the width. Square-and-multiply over the undecomposed 2790-bit
+/// exponent was 71% of a pairing's time.
+pub fn finalExponentiate(f: Fq12) Fq12 {
+    // Matches what `pow` would do with a zero base; `inv` below would not.
+    if (f.isZero()) return Fq12.zero;
+    const easy = frobeniusPow(f, 6).mul(f.inv());
+    const m = frobeniusPow(easy, 2).mul(easy);
+    return m.pow(u761, hard_exponent);
+}
 
 /// An affine point over field `F`, or `null` for the point at infinity —
 /// mirrors Python's `pt is None` convention directly.
@@ -413,10 +523,12 @@ fn linefunc(p1: G12Point, p2: G12Point, t: G12Point) Fq12 {
     }
 }
 
-/// The Miller loop, mirroring `miller_loop` exactly (including its
-/// non-cyclotomic-optimized final exponentiation — see the module doc
-/// comment on why this trades speed for auditability).
-fn millerLoop(q: ?G12Point, p: ?G12Point) Fq12 {
+/// The Miller loop, mirroring `miller_loop` exactly but for two
+/// substitutions that leave its value unchanged: `frobenius` in place of
+/// square-and-multiply by `field_modulus`, and the final exponentiation
+/// lifted out to `finalExponentiate` so a caller checking a product of
+/// pairings can apply it once rather than once per pair.
+fn millerLoopRaw(q: ?G12Point, p: ?G12Point) Fq12 {
     const qq = q orelse return Fq12.one;
     const pp = p orelse return Fq12.one;
     var r = qq;
@@ -430,17 +542,26 @@ fn millerLoop(q: ?G12Point, p: ?G12Point) Fq12 {
             r = add(Fq12, r, qq).?;
         }
     }
-    const q1: G12Point = .{ .x = qq.x.pow(u256, field_modulus), .y = qq.y.pow(u256, field_modulus) };
-    const nq2: G12Point = .{ .x = q1.x.pow(u256, field_modulus), .y = q1.y.pow(u256, field_modulus).neg() };
+    const q1: G12Point = .{ .x = frobenius(qq.x), .y = frobenius(qq.y) };
+    const nq2: G12Point = .{ .x = frobenius(q1.x), .y = frobenius(q1.y).neg() };
     f = f.mul(linefunc(r, q1, pp));
     r = add(Fq12, r, q1).?;
     f = f.mul(linefunc(r, nq2, pp));
-    return f.pow(u2790, final_exponent);
+    return f;
+}
+
+/// The Miller loop alone, without the final exponentiation.
+///
+/// `ECPAIRING` asks whether a *product* of pairings is one, and since
+/// `e(a,b) * e(c,d) == (ML(a,b) * ML(c,d))^exponent`, a caller can
+/// accumulate these across pairs and exponentiate the product once.
+pub fn millerLoop(q: ?G2Point, p: ?G1Point) Fq12 {
+    return millerLoopRaw(twist(q), castPointToFq12(p));
 }
 
 /// `e(Q, P)`, the optimal ate pairing of a `G2` point and a `G1` point.
 pub fn pairing(q: ?G2Point, p: ?G1Point) Fq12 {
-    return millerLoop(twist(q), castPointToFq12(p));
+    return finalExponentiate(millerLoop(q, p));
 }
 
 test "generators are on their respective curves" {
@@ -482,4 +603,95 @@ test "e(G1, G2)^curve_order == 1, and pairing is bilinear" {
 test "pairing with the point at infinity is 1" {
     try std.testing.expect(pairing(null, g1).eq(Fq12.one));
     try std.testing.expect(pairing(g2, null).eq(Fq12.one));
+}
+
+test "frobenius matches square-and-multiply by field_modulus" {
+    // The reference the generated `frobenius_gamma` table replaced. Random
+    // elements rather than structured ones, so a table entry that happens
+    // to be right only on sparse input cannot pass.
+    var prng: std.Random.DefaultPrng = .init(0x7a6b5c4d);
+    const rand = prng.random();
+    for (0..4) |_| {
+        var coeffs: [12]Fq = undefined;
+        for (&coeffs) |*c| c.* = Fq.init(rand.int(u256));
+        const a: Fq12 = .{ .coeffs = coeffs };
+        try std.testing.expect(frobenius(a).eq(a.pow(u256, field_modulus)));
+    }
+    // And on the structured values the Miller loop actually feeds it.
+    try std.testing.expect(frobenius(Fq12.one).eq(Fq12.one));
+    try std.testing.expect(frobenius(Fq12.zero).eq(Fq12.zero));
+    const g = twist(g2).?;
+    try std.testing.expect(frobenius(g.x).eq(g.x.pow(u256, field_modulus)));
+    try std.testing.expect(frobenius(g.y).eq(g.y.pow(u256, field_modulus)));
+}
+
+test "the decomposed final exponentiation matches the undecomposed exponent" {
+    // Proves `(p^6 - 1) * (p^2 + 1) * hard_exponent == final_exponent` in
+    // the only way that matters here: both routes land on the same element.
+    var prng: std.Random.DefaultPrng = .init(0x1f2e3d4c);
+    const rand = prng.random();
+    for (0..2) |_| {
+        var coeffs: [12]Fq = undefined;
+        for (&coeffs) |*c| c.* = Fq.init(rand.int(u256));
+        const a: Fq12 = .{ .coeffs = coeffs };
+        try std.testing.expect(finalExponentiate(a).eq(a.pow(u2790, final_exponent)));
+    }
+    // Zero has no inverse, so `finalExponentiate` special-cases it; check it
+    // still agrees with what the plain exponentiation would have produced.
+    try std.testing.expect(finalExponentiate(Fq12.zero).eq(Fq12.zero.pow(u2790, final_exponent)));
+    // And the real article: a Miller loop output.
+    const ml = millerLoop(g2, g1);
+    try std.testing.expect(finalExponentiate(ml).eq(ml.pow(u2790, final_exponent)));
+}
+
+test "a product of Miller loops exponentiated once equals the product of pairings" {
+    // The identity `ECPAIRING` relies on, which is what lets the precompile
+    // pay for one final exponentiation rather than one per pair.
+    const p1 = multiply(Fq, g1, 7).?;
+    const q1 = multiply(Fq2, g2, 11).?;
+    const p2 = multiply(Fq, g1, 13).?;
+    const q2 = multiply(Fq2, g2, 17).?;
+
+    const separate = pairing(q1, p1).mul(pairing(q2, p2));
+    const combined = finalExponentiate(millerLoop(q1, p1).mul(millerLoop(q2, p2)));
+    try std.testing.expect(separate.eq(combined));
+}
+
+test "Fq.inv agrees with Fermat's a^(p-2)" {
+    // An independent route to the same inverse, so this checks the binary
+    // GCD rather than just restating it.
+    var prng: std.Random.DefaultPrng = .init(0x5e1f2a3b);
+    const rand = prng.random();
+    for (0..64) |_| {
+        const a = Fq.init(rand.int(u256));
+        if (a.n == 0) continue;
+        try std.testing.expect(a.inv().eq(a.pow(field_modulus - 2)));
+        try std.testing.expect(a.mul(a.inv()).eq(Fq.one));
+    }
+    // Edges: 1, p-1, and the smallest even and odd values, since the loop
+    // branches on parity.
+    for ([_]u256{ 1, 2, 3, 4, field_modulus - 1, field_modulus - 2 }) |n| {
+        const a = Fq.init(n);
+        try std.testing.expect(a.inv().eq(a.pow(field_modulus - 2)));
+    }
+    // Zero is returned unchanged, as the reference does.
+    try std.testing.expect(Fq.zero.inv().eq(Fq.zero));
+}
+
+test "the direct Fq2 inverse agrees with the generic polynomial Euclid" {
+    var prng: std.Random.DefaultPrng = .init(0x3c4d5e6f);
+    const rand = prng.random();
+    for (0..32) |_| {
+        const a: Fq2 = .{ .coeffs = .{ Fq.init(rand.int(u256)), Fq.init(rand.int(u256)) } };
+        if (a.isZero()) continue;
+        try std.testing.expect(a.inv().eq(a.invGeneric()));
+        try std.testing.expect(a.mul(a.inv()).eq(Fq2.one));
+    }
+    // A purely real and a purely imaginary element, where one coefficient
+    // of the conjugate formula drops out.
+    const real: Fq2 = .{ .coeffs = .{ Fq.init(7), Fq.zero } };
+    const imag: Fq2 = .{ .coeffs = .{ Fq.zero, Fq.init(7) } };
+    try std.testing.expect(real.inv().eq(real.invGeneric()));
+    try std.testing.expect(imag.inv().eq(imag.invGeneric()));
+    try std.testing.expect(Fq2.one.inv().eq(Fq2.one));
 }
