@@ -49,6 +49,9 @@ fn padTo32(bytes: []const u8) [32]u8 {
 
 const DecodedHeader = struct {
     number: u64,
+    /// EIP-1559 (London) appended `baseFeePerGas` as the header's 16th
+    /// field. Zero before that.
+    base_fee: u256,
     miner: zevm.Address,
     timestamp: u64,
     gas_limit: u64,
@@ -72,6 +75,7 @@ const DecodedHeader = struct {
 fn decodeHeader(header: zevm.Rlp.Item) DecodedHeader {
     return .{
         .number = bytesToU64(header.list[8].string),
+        .base_fee = if (header.list.len > 15) bytesToU256(header.list[15].string) else 0,
         .miner = bytesToAddress(header.list[2].string),
         .timestamp = bytesToU64(header.list[11].string),
         .gas_limit = bytesToU64(header.list[9].string),
@@ -160,18 +164,64 @@ fn encodeItem(allocator: std.mem.Allocator, item: zevm.Rlp.Item) ![]u8 {
     }
 }
 
+/// The address that signed `tx_item`. This is the expensive half of reading
+/// a transaction (an ECDSA public-key recovery, ~30us), and it depends on
+/// nothing but the transaction's own bytes, which is what lets
+/// `recoverSenders` run it for a whole file at once across every core.
+/// `allocator` only holds scratch that is freed before returning.
+fn txSender(allocator: std.mem.Allocator, secp: Secp256k1, tx_item: zevm.Rlp.Item) !zevm.Address {
+    // EIP-2718: a typed transaction sits in the body as a byte string,
+    // `type || payload`, where a Legacy one is a bare list.
+    if (tx_item == .string) return typedSender(allocator, secp, tx_item.string);
+    return deriveSender(allocator, secp, tx_item.list);
+}
+
+/// How many fields a typed transaction carries before its signature
+/// (`y_parity, r, s`), or null for a type this decoder does not know.
+/// EIP-1559 (type 2) splits EIP-2930's single `gas_price` into a tip cap and
+/// a fee cap, so everything after `nonce` sits one field later.
+fn signedFieldCount(tx_type: u8) ?usize {
+    return switch (tx_type) {
+        0x01 => 8,
+        0x02 => 9,
+        else => null,
+    };
+}
+
+/// A typed transaction signs `keccak(type || rlp(every field before the
+/// signature))`.
+fn typedSender(allocator: std.mem.Allocator, secp: Secp256k1, bytes: []const u8) !zevm.Address {
+    if (bytes.len == 0) return error.UnsupportedTransactionType;
+    const signed_count = signedFieldCount(bytes[0]) orelse return error.UnsupportedTransactionType;
+    const payload = try zevm.Rlp.decode(allocator, bytes[1..]);
+    defer payload.deinit(allocator);
+    const fields = payload.list;
+    if (fields.len != signed_count + 3) return error.MalformedTransaction;
+
+    const signed = try encodeItem(allocator, .{ .list = fields[0..signed_count] });
+    defer allocator.free(signed);
+    const preimage = try allocator.alloc(u8, signed.len + 1);
+    defer allocator.free(preimage);
+    preimage[0] = bytes[0];
+    @memcpy(preimage[1..], signed);
+    var hash: secp256k1.Message = undefined;
+    std.mem.writeInt(u256, &hash, zevm.keccak256(preimage), .big);
+
+    const y_parity = bytesToU64(fields[signed_count].string);
+    if (y_parity > 1) return error.MalformedTransaction;
+    return recoverAddress(secp, hash, fields[signed_count + 1].string, fields[signed_count + 2].string, @intCast(y_parity));
+}
+
 /// `tx_item`'s string fields borrow directly from the decompressed body
 /// buffer the caller owns, kept alive as long as one block's entries are in use.
 /// A typed transaction's decoded payload and access list are allocated in
-/// `arena`, which must live as long too.
-fn parseTransaction(allocator: std.mem.Allocator, arena: std.mem.Allocator, secp: Secp256k1, tx_item: zevm.Rlp.Item) !zevm.Block.Entry {
-    // EIP-2718: a typed transaction sits in the body as a byte string,
-    // `type || payload`, where a Legacy one is a bare list.
-    if (tx_item == .string) return parseTypedTransaction(allocator, arena, secp, tx_item.string);
+/// `arena`, which must live as long too. `from` comes from `txSender`.
+fn parseTransaction(arena: std.mem.Allocator, tx_item: zevm.Rlp.Item, from: zevm.Address) !zevm.Block.Entry {
+    if (tx_item == .string) return parseTypedTransaction(arena, tx_item.string, from);
     const fields = tx_item.list;
     const to_bytes = fields[3].string;
     return .{
-        .from = try deriveSender(allocator, secp, fields),
+        .from = from,
         .tx = .{
             .nonce = bytesToU64(fields[0].string),
             .gas_price = bytesToU256(fields[1].string),
@@ -188,49 +238,85 @@ fn parseTransaction(allocator: std.mem.Allocator, arena: std.mem.Allocator, secp
 
 /// EIP-2930 (type 1, Berlin):
 /// `rlp([chain_id, nonce, gas_price, gas_limit, to, value, data, access_list,
-/// y_parity, r, s])`, signed over `keccak(0x01 || rlp(first eight fields))`.
-fn parseTypedTransaction(allocator: std.mem.Allocator, arena: std.mem.Allocator, secp: Secp256k1, bytes: []const u8) !zevm.Block.Entry {
-    if (bytes.len == 0 or bytes[0] != 0x01) return error.UnsupportedTransactionType;
+/// y_parity, r, s])`.
+/// EIP-1559 (type 2, London):
+/// `rlp([chain_id, nonce, max_priority_fee, max_fee, gas_limit, to, value,
+/// data, access_list, y_parity, r, s])`, the same shape with `gas_price`
+/// split in two, so the fields after it are read one position later.
+fn parseTypedTransaction(arena: std.mem.Allocator, bytes: []const u8, from: zevm.Address) !zevm.Block.Entry {
+    if (bytes.len == 0) return error.UnsupportedTransactionType;
+    const signed_count = signedFieldCount(bytes[0]) orelse return error.UnsupportedTransactionType;
     const payload = try zevm.Rlp.decode(arena, bytes[1..]);
     const fields = payload.list;
-    if (fields.len != 11) return error.MalformedTransaction;
+    if (fields.len != signed_count + 3) return error.MalformedTransaction;
+    const fee_market = bytes[0] == 0x02;
+    const shift: usize = if (fee_market) 1 else 0;
 
-    const signed = try encodeItem(allocator, .{ .list = fields[0..8] });
-    defer allocator.free(signed);
-    const preimage = try allocator.alloc(u8, signed.len + 1);
-    defer allocator.free(preimage);
-    preimage[0] = 0x01;
-    @memcpy(preimage[1..], signed);
-    var hash: secp256k1.Message = undefined;
-    std.mem.writeInt(u256, &hash, zevm.keccak256(preimage), .big);
-
-    const y_parity = bytesToU64(fields[8].string);
-    if (y_parity > 1) return error.MalformedTransaction;
-
-    const entries = try arena.alloc(zevm.AccessListEntry, fields[7].list.len);
-    for (fields[7].list, entries) |item, *entry| {
+    const access_list = fields[7 + shift].list;
+    const entries = try arena.alloc(zevm.AccessListEntry, access_list.len);
+    for (access_list, entries) |item, *entry| {
         const keys = try arena.alloc(u256, item.list[1].list.len);
         for (item.list[1].list, keys) |key, *out| out.* = bytesToU256(key.string);
         entry.* = .{ .address = bytesToAddress(item.list[0].string), .storage_keys = keys };
     }
 
-    const to_bytes = fields[4].string;
+    const to_bytes = fields[4 + shift].string;
     return .{
-        .from = try recoverAddress(secp, hash, fields[9].string, fields[10].string, @intCast(y_parity)),
+        .from = from,
         .tx = .{
             .nonce = bytesToU64(fields[1].string),
-            .gas_price = bytesToU256(fields[2].string),
-            .gas_limit = bytesToU64(fields[3].string),
+            // For type 2 this is `max_fee`; see `Transaction.gas_price`.
+            .gas_price = bytesToU256(fields[2 + shift].string),
+            .gas_limit = bytesToU64(fields[3 + shift].string),
             .to = if (to_bytes.len == 0) null else bytesToAddress(to_bytes),
-            .value = bytesToU256(fields[5].string),
-            .data = fields[6].string,
-            .v = y_parity,
-            .r = bytesToU256(fields[9].string),
-            .s = bytesToU256(fields[10].string),
+            .value = bytesToU256(fields[5 + shift].string),
+            .data = fields[6 + shift].string,
+            .v = bytesToU64(fields[signed_count].string),
+            .r = bytesToU256(fields[signed_count + 1].string),
+            .s = bytesToU256(fields[signed_count + 2].string),
             .chain_id = bytesToU256(fields[0].string),
             .access_list = entries,
+            .max_priority_fee = if (fee_market) bytesToU256(fields[2].string) else null,
         },
     };
+}
+
+/// Recovers `senders[i]` for every `items[i]`, split across one thread per
+/// core. Each worker owns a contiguous slice and its own scratch arena, and
+/// libsecp256k1 only ever reads the shared context, so the workers share
+/// nothing mutable. The result cannot depend on how the work is split.
+fn recoverSenders(secp: Secp256k1, items: []const zevm.Rlp.Item, senders: []zevm.Address) !void {
+    const max_threads = 64;
+    const cpus = std.Thread.getCpuCount() catch 1;
+    // Below a few hundred transactions a thread costs more than it saves.
+    const thread_count = @max(1, @min(max_threads, @min(cpus, items.len / 256)));
+
+    var threads: [max_threads]std.Thread = undefined;
+    var failures: [max_threads]?anyerror = @splat(null);
+    const per_thread = (items.len + thread_count - 1) / thread_count;
+    var spawned: usize = 0;
+    while (spawned < thread_count) : (spawned += 1) {
+        const lo = @min(items.len, spawned * per_thread);
+        const hi = @min(items.len, lo + per_thread);
+        threads[spawned] = std.Thread.spawn(.{}, recoverSendersWorker, .{ secp, items[lo..hi], senders[lo..hi], &failures[spawned] }) catch |err| {
+            for (threads[0..spawned]) |t| t.join();
+            return err;
+        };
+    }
+    for (threads[0..spawned]) |t| t.join();
+    for (failures[0..spawned]) |failure| if (failure) |err| return err;
+}
+
+fn recoverSendersWorker(secp: Secp256k1, items: []const zevm.Rlp.Item, senders: []zevm.Address, failure: *?anyerror) void {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    for (items, senders) |item, *sender| {
+        sender.* = txSender(arena.allocator(), secp, item) catch |err| {
+            failure.* = err;
+            return;
+        };
+        _ = arena.reset(.retain_capacity);
+    }
 }
 
 const record_type = struct {
@@ -411,16 +497,10 @@ pub fn main(io: std.Io, args: []const []const u8) anyerror!void {
                 dump_at_block = try std.fmt.parseInt(u64, args[i + 1], 10);
                 dump_path = args[i + 2];
                 i += 2;
-                // Resuming restarts at the dumped block's *file*, not the
-                // block itself: a mid-file dump makes that file's earlier
-                // blocks get replayed a second time on resume, silently
-                // double-applying their transactions (nonce mismatches
-                // downstream). Catch this immediately rather than producing
-                // a corrupt-but-successfully-written dump.
-                if ((dump_at_block.? + 1) % blocks_per_file != 0) {
-                    std.debug.print("--dump-at {d} is not a file's last block ((block+1) % {d} must be 0)\n", .{ dump_at_block.?, blocks_per_file });
-                    return error.InvalidDumpAtBlock;
-                }
+                // Any block may be dumped. Only *resuming* from a mid-file
+                // dump is unsafe, and `--resume-from` refuses that below.
+                // The final era1 file ends at the Merge, mid-file, and its
+                // last block is exactly where this replay has to stop.
             } else if (std.mem.eql(u8, args[i], "--resume-from") and i + 1 < args.len) {
                 resume_path = args[i + 1];
                 i += 1;
@@ -676,7 +756,7 @@ pub fn main(io: std.Io, args: []const []const u8) anyerror!void {
                 var tx_arena = std.heap.ArenaAllocator.init(allocator);
                 defer tx_arena.deinit();
                 for (body_item.list[0].list) |tx_item| {
-                    const entry = try parseTransaction(allocator, tx_arena.allocator(), secp, tx_item);
+                    const entry = try parseTransaction(tx_arena.allocator(), tx_item, try txSender(allocator, secp, tx_item));
                     if (entry.tx.to == target and entry.tx.value > 0) {
                         in_total += entry.tx.value;
                         std.debug.print("IN:  block {d} from {x} value {d} (running in_total {d})\n", .{ header.number, entry.from, entry.tx.value, in_total });
@@ -740,6 +820,14 @@ pub fn main(io: std.Io, args: []const []const u8) anyerror!void {
         // copy this design replaced.
         std.posix.madvise(dump.ptr, dump.len, std.posix.MADV.WILLNEED) catch {};
         const snapshot = try zevm.State.loadSnapshot(allocator, dump);
+        // Resuming restarts at the dumped block's *file*, not the block
+        // itself, so a snapshot taken mid-file would have that file's earlier
+        // blocks replayed a second time, silently double-applying their
+        // transactions. Only a file's last block is a safe place to resume.
+        if ((snapshot.block + 1) % blocks_per_file != 0) {
+            std.debug.print("cannot resume from block {d}: not a file's last block ((block+1) % {d} must be 0)\n", .{ snapshot.block, blocks_per_file });
+            return error.UnalignedResumeBlock;
+        }
         state = snapshot.state;
         starting_block = snapshot.block + 1;
         resumed_hashes = snapshot.recent_hashes;
@@ -836,6 +924,47 @@ pub fn main(io: std.Io, args: []const []const u8) anyerror!void {
         }
         idx += 1;
 
+        // Every sender in this file, recovered up front across all cores.
+        // Recovery reads nothing but each transaction's own bytes, so it can
+        // run ahead of execution, and the block loop below just takes the
+        // results in order. That loop decompresses and decodes each body a
+        // second time, which costs a fraction of a percent; restructuring it
+        // around a pre-decoded file would touch the dump/resume/root paths.
+        const recover_start = std.Io.Clock.Timestamp.now(io, .awake);
+        var senders: std.ArrayList(zevm.Address) = .empty;
+        defer senders.deinit(allocator);
+        {
+            var bodies: std.ArrayList([]u8) = .empty;
+            defer {
+                for (bodies.items) |body| allocator.free(body);
+                bodies.deinit(allocator);
+            }
+            var decoded: std.ArrayList(zevm.Rlp.Item) = .empty;
+            defer {
+                for (decoded.items) |item| item.deinit(allocator);
+                decoded.deinit(allocator);
+            }
+            var tx_items: std.ArrayList(zevm.Rlp.Item) = .empty;
+            defer tx_items.deinit(allocator);
+
+            var r = idx;
+            while (r < records.len and std.mem.eql(u8, &records[r].kind, &record_type.compressed_header)) : (r += 4) {
+                try bodies.ensureUnusedCapacity(allocator, 1);
+                try decoded.ensureUnusedCapacity(allocator, 1);
+                const body = try Snappy.frameDecompress(allocator, records[r + 1].data);
+                bodies.appendAssumeCapacity(body);
+                const item = try zevm.Rlp.decode(allocator, body);
+                decoded.appendAssumeCapacity(item);
+                try tx_items.appendSlice(allocator, item.list[0].list);
+            }
+            try senders.resize(allocator, tx_items.items.len);
+            try recoverSenders(secp, tx_items.items, senders.items);
+        }
+        var next_sender: usize = 0;
+        const recover_ns: u64 = @intCast(recover_start.durationTo(std.Io.Clock.Timestamp.now(io, .awake)).raw.nanoseconds);
+        tx_parse_ns += recover_ns;
+        decode_ns += recover_ns;
+
         var blocks_in_file: u64 = 0;
         var transactions_in_file: u64 = 0;
         while (idx < records.len and std.mem.eql(u8, &records[idx].kind, &record_type.compressed_header)) {
@@ -876,7 +1005,11 @@ pub fn main(io: std.Io, args: []const []const u8) anyerror!void {
             var tx_arena = std.heap.ArenaAllocator.init(allocator);
             defer tx_arena.deinit();
             for (transactions_rlp) |tx_item| {
-                try entries.append(allocator, try parseTransaction(allocator, tx_arena.allocator(), secp, tx_item));
+                // The pre-pass walked exactly these records in this order, so
+                // running past its results means the two loops disagree.
+                if (next_sender >= senders.items.len) return error.SenderCountMismatch;
+                try entries.append(allocator, try parseTransaction(tx_arena.allocator(), tx_item, senders.items[next_sender]));
+                next_sender += 1;
             }
             transactions_in_file += entries.items.len;
 
@@ -916,6 +1049,7 @@ pub fn main(io: std.Io, args: []const []const u8) anyerror!void {
                     .timestamp = header.timestamp,
                     .gas_limit = header.gas_limit,
                     .difficulty = header.difficulty,
+                    .base_fee = header.base_fee,
                     .recent_hashes = recent_hashes.items,
                 }) catch |err| {
                     std.debug.print("block {d} failed: {s}\n", .{ header.number, @errorName(err) });

@@ -1,7 +1,7 @@
 //! Executes a decoded `Transaction` against a `State`.
 //!
-//! Frontier through Berlin are implemented (Muir Glacier changes nothing
-//! this executes). `processBlock` panics on any block from a later fork (see
+//! Frontier through London are implemented (Muir, Arrow and Gray Glacier
+//! only delayed the difficulty bomb and change nothing this executes). `processBlock` panics on any block from a later fork (see
 //! `Fork`) instead of silently applying stale rules.
 //!
 //! Constantinople and Petersburg share a block on mainnet (7,280,000):
@@ -120,6 +120,22 @@ pub fn executeTransaction(self: *Evm, tx: Transaction, from: Address) !Result {
     // real chain rejects, charging gas and silently dropping the transfer.
     // Failing this check on a replayed transaction means our balance has
     // already drifted from real chain state.
+    //
+    // EIP-1559 (London) splits the fee into a base fee, which is burned, and
+    // a priority fee, which goes to the miner. A fee-market transaction
+    // offers a maximum total (`gas_price`) and a maximum tip
+    // (`max_priority_fee`) and pays `base_fee + min(tip, max - base_fee)`;
+    // every other type pays its `gas_price` outright, which must at least
+    // cover the base fee. The balance check below is still against the
+    // *maximum*, as execution-specs' `check_transaction` does it.
+    const base_fee: u256 = if (self.block.fork.atLeast(.london)) self.block.base_fee else 0;
+    var effective_gas_price = tx.gas_price;
+    if (tx.max_priority_fee) |tip| {
+        if (tx.gas_price < tip) return error.PriorityFeeAboveMaxFee;
+        if (tx.gas_price < base_fee) return error.MaxFeeBelowBaseFee;
+        effective_gas_price = base_fee + @min(tip, tx.gas_price - base_fee);
+    } else if (tx.gas_price < base_fee) return error.GasPriceBelowBaseFee;
+
     const gas_fee = @as(u256, tx.gas_limit) * tx.gas_price;
     const upfront_cost = gas_fee + tx.value;
     const balance_before = self.state.getBalance(from);
@@ -134,13 +150,14 @@ pub fn executeTransaction(self: *Evm, tx: Transaction, from: Address) !Result {
     }
     // Only the fee is debited here; `value` moves separately, through the
     // transfer inside the call/create this transaction turns into.
-    try self.state.setBalance(from, balance_before - gas_fee);
+    try self.state.setBalance(from, balance_before - @as(u256, tx.gas_limit) * effective_gas_price);
 
     // A transaction's nonce always advances, whether it succeeds, reverts,
     // or fails outright.
     try self.state.setNonce(from, current_nonce + 1);
 
-    self.tx = .{ .origin = from, .gas_price = tx.gas_price };
+    // GASPRICE reports what is actually being paid per gas.
+    self.tx = .{ .origin = from, .gas_price = effective_gas_price };
 
     // EIP-2929/2930 (Berlin): the sender, every precompile and everything in
     // the access list start warm. The target (or the address being created)
@@ -164,10 +181,13 @@ pub fn executeTransaction(self: *Evm, tx: Transaction, from: Address) !Result {
 
     // Refund unused gas, then pay the miner, via `creditBalance` (unjournaled,
     // like block rewards): a transaction's gas fee is never undone by a revert.
-    const unused = @as(u256, tx.gas_limit - result.gas_used) * tx.gas_price;
+    const unused = @as(u256, tx.gas_limit - result.gas_used) * effective_gas_price;
     if (unused != 0) try self.state.creditBalance(from, unused);
-    if (result.gas_used != 0 and tx.gas_price != 0) {
-        try self.state.creditBalance(self.block.coinbase, @as(u256, result.gas_used) * tx.gas_price);
+    // Only the priority fee reaches the miner; the base fee part of what the
+    // sender paid is credited to no one, which is what burns it.
+    const priority_fee = effective_gas_price - base_fee;
+    if (result.gas_used != 0 and priority_fee != 0) {
+        try self.state.creditBalance(self.block.coinbase, @as(u256, result.gas_used) * priority_fee);
     }
 
     // Any `SELFDESTRUCT` that survived to here (a reverted one never
@@ -191,9 +211,9 @@ pub fn processBlock(self: *Evm, block: Block) !void {
     const fork = Fork.at(block.number);
     // Muir Glacier delayed the difficulty bomb and changed nothing this
     // executes, so Istanbul's rules carry through it unchanged.
-    if (fork.atLeast(.london)) {
+    if (fork.atLeast(.merge)) {
         std.debug.panic(
-            "block {d} is past Berlin (fork: {s}): this Evm only implements up to Berlin's rules",
+            "block {d} is past Gray Glacier (fork: {s}): this Evm only implements up to London's rules",
             .{ block.number, @tagName(fork) },
         );
     }
@@ -285,7 +305,7 @@ fn call(self: *Evm, value: u256, data: []const u8, access_list_cost: u64, gas_li
         return .{
             .status = status,
             .return_data = result.output,
-            .gas_used = gasUsed(status, result.gas_remaining, 0, execution_gas_limit, intrinsic),
+            .gas_used = gasUsed(status, result.gas_remaining, 0, execution_gas_limit, intrinsic, self.block.fork),
         };
     }
 
@@ -325,7 +345,7 @@ fn call(self: *Evm, value: u256, data: []const u8, access_list_cost: u64, gas_li
     return .{
         .status = interp.status,
         .return_data = try self.allocator.dupe(u8, interp.return_data),
-        .gas_used = gasUsed(interp.status, interp.gas_remaining, interp.refund, execution_gas_limit, intrinsic),
+        .gas_used = gasUsed(interp.status, interp.gas_remaining, interp.refund, execution_gas_limit, intrinsic, self.block.fork),
     };
 }
 
@@ -336,7 +356,7 @@ fn call(self: *Evm, value: u256, data: []const u8, access_list_cost: u64, gas_li
 /// halts (`.out_of_gas`, `.invalid_opcode`, `.invalid_jump`,
 /// `.stack_overflow`, `.stack_underflow`) forfeit the entire limit;
 /// `.reverted` is the exception that only spends what actually ran.
-fn gasUsed(status: Interpreter.Status, gas_remaining: u64, refund: i64, execution_gas_limit: u64, intrinsic: u64) u64 {
+fn gasUsed(status: Interpreter.Status, gas_remaining: u64, refund: i64, execution_gas_limit: u64, intrinsic: u64, fork: Fork) u64 {
     switch (status) {
         .out_of_gas, .invalid_opcode, .invalid_jump, .stack_overflow, .stack_underflow => return execution_gas_limit + intrinsic,
         else => {},
@@ -346,7 +366,8 @@ fn gasUsed(status: Interpreter.Status, gas_remaining: u64, refund: i64, executio
     // A negative counter means more refund was taken back than granted,
     // which refunds nothing rather than charging extra.
     if (refund <= 0) return spent;
-    return spent - @min(@as(u64, @intCast(refund)), spent / gas.max_refund_denominator);
+    const denominator = if (fork.atLeast(.london)) gas.max_refund_denominator_3529 else gas.max_refund_denominator;
+    return spent - @min(@as(u64, @intCast(refund)), spent / denominator);
 }
 
 fn create(self: *Evm, nonce: u64, value: u256, data: []const u8, access_list_cost: u64, gas_limit: u64, from: Address) !Result {
@@ -428,11 +449,14 @@ fn create(self: *Evm, nonce: u64, value: u256, data: []const u8, access_list_cos
     // exceptional halt (forfeits all remaining gas), not a graceful stop.
     // No limit at all before this fork. Mirrors `Interpreter.createOp`.
     const oversized = self.block.fork.atLeast(.spurious_dragon) and interp.return_data.len > Interpreter.max_code_size;
+    // EIP-3541 (London), mirroring `Interpreter.createOp`.
+    const ef_prefixed = self.block.fork.atLeast(.london) and interp.return_data.len > 0 and interp.return_data[0] == 0xef;
+    const rejected = oversized or ef_prefixed;
 
     // Mirrors `Interpreter.createOp`: a successful init code run still has
     // to afford storing its returned code, at `code_deposit_byte` gas/byte.
-    var success = interp.status == .stopped and !oversized;
-    var status: Interpreter.Status = if (oversized) .out_of_gas else interp.status;
+    var success = interp.status == .stopped and !rejected;
+    var status: Interpreter.Status = if (rejected) .out_of_gas else interp.status;
     var deployed_code: []const u8 = interp.return_data;
     if (success) {
         const deposit_cost = gas.code_deposit_byte * @as(u64, interp.return_data.len);
@@ -461,7 +485,7 @@ fn create(self: *Evm, nonce: u64, value: u256, data: []const u8, access_list_cos
         .status = status,
         .return_data = try self.allocator.dupe(u8, interp.return_data),
         .created_address = new_address,
-        .gas_used = gasUsed(status, interp.gas_remaining, interp.refund, gas_limit - intrinsic, intrinsic),
+        .gas_used = gasUsed(status, interp.gas_remaining, interp.refund, gas_limit - intrinsic, intrinsic, self.block.fork),
     };
 }
 
@@ -1553,5 +1577,92 @@ test "EIP-2930: an access list costs intrinsic gas and makes its entries start w
         // and warm (100) with it, which costs 2400 + 1900 up front.
         const expected: u64 = if (with_list) 21000 + 2400 + 1900 + 3 + 100 + 2 else 21000 + 3 + 2100 + 2;
         try std.testing.expectEqual(expected, result.gas_used);
+    }
+}
+
+test "EIP-1559: the base fee is burned, only the priority fee reaches the miner" {
+    // (max_fee, tip) -> what is actually paid per gas, with a base fee of 10.
+    const cases = [_]struct { max_fee: u256, tip: u256, paid: u256 }{
+        .{ .max_fee = 100, .tip = 3, .paid = 13 }, // tip fits under the cap
+        .{ .max_fee = 12, .tip = 5, .paid = 12 }, // cap leaves room for only 2 of the tip
+    };
+    for (cases) |c| {
+        var state = State.init(std.testing.allocator);
+        defer state.deinit();
+        const funds: u256 = 21000 * c.max_fee;
+        try state.setBalance(0x1, funds);
+
+        var evm = Evm{ .allocator = std.testing.allocator, .state = &state };
+        evm.block.fork = .london;
+        evm.block.base_fee = 10;
+        evm.block.coinbase = 0xc0;
+        var tx = testTx();
+        tx.to = 0xdd;
+        tx.gas_limit = 21000;
+        tx.gas_price = c.max_fee;
+        tx.max_priority_fee = c.tip;
+
+        const result = try evm.executeTransaction(tx, 0x1);
+        defer std.testing.allocator.free(result.return_data);
+        try std.testing.expectEqual(@as(u64, 21000), result.gas_used);
+        try std.testing.expectEqual(funds - 21000 * c.paid, state.getBalance(0x1));
+        try std.testing.expectEqual(21000 * (c.paid - 10), state.getBalance(0xc0));
+    }
+}
+
+test "EIP-1559: a transaction that cannot cover the base fee is invalid" {
+    var state = State.init(std.testing.allocator);
+    defer state.deinit();
+    try state.setBalance(0x1, 1_000_000_000);
+    var evm = Evm{ .allocator = std.testing.allocator, .state = &state };
+    evm.block.fork = .london;
+    evm.block.base_fee = 10;
+
+    var legacy = testTx();
+    legacy.to = 0xdd;
+    legacy.gas_price = 9;
+    try std.testing.expectError(error.GasPriceBelowBaseFee, evm.executeTransaction(legacy, 0x1));
+
+    var fee_market = testTx();
+    fee_market.to = 0xdd;
+    fee_market.gas_price = 9;
+    fee_market.max_priority_fee = 1;
+    try std.testing.expectError(error.MaxFeeBelowBaseFee, evm.executeTransaction(fee_market, 0x1));
+
+    fee_market.gas_price = 20;
+    fee_market.max_priority_fee = 21;
+    try std.testing.expectError(error.PriorityFeeAboveMaxFee, evm.executeTransaction(fee_market, 0x1));
+}
+
+test "EIP-3529 caps the refund at a fifth of gas used instead of a half" {
+    // 21000 intrinsic + 50000 executed = 71000 spent, with a refund of 50000.
+    try std.testing.expectEqual(@as(u64, 71000 - 71000 / 2), gasUsed(.stopped, 50000, 50000, 100000, 21000, .berlin));
+    try std.testing.expectEqual(@as(u64, 71000 - 71000 / 5), gasUsed(.stopped, 50000, 50000, 100000, 21000, .london));
+    // A refund under the cap is paid in full either way.
+    try std.testing.expectEqual(@as(u64, 71000 - 1000), gasUsed(.stopped, 50000, 1000, 100000, 21000, .london));
+}
+
+test "EIP-3541: deployed code may not start with 0xEF from London on" {
+    // Init code: MSTORE8 0xEF at 0, RETURN one byte.
+    const init = [_]u8{ 0x60, 0xef, 0x60, 0x00, 0x53, 0x60, 0x01, 0x60, 0x00, 0xf3 };
+    for ([_]Fork{ .berlin, .london }) |fork| {
+        var state = State.init(std.testing.allocator);
+        defer state.deinit();
+        try state.setBalance(0x1, 1000);
+        var evm = Evm{ .allocator = std.testing.allocator, .state = &state };
+        evm.block.fork = fork;
+        var tx = testTx();
+        tx.data = &init;
+
+        const result = try evm.executeTransaction(tx, 0x1);
+        defer std.testing.allocator.free(result.return_data);
+        if (fork == .london) {
+            try std.testing.expectEqual(Interpreter.Status.out_of_gas, result.status);
+            try std.testing.expectEqual(tx.gas_limit, result.gas_used);
+            try std.testing.expectEqual(@as(usize, 0), state.getCode(result.created_address.?).len);
+        } else {
+            try std.testing.expectEqual(Interpreter.Status.stopped, result.status);
+            try std.testing.expectEqualSlices(u8, &.{0xef}, state.getCode(result.created_address.?));
+        }
     }
 }

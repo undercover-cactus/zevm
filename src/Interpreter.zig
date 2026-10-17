@@ -1040,6 +1040,8 @@ fn sstore(self: *Interpreter) !void {
         const original = state.originalStorage(self.address, slot);
         const sload_cost = if (berlin) gas.warm_storage_read_2929 else gas.sload_1884;
         const reset_cost = if (berlin) gas.sstore_reset - gas.cold_sload_2929 else gas.sstore_reset;
+        // EIP-3529 (London): clearing a slot refunds only what it saves.
+        const clear_refund: i64 = if (self.block.fork.atLeast(.london)) gas.sstore_clear_refund_3529 else gas.sstore_clear_refund;
 
         if (current == value) {
             // A write that changes nothing pays only for having looked.
@@ -1051,7 +1053,7 @@ fn sstore(self: *Interpreter) !void {
                 if (!self.chargeGas(gas.sstore_set)) return;
             } else {
                 if (!self.chargeGas(reset_cost)) return;
-                if (value == 0) self.refund += @intCast(gas.sstore_clear_refund);
+                if (value == 0) self.refund += clear_refund;
             }
         } else {
             // The slot has already been changed in this transaction, so the
@@ -1063,8 +1065,8 @@ fn sstore(self: *Interpreter) !void {
                 // if it is being filled again, and granted if it is being
                 // cleared now. This is the subtraction that lets a nested
                 // frame's counter go negative.
-                if (current == 0) self.refund -= @intCast(gas.sstore_clear_refund);
-                if (value == 0) self.refund += @intCast(gas.sstore_clear_refund);
+                if (current == 0) self.refund -= clear_refund;
+                if (value == 0) self.refund += clear_refund;
             }
             if (original == value) {
                 // Put back exactly as it was found, so the difference between
@@ -1528,8 +1530,13 @@ fn createOp(self: *Interpreter, kind: CreateKind) !void {
     // forfeiting all remaining gas rather than a graceful stop. No limit
     // at all before this fork.
     const oversized = self.block.fork.atLeast(.spurious_dragon) and child.return_data.len > max_code_size;
-    var success = child.status == .stopped and !oversized;
-    var status = if (oversized) .out_of_gas else child.status;
+    // EIP-3541 (London): new code may not start with 0xEF, reserving that
+    // byte for a future code format. Rejected the same way as oversized
+    // code, as an exceptional halt.
+    const ef_prefixed = self.block.fork.atLeast(.london) and child.return_data.len > 0 and child.return_data[0] == 0xef;
+    const rejected = oversized or ef_prefixed;
+    var success = child.status == .stopped and !rejected;
+    var status = if (rejected) .out_of_gas else child.status;
     var deployed_code: []const u8 = child.return_data;
     if (success) {
         const deposit_cost = gas.code_deposit_byte * @as(u64, child.return_data.len);
@@ -1670,7 +1677,8 @@ fn selfdestruct(self: *Interpreter) !void {
     // every repeat.
     const already_marked = state.isPendingDestruction(self.address);
     try state.destroyAccount(self.address);
-    if (!already_marked) self.refund += @intCast(gas.selfdestruct_refund);
+    // EIP-3529 (London) removed this refund outright.
+    if (!already_marked and !self.block.fork.atLeast(.london)) self.refund += @intCast(gas.selfdestruct_refund);
     self.status = .stopped;
 }
 
@@ -5084,4 +5092,29 @@ test "EIP-2929: SLOAD and BALANCE are cold the first time and warm after" {
     try interp2.run();
     try std.testing.expectEqual(Status.stopped, interp2.status);
     try std.testing.expectEqual(@as(u64, (3 + 2600 + 2) + (3 + 100 + 2)), 100_000 - interp2.gas_remaining);
+}
+
+test "EIP-3529: clearing a slot refunds 4800 and SELFDESTRUCT refunds nothing from London on" {
+    var r = try runSstoreSequence(.london, 5, &.{0});
+    try std.testing.expectEqual(@as(u64, 5000), r.spent);
+    try std.testing.expectEqual(@as(i64, 4800), r.refund);
+    // The restore refunds are untouched by EIP-3529.
+    r = try runSstoreSequence(.london, 5, &.{ 7, 5 });
+    try std.testing.expectEqual(@as(i64, 2800), r.refund);
+
+    // PUSH1 0xbb, SELFDESTRUCT.
+    const code = [_]u8{ @intFromEnum(OpCode.PUSH1), 0xbb, @intFromEnum(OpCode.SELFDESTRUCT) };
+    for ([_]Fork{ .berlin, .london }) |fork| {
+        var state = State.init(std.testing.allocator);
+        defer state.deinit();
+        var interp = try Interpreter.initCall(std.testing.allocator, &code, 100_000, .{
+            .address = 0xaa,
+            .state = &state,
+            .block = .{ .fork = fork },
+        });
+        defer interp.deinit();
+        try interp.run();
+        try std.testing.expectEqual(Status.stopped, interp.status);
+        try std.testing.expectEqual(@as(i64, if (fork == .london) 0 else 24000), interp.refund);
+    }
 }

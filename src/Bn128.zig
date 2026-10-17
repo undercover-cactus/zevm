@@ -53,9 +53,41 @@ pub const Fq = struct {
         return .{ .n = field_modulus - (b.n - a.n) };
     }
 
+    /// `a * b mod p`, by two Montgomery reductions rather than a `%`.
+    ///
+    /// `%` on a 512-bit product has no hardware instruction behind it and
+    /// compiles to a software long division, which was the floor under every
+    /// operation in this file. `redc(t)` instead computes `t / R mod p`
+    /// (`R = 2^256`) with multiplications and a shift. Applying it to `a * b`
+    /// gives `a * b / R`; applying it again to that times `R^2 mod p` cancels
+    /// the stray `1 / R`. So the result, and every `Fq` anywhere, stays in
+    /// plain (non-Montgomery) form.
     pub fn mul(a: Fq, b: Fq) Fq {
-        const wide: u512 = @as(u512, a.n) * @as(u512, b.n);
-        return .{ .n = @intCast(wide % field_modulus) };
+        const x = redc(@as(u512, a.n) * b.n);
+        return .{ .n = redc(@as(u512, x) * mont_r2) };
+    }
+
+    /// `-p^-1 mod 2^256`. Newton's iteration doubles the number of correct
+    /// low bits each round, starting from 1 (correct mod 2, since `p` is
+    /// odd), so eight rounds reach 256.
+    const mont_n_prime: u256 = blk: {
+        var x: u256 = 1;
+        for (0..8) |_| x *%= 2 -% field_modulus *% x;
+        break :blk 0 -% x;
+    };
+    /// `R^2 mod p`.
+    const mont_r2: u256 = @intCast((@as(u1024, 1) << 512) % field_modulus);
+
+    /// Montgomery reduction: `t * R^-1 mod p`, for any `t < p * R`. `m` is
+    /// chosen so `t + m * p` is a multiple of `R`, which makes the division
+    /// by `R` an exact shift. The sum stays under `2 * p * R < 2^511`, and
+    /// the quotient under `2p`, so one conditional subtraction finishes it.
+    fn redc(t: u512) u256 {
+        const m: u256 = @as(u256, @truncate(t)) *% mont_n_prime;
+        const sum = t + @as(u512, m) * field_modulus;
+        var r: u256 = @intCast(sum >> 256);
+        if (r >= field_modulus) r -= field_modulus;
+        return r;
     }
 
     pub fn neg(a: Fq) Fq {
@@ -192,10 +224,19 @@ pub fn Fqp(comptime degree: usize, comptime modulus_coeffs: [degree]i64) type {
             return .{ .coeffs = out };
         }
 
+        pub fn mul(a: Self, b: Self) Self {
+            if (comptime is_bn254_fq12) return .{ .coeffs = tower.mul12(a.coeffs, b.coeffs) };
+            return a.mulSchoolbook(b);
+        }
+
+        /// This file's `Fq12`, whose modulus is what `tower` is built on.
+        const is_bn254_fq12 = degree == 12 and std.mem.eql(i64, &modulus_coeffs, &.{ 82, 0, 0, 0, 0, 0, -18, 0, 0, 0, 0, 0 });
+
         /// Full polynomial multiplication followed by reduction mod the
         /// extension's modulus polynomial, exactly mirroring `FQP.__mul__`'s
-        /// `else` branch (the "other is also an FQP" case).
-        pub fn mul(a: Self, b: Self) Self {
+        /// `else` branch (the "other is also an FQP" case). What `mul` does
+        /// for `Fq2`, and the reference `tower.mul12` is tested against.
+        pub fn mulSchoolbook(a: Self, b: Self) Self {
             var wide: [2 * degree - 1]Fq = undefined;
             for (&wide) |*c| c.* = Fq.zero;
             for (0..degree) |i| {
@@ -248,6 +289,9 @@ pub fn Fqp(comptime degree: usize, comptime modulus_coeffs: [degree]i64) type {
             var temp: [degree + 1]Fq = undefined;
             @memcpy(temp[0..a.len], a);
             for (out) |*o| o.* = Fq.zero;
+            // Python's `range(dega - degb, -1, -1)` is simply empty when the
+            // divisor has the higher degree; here the subtraction would wrap.
+            if (dega < degb) return;
             var i = dega - degb;
             while (true) : (i -= 1) {
                 out[i] = out[i].add(temp[degb + i].div(b[degb]));
@@ -269,6 +313,7 @@ pub fn Fqp(comptime degree: usize, comptime modulus_coeffs: [degree]i64) type {
         /// and a pile of polynomial bookkeeping; `Fq2` inversions are hot
         /// enough in G2 arithmetic to be worth the special case.
         pub fn inv(a: Self) Self {
+            if (comptime is_bn254_fq12) return .{ .coeffs = tower.inv12(a.coeffs) };
             if (comptime degree == 2 and modulus_coeffs[1] == 0) {
                 const norm = a.coeffs[0].mul(a.coeffs[0])
                     .add(mod_coeffs[0].mul(a.coeffs[1].mul(a.coeffs[1])));
@@ -337,6 +382,123 @@ pub fn Fqp(comptime degree: usize, comptime modulus_coeffs: [degree]i64) type {
         }
     };
 }
+
+/// `Fq12` arithmetic done as the tower `Fq2 -> Fq6 -> Fq12` it really is,
+/// for `Fqp(12, ...)`'s `mul` and `inv`. The flat representation everything
+/// else uses is converted in and out at the edges, which costs additions only.
+///
+/// The flat modulus `w^12 - 18w^6 + 82` hides the tower: put `u = w^6 - 9` and
+/// it becomes `u^2 = -1`. So with `xi = 9 + u = w^6`:
+///
+///     Fq2  = Fq[u]  / (u^2 + 1)
+///     Fq6  = Fq2[v] / (v^3 - xi)     where v = w^2
+///     Fq12 = Fq6[w] / (w^2 - v)
+///
+/// and a flat element `sum c_k w^k` is `sum_{k<6} d_k w^k` with
+/// `d_k = c_k + c_{k+6} * xi`, which in turn is `g + h w` for the `Fq6`
+/// elements `g = (d0, d2, d4)` and `h = (d1, d3, d5)`.
+///
+/// Karatsuba at every level makes a multiplication 3 * 6 * 3 = 54 `Fq`
+/// multiplications against the flat schoolbook's 144 plus reduction, and an
+/// inversion becomes conjugate-and-norm down to a single `Fq` inversion
+/// instead of a polynomial Euclid that performs several.
+const tower = struct {
+    const T2 = struct { a: Fq, b: Fq }; // a + b u
+    const T6 = [3]T2; // c0 + c1 v + c2 v^2
+    const T12 = struct { g: T6, h: T6 }; // g + h w
+
+    fn add2(x: T2, y: T2) T2 {
+        return .{ .a = x.a.add(y.a), .b = x.b.add(y.b) };
+    }
+    fn sub2(x: T2, y: T2) T2 {
+        return .{ .a = x.a.sub(y.a), .b = x.b.sub(y.b) };
+    }
+    fn neg2(x: T2) T2 {
+        return .{ .a = x.a.neg(), .b = x.b.neg() };
+    }
+    /// Karatsuba: three multiplications rather than four.
+    fn mul2(x: T2, y: T2) T2 {
+        const ac = x.a.mul(y.a);
+        const bd = x.b.mul(y.b);
+        const cross = x.a.add(x.b).mul(y.a.add(y.b));
+        return .{ .a = ac.sub(bd), .b = cross.sub(ac).sub(bd) };
+    }
+    fn times9(x: Fq) Fq {
+        const x2 = x.add(x);
+        const x8 = x2.add(x2).add(x2.add(x2));
+        return x8.add(x);
+    }
+    /// Multiplication by `xi = 9 + u`: `(a + bu)(9 + u) = (9a - b) + (a + 9b)u`.
+    fn mulXi(x: T2) T2 {
+        return .{ .a = times9(x.a).sub(x.b), .b = x.a.add(times9(x.b)) };
+    }
+    fn inv2(x: T2) T2 {
+        const norm_inv = x.a.mul(x.a).add(x.b.mul(x.b)).inv();
+        return .{ .a = x.a.mul(norm_inv), .b = x.b.neg().mul(norm_inv) };
+    }
+
+    fn add6(x: T6, y: T6) T6 {
+        return .{ add2(x[0], y[0]), add2(x[1], y[1]), add2(x[2], y[2]) };
+    }
+    fn sub6(x: T6, y: T6) T6 {
+        return .{ sub2(x[0], y[0]), sub2(x[1], y[1]), sub2(x[2], y[2]) };
+    }
+    /// Karatsuba over three terms: six `Fq2` multiplications rather than nine.
+    fn mul6(x: T6, y: T6) T6 {
+        const t0 = mul2(x[0], y[0]);
+        const t1 = mul2(x[1], y[1]);
+        const t2 = mul2(x[2], y[2]);
+        const c0 = add2(t0, mulXi(sub2(sub2(mul2(add2(x[1], x[2]), add2(y[1], y[2])), t1), t2)));
+        const c1 = add2(sub2(sub2(mul2(add2(x[0], x[1]), add2(y[0], y[1])), t0), t1), mulXi(t2));
+        const c2 = add2(sub2(sub2(mul2(add2(x[0], x[2]), add2(y[0], y[2])), t0), t2), t1);
+        return .{ c0, c1, c2 };
+    }
+    /// `x * v`, which only shifts coefficients (and wraps one through `xi`).
+    fn mulV(x: T6) T6 {
+        return .{ mulXi(x[2]), x[0], x[1] };
+    }
+    fn inv6(x: T6) T6 {
+        const c0 = sub2(mul2(x[0], x[0]), mulXi(mul2(x[1], x[2])));
+        const c1 = sub2(mulXi(mul2(x[2], x[2])), mul2(x[0], x[1]));
+        const c2 = sub2(mul2(x[1], x[1]), mul2(x[0], x[2]));
+        const norm = add2(mul2(x[0], c0), mulXi(add2(mul2(x[2], c1), mul2(x[1], c2))));
+        const n = inv2(norm);
+        return .{ mul2(c0, n), mul2(c1, n), mul2(c2, n) };
+    }
+
+    fn fromFlat(c: [12]Fq) T12 {
+        var d: [6]T2 = undefined;
+        // c_k + c_{k+6} (9 + u)
+        for (0..6) |k| d[k] = .{ .a = c[k].add(times9(c[k + 6])), .b = c[k + 6] };
+        return .{ .g = .{ d[0], d[2], d[4] }, .h = .{ d[1], d[3], d[5] } };
+    }
+    fn toFlat(x: T12) [12]Fq {
+        const d = [6]T2{ x.g[0], x.h[0], x.g[1], x.h[1], x.g[2], x.h[2] };
+        var c: [12]Fq = undefined;
+        for (0..6) |k| {
+            c[k + 6] = d[k].b;
+            c[k] = d[k].a.sub(times9(d[k].b));
+        }
+        return c;
+    }
+
+    /// `(g0 + h0 w)(g1 + h1 w) = (g0 g1 + h0 h1 v) + ((g0 + h0)(g1 + h1) - g0 g1 - h0 h1) w`
+    fn mul12(a: [12]Fq, b: [12]Fq) [12]Fq {
+        const x = fromFlat(a);
+        const y = fromFlat(b);
+        const t0 = mul6(x.g, y.g);
+        const t1 = mul6(x.h, y.h);
+        const cross = sub6(sub6(mul6(add6(x.g, x.h), add6(y.g, y.h)), t0), t1);
+        return toFlat(.{ .g = add6(t0, mulV(t1)), .h = cross });
+    }
+    /// `(g + h w)^-1 = (g - h w) / (g^2 - h^2 v)`.
+    fn inv12(a: [12]Fq) [12]Fq {
+        const x = fromFlat(a);
+        const n = inv6(sub6(mul6(x.g, x.g), mulV(mul6(x.h, x.h))));
+        const zero6: T6 = .{ .{ .a = Fq.zero, .b = Fq.zero }, .{ .a = Fq.zero, .b = Fq.zero }, .{ .a = Fq.zero, .b = Fq.zero } };
+        return toFlat(.{ .g = mul6(x.g, n), .h = mul6(sub6(zero6, x.h), n) });
+    }
+};
 
 pub const Fq2 = Fqp(2, .{ 1, 0 });
 pub const Fq12 = Fqp(12, .{ 82, 0, 0, 0, 0, 0, -18, 0, 0, 0, 0, 0 });
@@ -457,16 +619,98 @@ pub fn add(comptime F: type, p1: ?AffinePoint(F), p2: ?AffinePoint(F)) ?AffinePo
     return .{ .x = newx, .y = newy };
 }
 
-/// `n` is reduced by nothing (matches Python: `multiply` recurses on the
-/// literal integer `n`, which can be any non-negative value, not
-/// necessarily `< curve_order` — a scalar `>= curve_order` is legal EVM
-/// input for `ECMUL`, just wraps around group-theoretically).
+/// `n * pt`, by double-and-add in Jacobian coordinates.
+///
+/// Affine doubling and addition each divide by a line's slope, so every one
+/// of up to 256 steps paid a field inversion; for `Fq2` that was most of the
+/// G2 subgroup check. A Jacobian point `(X, Y, Z)` stands for
+/// `(X / Z^2, Y / Z^3)` and carries the denominator instead of dividing by
+/// it, so the steps are multiplications only and the single inversion comes
+/// at the end, to get back to affine. Infinity is `Z = 0`, so the subgroup
+/// check (`n = curve_order`, expected infinity) never inverts at all.
+///
+/// `n` is reduced by nothing: a scalar `>= curve_order` is legal EVM input
+/// for `ECMUL` and just wraps around group-theoretically, as in the Python
+/// reference (`multiplyAffine`, which this is tested against).
 pub fn multiply(comptime F: type, pt: ?AffinePoint(F), n: u256) ?AffinePoint(F) {
+    const p = pt orelse return null;
+    var acc: Jacobian(F) = .infinity;
+    var bit: u9 = 256 - @as(u9, @clz(n));
+    while (bit > 0) {
+        bit -= 1;
+        acc = jacobianDouble(F, acc);
+        if ((n >> @intCast(bit)) & 1 == 1) acc = jacobianAddAffine(F, acc, p);
+    }
+    if (acc.z.eq(F.zero)) return null;
+    const z_inv = acc.z.inv();
+    const z_inv2 = z_inv.mul(z_inv);
+    return .{ .x = acc.x.mul(z_inv2), .y = acc.y.mul(z_inv2).mul(z_inv) };
+}
+
+/// A point `(x / z^2, y / z^3)`; `z = 0` is the point at infinity.
+fn Jacobian(comptime F: type) type {
+    return struct {
+        x: F,
+        y: F,
+        z: F,
+        const infinity: @This() = .{ .x = F.one, .y = F.one, .z = F.zero };
+    };
+}
+
+/// "dbl-2009-l" from the Explicit-Formulas Database, for curves with `a = 0`
+/// (both of ours: `y^2 = x^3 + b`). Doubling infinity yields `z = 0` again,
+/// and so does doubling a point with `y = 0`, which is correct for both.
+fn jacobianDouble(comptime F: type, p: Jacobian(F)) Jacobian(F) {
+    const a = p.x.mul(p.x);
+    const b = p.y.mul(p.y);
+    const c = b.mul(b);
+    const xb = p.x.add(b);
+    var d = xb.mul(xb).sub(a).sub(c);
+    d = d.add(d);
+    const e = a.add(a).add(a);
+    const x3 = e.mul(e).sub(d).sub(d);
+    const c2 = c.add(c);
+    const c4 = c2.add(c2);
+    const y3 = e.mul(d.sub(x3)).sub(c4.add(c4));
+    const yz = p.y.mul(p.z);
+    return .{ .x = x3, .y = y3, .z = yz.add(yz) };
+}
+
+/// "madd-2007-bl": Jacobian `p` plus affine `q`. The two degenerate cases
+/// the formula cannot express, `q == p` and `q == -p`, are told apart by
+/// whether the `y`s agree once the `x`s do, as the affine `add` does.
+fn jacobianAddAffine(comptime F: type, p: Jacobian(F), q: AffinePoint(F)) Jacobian(F) {
+    if (p.z.eq(F.zero)) return .{ .x = q.x, .y = q.y, .z = F.one };
+    const z1z1 = p.z.mul(p.z);
+    const qx_scaled = q.x.mul(z1z1);
+    const s2 = q.y.mul(p.z).mul(z1z1);
+    const h = qx_scaled.sub(p.x);
+    var r = s2.sub(p.y);
+    if (h.eq(F.zero)) {
+        if (r.eq(F.zero)) return jacobianDouble(F, p);
+        return .infinity;
+    }
+    r = r.add(r);
+    const hh = h.mul(h);
+    const hh2 = hh.add(hh);
+    const i = hh2.add(hh2);
+    const j = h.mul(i);
+    const v = p.x.mul(i);
+    const x3 = r.mul(r).sub(j).sub(v).sub(v);
+    const y1j = p.y.mul(j);
+    const y3 = r.mul(v.sub(x3)).sub(y1j).sub(y1j);
+    const zh = p.z.add(h);
+    return .{ .x = x3, .y = y3, .z = zh.mul(zh).sub(z1z1).sub(hh) };
+}
+
+/// The Python reference's recursive affine `multiply`, verbatim. Kept as
+/// the oracle `multiply` is tested against.
+fn multiplyAffine(comptime F: type, pt: ?AffinePoint(F), n: u256) ?AffinePoint(F) {
     if (n == 0) return null;
     const p = pt orelse return null;
     if (n == 1) return p;
-    if (n % 2 == 0) return multiply(F, double(F, p), n / 2);
-    return add(F, multiply(F, double(F, p), n / 2), p);
+    if (n % 2 == 0) return multiplyAffine(F, double(F, p), n / 2);
+    return add(F, multiplyAffine(F, double(F, p), n / 2), p);
 }
 
 fn neg(comptime F: type, pt: ?AffinePoint(F)) ?AffinePoint(F) {
@@ -556,7 +800,94 @@ fn millerLoopRaw(q: ?G12Point, p: ?G12Point) Fq12 {
 /// `e(a,b) * e(c,d) == (ML(a,b) * ML(c,d))^exponent`, a caller can
 /// accumulate these across pairs and exponentiate the product once.
 pub fn millerLoop(q: ?G2Point, p: ?G1Point) Fq12 {
-    return millerLoopRaw(twist(q), castPointToFq12(p));
+    const qq = q orelse return Fq12.one;
+    const pp = p orelse return Fq12.one;
+    return millerLoopFq2(qq, pp);
+}
+
+/// `millerLoopRaw`'s loop with `Q` kept in `G2` over `Fq2` rather than
+/// twisted into `Fq12`, producing the very same `Fq12` value.
+///
+/// The twisted point is `(x w^2, y w^3)` for `Q = (x, y)`, so every slope the
+/// reference divides out in `Fq12` is `lambda * w` for the `lambda` of the
+/// same step over `Fq2`, and the twist commutes with doubling and adding.
+/// Point arithmetic and slopes therefore stay in `Fq2`, where an inversion is
+/// a single `Fq` inversion; the reference performed three `Fq12` inversions
+/// per round (one each in `linefunc`, `double` and `add`), which were about
+/// two thirds of a pairing once multiplication was cheap. Only squaring `f`
+/// and multiplying in each line still happen in `Fq12`.
+fn millerLoopFq2(q: G2Point, p: G1Point) Fq12 {
+    var r = q;
+    var f = Fq12.one;
+    var i: i16 = log_ate_loop_count;
+    while (i >= 0) : (i -= 1) {
+        f = f.mul(f).mul(lineAt(r, r, p));
+        r = double(Fq2, r);
+        if (ate_loop_count & (@as(u256, 1) << @intCast(i)) != 0) {
+            f = f.mul(lineAt(r, q, p));
+            r = add(Fq2, r, q).?;
+        }
+    }
+    const q1 = frobeniusG2(q);
+    const nq2 = neg(Fq2, frobeniusG2(q1)).?;
+    f = f.mul(lineAt(r, q1, p));
+    r = add(Fq2, r, q1).?;
+    f = f.mul(lineAt(r, nq2, p));
+    return f;
+}
+
+/// `linefunc(twist(r), twist(s), castPointToFq12(p))`: the line through `r`
+/// and `s` (the tangent if they are equal) evaluated at `p`, built directly.
+/// With the twisted `x1 = xr w^2`, `y1 = yr w^3` and slope `lambda w`, the
+/// reference's `m (xt - x1) - (yt - y1)` expands to
+///
+///     -yp + (lambda xp) w + (yr - lambda xr) w^3
+///
+/// and the vertical line `xt - x1` to `xp - xr w^2`.
+fn lineAt(r: G2Point, s: G2Point, p: G1Point) Fq12 {
+    var c: [12]Fq = .{Fq.zero} ** 12;
+    if (r.x.eq(s.x) and !r.y.eq(s.y)) {
+        c[0] = p.x;
+        placeFq2(&c, 2, r.x.neg());
+        return .{ .coeffs = c };
+    }
+    const lambda = if (r.x.eq(s.x))
+        r.x.mul(r.x).mulScalar(Fq.init(3)).div(r.y.mulScalar(Fq.init(2)))
+    else
+        s.y.sub(r.y).div(s.x.sub(r.x));
+    c[0] = p.y.neg();
+    placeFq2(&c, 1, lambda.mulScalar(p.x));
+    placeFq2(&c, 3, r.y.sub(lambda.mul(r.x)));
+    return .{ .coeffs = c };
+}
+
+/// Adds `b * w^k` into the flat coefficients `c`, for `b` in `Fq2`. `twist`
+/// embeds `Fq2` through `i = w^6 - 9`, so `(b0 + b1 i) w^k` is
+/// `(b0 - 9 b1) w^k + b1 w^(k+6)`.
+fn placeFq2(c: *[12]Fq, k: usize, b: Fq2) void {
+    c[k] = c[k].add(b.coeffs[0].sub(tower.times9(b.coeffs[1])));
+    c[k + 6] = c[k + 6].add(b.coeffs[1]);
+}
+
+/// The `G2` point whose twist is the Frobenius image of `twist(q)`, which is
+/// what the reference's `q1`/`nq2` are. Computed by going through the twist
+/// and back rather than with hand-derived constants, so it agrees with the
+/// reference by construction; it runs twice per pairing, not per round.
+fn frobeniusG2(q: G2Point) G2Point {
+    const t = twist(q).?;
+    const w2 = w.mul(w);
+    return .{
+        .x = fromSubfield(frobenius(t.x).mul(w2.inv())),
+        .y = fromSubfield(frobenius(t.y).mul(w2.mul(w).inv())),
+    };
+}
+
+/// The inverse of `twist`'s embedding of `Fq2`: an `Fq12` element that lies
+/// in that subfield has only its `w^0` and `w^6` coefficients set, and
+/// `c0 + c6 w^6 = (c0 + 9 c6) + c6 i`.
+fn fromSubfield(e: Fq12) Fq2 {
+    for (e.coeffs, 0..) |coeff, k| std.debug.assert(k == 0 or k == 6 or coeff.eq(Fq.zero));
+    return .{ .coeffs = .{ e.coeffs[0].add(tower.times9(e.coeffs[6])), e.coeffs[6] } };
 }
 
 /// `e(Q, P)`, the optimal ate pairing of a `G2` point and a `G1` point.
@@ -694,4 +1025,86 @@ test "the direct Fq2 inverse agrees with the generic polynomial Euclid" {
     try std.testing.expect(real.inv().eq(real.invGeneric()));
     try std.testing.expect(imag.inv().eq(imag.invGeneric()));
     try std.testing.expect(Fq2.one.inv().eq(Fq2.one));
+}
+
+test "Montgomery Fq.mul agrees with a plain 512-bit remainder" {
+    // The reference is the exact expression `mul` used to be.
+    var prng: std.Random.DefaultPrng = .init(0x6d6f6e74);
+    const rand = prng.random();
+    for (0..2000) |_| {
+        const a = Fq.init(rand.int(u256));
+        const b = Fq.init(rand.int(u256));
+        const expected: u256 = @intCast((@as(u512, a.n) * b.n) % field_modulus);
+        try std.testing.expectEqual(expected, a.mul(b).n);
+    }
+    // Edges: zero, one, the largest element, and squaring it (the largest
+    // possible product, which is what bounds `redc`'s input).
+    const edges = [_]u256{ 0, 1, 2, field_modulus - 1, field_modulus - 2 };
+    for (edges) |x| for (edges) |y| {
+        const expected: u256 = @intCast((@as(u512, x) * y) % field_modulus);
+        try std.testing.expectEqual(expected, (Fq{ .n = x }).mul(.{ .n = y }).n);
+    };
+}
+
+test "the Fq12 tower multiplies and inverts exactly like the flat reference" {
+    var prng: std.Random.DefaultPrng = .init(0x746f7765);
+    const rand = prng.random();
+    for (0..64) |_| {
+        var ca: [12]Fq = undefined;
+        var cb: [12]Fq = undefined;
+        for (&ca, &cb) |*x, *y| {
+            x.* = Fq.init(rand.int(u256));
+            y.* = Fq.init(rand.int(u256));
+        }
+        const a: Fq12 = .{ .coeffs = ca };
+        const b: Fq12 = .{ .coeffs = cb };
+        try std.testing.expect(a.mul(b).eq(a.mulSchoolbook(b)));
+        try std.testing.expect(a.inv().eq(a.invGeneric()));
+        try std.testing.expect(a.mul(a.inv()).eq(Fq12.one));
+    }
+    // Structured values: the identity, and the tower's own generators
+    // (w, and w^6 = xi) where the flat <-> tower conversion does real work.
+    var w6_coeffs: [12]i64 = .{0} ** 12;
+    w6_coeffs[6] = 1;
+    const w6 = Fq12.initInts(w6_coeffs);
+    for ([_]Fq12{ Fq12.one, w, w6, w.mulSchoolbook(w6) }) |x| {
+        try std.testing.expect(x.mul(x).eq(x.mulSchoolbook(x)));
+        try std.testing.expect(x.inv().eq(x.invGeneric()));
+    }
+    try std.testing.expect(Fq12.zero.inv().eq(Fq12.zero.invGeneric()));
+}
+
+test "Jacobian multiply agrees with the affine reference on G1 and G2" {
+    var prng: std.Random.DefaultPrng = .init(0x6a61636f);
+    const rand = prng.random();
+    const fixed = [_]u256{ 0, 1, 2, 3, curve_order - 1, curve_order, curve_order + 1, std.math.maxInt(u256) };
+    var scalars: [8 + 24]u256 = undefined;
+    @memcpy(scalars[0..8], &fixed);
+    for (scalars[8..]) |*n| n.* = rand.int(u256);
+    for (scalars) |n| {
+        try std.testing.expectEqual(multiplyAffine(Fq, g1, n), multiply(Fq, g1, n));
+        const j2 = multiply(Fq2, g2, n);
+        const a2 = multiplyAffine(Fq2, g2, n);
+        try std.testing.expectEqual(a2 == null, j2 == null);
+        if (a2) |a| try std.testing.expect(a.x.eq(j2.?.x) and a.y.eq(j2.?.y));
+    }
+    // A point plus its own negation lands on infinity mid-computation, the
+    // case the addition formula has to special-case.
+    const p = multiply(Fq, g1, 5).?;
+    try std.testing.expectEqual(@as(?G1Point, null), add(Fq, p, neg(Fq, p)));
+    try std.testing.expectEqual(@as(?G1Point, null), multiply(Fq, g1, curve_order));
+}
+
+test "the Fq2 Miller loop computes exactly the reference's Fq12 value" {
+    // Exact equality before the final exponentiation, not just after it:
+    // both loops are meant to produce the same field element.
+    const ps = [_]u256{ 1, 2, 7, 1234567, curve_order - 1 };
+    const qs = [_]u256{ 1, 3, 11, 7654321, curve_order - 2 };
+    for (ps) |a| for (qs) |b| {
+        const p = multiply(Fq, g1, a).?;
+        const q = multiply(Fq2, g2, b).?;
+        try std.testing.expect(millerLoop(q, p).eq(millerLoopRaw(twist(q), castPointToFq12(p))));
+    };
+    try std.testing.expect(millerLoop(null, g1).eq(Fq12.one));
+    try std.testing.expect(millerLoop(g2, null).eq(Fq12.one));
 }

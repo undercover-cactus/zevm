@@ -1,6 +1,6 @@
-//! A decoded Ethereum transaction: Legacy, or EIP-2930's access-list type
-//! (type 1, Berlin). EIP-1559 fee markets, EIP-4844 blobs and EIP-7702
-//! authorizations are not supported.
+//! A decoded Ethereum transaction: Legacy, EIP-2930's access-list type
+//! (type 1, Berlin) or EIP-1559's fee-market type (type 2, London). EIP-4844
+//! blobs and EIP-7702 authorizations are not supported.
 
 const Address = @import("Address.zig").Address;
 
@@ -13,6 +13,9 @@ pub const AccessListEntry = struct {
 
 pub const Transaction = struct {
     nonce: u64,
+    /// For an EIP-1559 transaction this is `max_fee_per_gas`, the most it
+    /// will pay per gas in total; what it actually pays depends on the
+    /// block's base fee (see `Evm.executeTransaction`).
     gas_price: u256,
     gas_limit: u64,
     /// `null` means this transaction creates a contract, and `data` is its init code.
@@ -32,4 +35,8 @@ pub const Transaction = struct {
     chain_id: ?u256 = null,
     /// EIP-2930. Empty for Legacy transactions.
     access_list: []const AccessListEntry = &.{},
+    /// EIP-1559's `max_priority_fee_per_gas`, the most the miner may get
+    /// per gas on top of the base fee. Null for every other type, which
+    /// pays `gas_price` outright.
+    max_priority_fee: ?u256 = null,
 };

@@ -668,11 +668,12 @@ fn bn128PairingOutput(allocator: std.mem.Allocator, input: []const u8) ![]const 
         const p = try decodeG1Checked(input, i);
         const q = try decodeG2Checked(input, i + 64);
         // Subgroup check: both points must be in the curve_order-torsion
-        // subgroup. Trivially true for every valid G1 point (G1's own order
-        // equals curve_order), but real G2 points off the twist's larger
-        // curve can fail this, so it's checked uniformly for both, matching
-        // the spec exactly.
-        if (bn128.multiply(bn128.Fq, p, bn128.curve_order) != null) return error.InvalidPoint;
+        // subgroup. Only G2's can fail. G1 is the whole curve
+        // `y^2 = x^3 + 3` over Fq, which has exactly `curve_order` points,
+        // so any point `decodeG1Checked` accepted is already in it and
+        // multiplying by `curve_order` always lands on infinity. That check
+        // was 254 doublings per pair that could only ever say yes. The
+        // twist G2 lives on has more points than that, so its check is real.
         if (bn128.multiply(bn128.Fq2, q, bn128.curve_order) != null) return error.InvalidPoint;
         accumulated = accumulated.mul(bn128.millerLoop(q, p));
     }

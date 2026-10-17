@@ -96,6 +96,14 @@ pub const sstore_clear_refund: u64 = 15000;
 /// A transaction's total refund can never exceed this fraction of its raw
 /// gas used, preventing gas-usage inflation just to farm refunds.
 pub const max_refund_denominator: u64 = 2;
+/// EIP-3529 (London) cut refunds hard, because they paid for "gas tokens"
+/// that bought cheap storage now to sell it back at peak prices, bloating
+/// state for no other purpose. The cap tightens from a half to a fifth, the
+/// slot-clearing refund drops to what a clear actually saves
+/// (`sstore_reset - cold_sload + access_list_storage_key`), and
+/// `SELFDESTRUCT` stops refunding anything at all.
+pub const max_refund_denominator_3529: u64 = 5;
+pub const sstore_clear_refund_3529: u64 = 4800;
 
 /// EIP-2200 (Istanbul). An `SSTORE` must have more than this left before it
 /// starts, which is what makes the 2300-gas stipend a hard floor: a callee
