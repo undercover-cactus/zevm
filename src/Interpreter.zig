@@ -287,6 +287,10 @@ const debug_is_new_account_caller: Address = 0xe53c52acf5f396d978e84ab48f16c13fb
 // the hunt it was built for was long over. `debug_trace_enabled` needs the
 // count too, so either flag turns it back on.
 const debug_step_limit_enabled = false;
+/// Whether anything reads `debug_total_step_count`, so callers can skip
+/// resetting it: with prewarm threads running transactions alongside the
+/// replay, an unconditional write to a shared global is a data race.
+pub const counts_steps = debug_step_limit_enabled or debug_trace_enabled;
 pub var debug_total_step_count: u64 = 0;
 const debug_total_step_limit: u64 = 20_000_000;
 

@@ -331,8 +331,15 @@ fn ecrecoverOutput(allocator: std.mem.Allocator, input: []const u8) ![]const u8 
 
 /// A libsecp256k1 context, created once and reused: context creation isn't
 /// free, and recreating it every `ECRECOVER` call would itself be a
-/// hot-path cost. Not thread-safe, matching the rest of this codebase.
+/// hot-path cost. Created lazily, which is not thread-safe: anything running
+/// precompiles on several threads at once calls `initSecp` first, after which
+/// the context is only ever read, which libsecp256k1 allows concurrently.
 var cached_secp: ?secp256k1.Secp256k1 = null;
+
+/// Creates the shared secp256k1 context now rather than on first use.
+pub fn initSecp() void {
+    _ = secp();
+}
 
 fn secp() secp256k1.Secp256k1 {
     if (cached_secp) |s| return s;

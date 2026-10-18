@@ -307,6 +307,75 @@ fn recoverSenders(secp: Secp256k1, items: []const zevm.Rlp.Item, senders: []zevm
     for (failures[0..spawned]) |failure| if (failure) |err| return err;
 }
 
+/// What the prewarm threads read for one era1 file: the decoded file the
+/// pre-pass already produced, plus the real state's snapshot, which is never
+/// written after load and so can be shared read-only.
+const Prewarm = struct {
+    base: zevm.State.Base,
+    snapshot_bytes: ?[]const u8,
+    headers: []const DecodedHeader,
+    /// Block `b`'s transactions are `tx_items[block_start[b]..block_start[b + 1]]`.
+    block_start: []const usize,
+    tx_items: []const zevm.Rlp.Item,
+    senders: []const zevm.Address,
+    stop: std.atomic.Value(bool) = .init(false),
+};
+
+/// How many prewarm threads run alongside the replay. Their job is to have
+/// many state reads in flight at once, which a single executing thread
+/// cannot; eight keep the disk busy without crowding the replay off a core.
+const prewarm_threads = 8;
+
+/// Runs blocks `first`, `first + stride`, ... of the file on a throwaway state
+/// over the shared snapshot, purely so the snapshot pages those transactions
+/// read are in the page cache by the time the real replay reaches them.
+///
+/// Results are discarded, so nothing here can affect consensus. The throwaway
+/// state does not see what the real replay changed earlier in the chunk, so a
+/// transaction may now and then take a different path and warm a page the
+/// real one does not need; that only makes the prefetch less useful.
+fn prewarmWorker(p: *Prewarm, first: usize, stride: usize) void {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    var b = first;
+    while (b < p.headers.len) : (b += stride) {
+        if (p.stop.load(.monotonic)) return;
+        _ = arena.reset(.retain_capacity);
+        prewarmBlock(arena.allocator(), p, b) catch {};
+    }
+}
+
+fn prewarmBlock(allocator: std.mem.Allocator, p: *Prewarm, b: usize) !void {
+    const header = p.headers[b];
+    if (header.number == 0) return;
+    // A private overlay over the shared snapshot. Never deinit'd: the arena
+    // owns everything it allocates, and `base` belongs to the real state.
+    var state = zevm.State.init(allocator);
+    state.base = p.base;
+    state.snapshot_bytes = p.snapshot_bytes;
+    var evm = zevm.Evm{ .allocator = allocator, .state = &state };
+    evm.block = .{
+        .number = header.number,
+        .timestamp = header.timestamp,
+        .coinbase = header.miner,
+        .gas_limit = header.gas_limit,
+        .difficulty = header.difficulty,
+        .base_fee = header.base_fee,
+        .fork = zevm.Fork.at(header.number),
+    };
+    for (p.block_start[b]..p.block_start[b + 1]) |i| {
+        if (p.stop.load(.monotonic)) return;
+        const entry = parseTransaction(allocator, p.tx_items[i], p.senders[i]) catch continue;
+        // The real replay may have moved this sender's nonce and balance
+        // since the snapshot. The throwaway state is given whatever the
+        // transaction needs to get past those checks and actually run.
+        state.setNonce(entry.from, entry.tx.nonce) catch continue;
+        const upfront = @as(u256, entry.tx.gas_limit) * entry.tx.gas_price + entry.tx.value;
+        if (state.getBalance(entry.from) < upfront) state.setBalance(entry.from, upfront) catch continue;
+        _ = evm.executeTransaction(entry.tx, entry.from) catch {};
+    }
+}
+
 fn recoverSendersWorker(secp: Secp256k1, items: []const zevm.Rlp.Item, senders: []zevm.Address, failure: *?anyerror) void {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
@@ -805,21 +874,26 @@ pub fn main(io: std.Io, args: []const []const u8) anyerror!void {
         // released when the process exits, which is the same moment the
         // state is discarded anyway.
         //
-        // `MADV_WILLNEED` rather than `MADV_SEQUENTIAL`. Both the indexing
-        // pass and the replay read this file, but in opposite patterns: the
-        // index walk is strictly front to back, while account and storage
-        // reads afterwards are scattered. `SEQUENTIAL` serves the first and
-        // actively hurts the second, since it tells the kernel to drop pages
-        // once passed and every later read then faults them back one 4KB
-        // page at a time. Leaving no advice at all was worse still: a chunk
-        // that had been taking ~13 minutes spent 98 minutes at 20% CPU,
-        // waiting on single-page faults against a file too big for what was
-        // left of the page cache. `WILLNEED` asks for the whole thing up
-        // front, which is affordable precisely because these are file-backed
-        // pages the kernel may evict under pressure, unlike the anonymous
-        // copy this design replaced.
-        std.posix.madvise(dump.ptr, dump.len, std.posix.MADV.WILLNEED) catch {};
+        // The advice follows the two phases, because they read this file in
+        // opposite patterns. Indexing walks it strictly front to back, so it
+        // gets `SEQUENTIAL`: aggressive read-ahead, and pages dropped once
+        // passed, so the pass does not flood the page cache. The replay
+        // afterwards makes scattered single-page reads, so it gets `RANDOM`:
+        // fetch the page touched and nothing speculative around it.
+        //
+        // This used to be one `WILLNEED` over the whole file, chosen when the
+        // snapshot was ~20GB and could be cached entirely: reading it all in
+        // up front then meant every later read hit memory. At 97GB on a 62GB
+        // machine it cannot stay cached, so the same advice churned the
+        // cache, kept whatever was read last rather than what is hot, and
+        // pushed the heap (the account index included) out to swap; late
+        // London blocks spent 44% of their time waiting on disk, 12% of the
+        // faults inside that index. (Before `WILLNEED`, `SEQUENTIAL` had been
+        // left in force for the whole replay, which dropped every page right
+        // after use; switching advice between the phases avoids that too.)
+        std.posix.madvise(dump.ptr, dump.len, std.posix.MADV.SEQUENTIAL) catch {};
         const snapshot = try zevm.State.loadSnapshot(allocator, dump);
+        std.posix.madvise(dump.ptr, dump.len, std.posix.MADV.NORMAL) catch {};
         // Resuming restarts at the dumped block's *file*, not the block
         // itself, so a snapshot taken mid-file would have that file's earlier
         // blocks replayed a second time, silently double-applying their
@@ -930,23 +1004,30 @@ pub fn main(io: std.Io, args: []const []const u8) anyerror!void {
         // results in order. That loop decompresses and decodes each body a
         // second time, which costs a fraction of a percent; restructuring it
         // around a pre-decoded file would touch the dump/resume/root paths.
+        //
+        // The decoded file is kept until the file is done, rather than freed
+        // after recovery, because the prewarm threads below run its
+        // transactions too.
         const recover_start = std.Io.Clock.Timestamp.now(io, .awake);
         var senders: std.ArrayList(zevm.Address) = .empty;
         defer senders.deinit(allocator);
+        var bodies: std.ArrayList([]u8) = .empty;
+        defer {
+            for (bodies.items) |body| allocator.free(body);
+            bodies.deinit(allocator);
+        }
+        var decoded: std.ArrayList(zevm.Rlp.Item) = .empty;
+        defer {
+            for (decoded.items) |item| item.deinit(allocator);
+            decoded.deinit(allocator);
+        }
+        var tx_items: std.ArrayList(zevm.Rlp.Item) = .empty;
+        defer tx_items.deinit(allocator);
+        var file_headers: std.ArrayList(DecodedHeader) = .empty;
+        defer file_headers.deinit(allocator);
+        var block_start: std.ArrayList(usize) = .empty;
+        defer block_start.deinit(allocator);
         {
-            var bodies: std.ArrayList([]u8) = .empty;
-            defer {
-                for (bodies.items) |body| allocator.free(body);
-                bodies.deinit(allocator);
-            }
-            var decoded: std.ArrayList(zevm.Rlp.Item) = .empty;
-            defer {
-                for (decoded.items) |item| item.deinit(allocator);
-                decoded.deinit(allocator);
-            }
-            var tx_items: std.ArrayList(zevm.Rlp.Item) = .empty;
-            defer tx_items.deinit(allocator);
-
             var r = idx;
             while (r < records.len and std.mem.eql(u8, &records[r].kind, &record_type.compressed_header)) : (r += 4) {
                 try bodies.ensureUnusedCapacity(allocator, 1);
@@ -955,12 +1036,46 @@ pub fn main(io: std.Io, args: []const []const u8) anyerror!void {
                 bodies.appendAssumeCapacity(body);
                 const item = try zevm.Rlp.decode(allocator, body);
                 decoded.appendAssumeCapacity(item);
+                try block_start.append(allocator, tx_items.items.len);
                 try tx_items.appendSlice(allocator, item.list[0].list);
+                if (state.base != null) {
+                    const header_rlp = try Snappy.frameDecompress(allocator, records[r].data);
+                    defer allocator.free(header_rlp);
+                    const header_item = try zevm.Rlp.decode(allocator, header_rlp);
+                    defer header_item.deinit(allocator);
+                    try file_headers.append(allocator, decodeHeader(header_item));
+                }
             }
+            try block_start.append(allocator, tx_items.items.len);
             try senders.resize(allocator, tx_items.items.len);
             try recoverSenders(secp, tx_items.items, senders.items);
         }
         var next_sender: usize = 0;
+
+        // Prewarming: only a resumed state has a snapshot to warm. The
+        // `defer` that stops the threads is registered after the decoded
+        // file's own, so it runs first on every way out of this file,
+        // including the early `return` after a dump.
+        var prewarm: Prewarm = .{
+            .base = if (state.base) |b| b else undefined,
+            .snapshot_bytes = state.snapshot_bytes,
+            .headers = file_headers.items,
+            .block_start = block_start.items,
+            .tx_items = tx_items.items,
+            .senders = senders.items,
+        };
+        var prewarm_pool: [prewarm_threads]std.Thread = undefined;
+        var prewarm_spawned: usize = 0;
+        defer {
+            prewarm.stop.store(true, .monotonic);
+            for (prewarm_pool[0..prewarm_spawned]) |t| t.join();
+        }
+        if (state.base != null) {
+            zevm.Precompiles.initSecp();
+            while (prewarm_spawned < prewarm_threads) : (prewarm_spawned += 1) {
+                prewarm_pool[prewarm_spawned] = std.Thread.spawn(.{}, prewarmWorker, .{ &prewarm, prewarm_spawned, prewarm_threads }) catch break;
+            }
+        }
         const recover_ns: u64 = @intCast(recover_start.durationTo(std.Io.Clock.Timestamp.now(io, .awake)).raw.nanoseconds);
         tx_parse_ns += recover_ns;
         decode_ns += recover_ns;

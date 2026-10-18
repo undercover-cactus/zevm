@@ -72,7 +72,7 @@ pub fn executeTransaction(self: *Evm, tx: Transaction, from: Address) !Result {
     // DEBUG: resets Interpreter's step-count safety valve (see its doc
     // comment) so it measures *this* transaction's total, not a running
     // total across the whole replay.
-    Interpreter.debug_total_step_count = 0;
+    if (Interpreter.counts_steps) Interpreter.debug_total_step_count = 0;
 
     const tracing = debug_trace_tx_enabled and self.block.number == debug_trace_tx_block and from == debug_trace_tx_from;
     if (tracing) Interpreter.step_trace_enabled = true;
