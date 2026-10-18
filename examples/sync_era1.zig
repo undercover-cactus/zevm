@@ -892,8 +892,12 @@ pub fn main(io: std.Io, args: []const []const u8) anyerror!void {
         // left in force for the whole replay, which dropped every page right
         // after use; switching advice between the phases avoids that too.)
         std.posix.madvise(dump.ptr, dump.len, std.posix.MADV.SEQUENTIAL) catch {};
+        const load_start = std.Io.Clock.Timestamp.now(io, .awake);
         const snapshot = try zevm.State.loadSnapshot(allocator, dump);
         std.posix.madvise(dump.ptr, dump.len, std.posix.MADV.NORMAL) catch {};
+        std.debug.print("  load (index the snapshot):     {d:.2}ms\n", .{
+            @as(f64, @floatFromInt(load_start.durationTo(std.Io.Clock.Timestamp.now(io, .awake)).raw.nanoseconds)) / 1_000_000.0,
+        });
         // Resuming restarts at the dumped block's *file*, not the block
         // itself, so a snapshot taken mid-file would have that file's earlier
         // blocks replayed a second time, silently double-applying their
@@ -1226,6 +1230,7 @@ pub fn main(io: std.Io, args: []const []const u8) anyerror!void {
                 // briefly holding two copies) on top of the ~44GB of live
                 // state peaked over this machine's 62GB and got the replay
                 // OOM-killed mid-run.
+                const dump_start = std.Io.Clock.Timestamp.now(io, .awake);
                 var dump_file = try std.Io.Dir.cwd().createFile(io, dump_path, .{});
                 defer dump_file.close(io);
                 const dump_buf = try allocator.alloc(u8, 1 << 20);
@@ -1234,6 +1239,9 @@ pub fn main(io: std.Io, args: []const []const u8) anyerror!void {
                 try state.writeSnapshot(&dump_writer.interface, header.number, recent_hashes.items);
                 try dump_writer.interface.flush();
                 std.debug.print("dumped snapshot at block {d} to {s} ({d} accounts)\n", .{ header.number, dump_path, state.accountCount() });
+                std.debug.print("  dump (write the checkpoint):   {d:.2}ms\n", .{
+                    @as(f64, @floatFromInt(dump_start.durationTo(std.Io.Clock.Timestamp.now(io, .awake)).raw.nanoseconds)) / 1_000_000.0,
+                });
 
                 // Same breakdown the end-of-run summary prints. Without it
                 // here, a chunked run (which always leaves through this
