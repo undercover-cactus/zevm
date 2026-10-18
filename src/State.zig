@@ -261,11 +261,19 @@ pub fn finalizeTransaction(self: *State) void {
     // process past this machine's 62GB and got it OOM-killed. Capacity is
     // retained, so the next transaction reuses the same buffer.
     self.journal.clearRetainingCapacity();
-    // A new transaction means a new notion of "original".
-    self.originals.clearRetainingCapacity();
-    // And everything is cold again.
-    self.warm_addresses.clearRetainingCapacity();
-    self.warm_slots.clearRetainingCapacity();
+    // A new transaction means a new notion of "original", and everything is
+    // cold again.
+    //
+    // Unlike the lists above, clearing a hash map while retaining capacity
+    // zero-fills its *whole* table, not just what this transaction used. One
+    // heavy transaction touching tens of thousands of slots grew these once,
+    // and every transaction after it, a plain transfer included, then paid to
+    // zero-fill the lot: 6.4% of all replay time on late-2022 blocks. A table
+    // far bigger than what it just held is given back instead; one sized
+    // about right is kept, as before.
+    if (self.originals.capacity() > 4 * @max(self.originals.count(), 256)) self.originals.clearAndFree(self.allocator) else self.originals.clearRetainingCapacity();
+    if (self.warm_addresses.capacity() > 4 * @max(self.warm_addresses.count(), 256)) self.warm_addresses.clearAndFree(self.allocator) else self.warm_addresses.clearRetainingCapacity();
+    if (self.warm_slots.capacity() > 4 * @max(self.warm_slots.count(), 256)) self.warm_slots.clearAndFree(self.allocator) else self.warm_slots.clearRetainingCapacity();
 }
 
 /// Marks `address` warm (EIP-2929), returning whether it already was. The
@@ -2074,4 +2082,24 @@ test "a reverted frame's warm accesses go cold again, earlier ones stay warm" {
     // And a new transaction starts with everything cold.
     state.finalizeTransaction();
     try std.testing.expect(!try state.warmAddress(0xaa));
+}
+
+test "a per-transaction map grown by one heavy transaction is given back after a light one" {
+    var state = State.init(std.testing.allocator);
+    defer state.deinit();
+
+    // A heavy transaction warms 10,000 slots.
+    for (0..10_000) |i| _ = try state.warmSlot(0xaa, i);
+    state.finalizeTransaction();
+    const grown = state.warm_slots.capacity();
+    try std.testing.expect(grown >= 10_000);
+
+    // A light one touches a single slot; its clear releases the big table.
+    _ = try state.warmSlot(0xaa, 1);
+    state.finalizeTransaction();
+    try std.testing.expect(state.warm_slots.capacity() < grown);
+
+    // Correctness is unaffected either way: everything starts cold again.
+    try std.testing.expect(!try state.warmSlot(0xaa, 1));
+    try std.testing.expect(!try state.warmAddress(0xbb));
 }

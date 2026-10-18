@@ -6,6 +6,7 @@
 //! `State.zig`'s own doc comment.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const OpCode = @import("OpCode.zig").OpCode;
 const Stack = @import("Stack.zig");
 const Memory = @import("Memory.zig");
@@ -280,6 +281,12 @@ const debug_is_new_account_caller: Address = 0xe53c52acf5f396d978e84ab48f16c13fb
 // anywhere near this many steps (even an all-zero-cost-opcode adversarial
 // sequence would need a code buffer this codebase can't hold), so tripping
 // it means a genuine unbounded loop within a single transaction.
+//
+// Off unless re-enabled: it ran on every opcode of every replay, a global
+// load, increment and compare that came to ~2-3% of all replay time once
+// the hunt it was built for was long over. `debug_trace_enabled` needs the
+// count too, so either flag turns it back on.
+const debug_step_limit_enabled = false;
 pub var debug_total_step_count: u64 = 0;
 const debug_total_step_limit: u64 = 20_000_000;
 
@@ -290,8 +297,8 @@ fn step(self: *Interpreter) !void {
     }
 
     const byte = self.code[self.pc];
-    debug_total_step_count += 1;
-    if (debug_total_step_count > debug_total_step_limit) {
+    if (debug_step_limit_enabled or debug_trace_enabled) debug_total_step_count += 1;
+    if (debug_step_limit_enabled and debug_total_step_count > debug_total_step_limit) {
         std.debug.panic(
             "a single transaction exceeded {d} total opcode steps: block={d} address={x} pc={d} op={x} gas_remaining={d} depth={d}",
             .{ debug_total_step_limit, self.block.number, self.address, self.pc, byte, self.gas_remaining, self.depth },
@@ -1693,8 +1700,16 @@ fn mul(a: u256, b: u256) u256 {
 fn sub(a: u256, b: u256) u256 {
     return a -% b;
 }
+/// `/` and `%` on `u256` have no instruction behind them and compile to
+/// compiler-rt's generic wide long division, which was 9% of the
+/// interpreter's own time for `DIV` alone. Most operands are token amounts
+/// that fit in far fewer bits, so the narrowest width that holds both is
+/// tried first, down to the CPU's own 64-bit divide.
 fn div(a: u256, b: u256) u256 {
-    return if (b == 0) 0 else a / b;
+    if (b == 0 or a < b) return 0;
+    if (a <= std.math.maxInt(u64)) return @as(u64, @intCast(a)) / @as(u64, @intCast(b));
+    if (a <= std.math.maxInt(u128)) return @as(u128, @intCast(a)) / @as(u128, @intCast(b));
+    return fromLimbs(divRemLimbs(4, toLimbs(4, a), toLimbs(4, b)).q);
 }
 fn sdiv(a: u256, b: u256) u256 {
     if (b == 0) return 0;
@@ -1703,8 +1718,13 @@ fn sdiv(a: u256, b: u256) u256 {
     if (bi == -1 and ai == std.math.minInt(i256)) return a;
     return @bitCast(@divTrunc(ai, bi));
 }
+/// See `div`. `a < b` is `a` itself.
 fn mod(a: u256, b: u256) u256 {
-    return if (b == 0) 0 else a % b;
+    if (b == 0) return 0;
+    if (a < b) return a;
+    if (a <= std.math.maxInt(u64)) return @as(u64, @intCast(a)) % @as(u64, @intCast(b));
+    if (a <= std.math.maxInt(u128)) return @as(u128, @intCast(a)) % @as(u128, @intCast(b));
+    return fromLimbs(divRemLimbs(4, toLimbs(4, a), toLimbs(4, b)).r);
 }
 fn smod(a: u256, b: u256) u256 {
     if (b == 0) return 0;
@@ -1718,10 +1738,178 @@ fn addmod(a: u256, b: u256, n: u256) u256 {
     const sum: u512 = @as(u512, a) + @as(u512, b);
     return @truncate(sum % @as(u512, n));
 }
+/// `a * b mod n` over the full 512-bit product.
+///
+/// The generic path is a 512-bit `%`, a software long division, and was 27%
+/// of the interpreter's own time on 2021 blocks: Uniswap V3's
+/// `FullMath.mulDiv` runs on every swap and computes `mulmod(x, y, not(0))`.
+/// For that modulus no division is needed. `2^256 = 1 (mod 2^256 - 1)`, so
+/// `hi * 2^256 + lo` reduces to `hi + lo`; a carry out of that sum is one
+/// more `2^256`, so one more 1. `hi < 2^256 - 1` always, which keeps the
+/// result below the modulus after that single fold, except for the value
+/// `2^256 - 1` itself, which is 0. A product that fits in 256 bits goes to
+/// `mod` and its narrow paths instead.
 fn mulmod(a: u256, b: u256, n: u256) u256 {
     if (n == 0) return 0;
     const prod: u512 = @as(u512, a) * @as(u512, b);
-    return @truncate(prod % @as(u512, n));
+    const hi: u256 = @truncate(prod >> 256);
+    const lo: u256 = @truncate(prod);
+    if (n == std.math.maxInt(u256)) {
+        const sum = @addWithOverflow(lo, hi);
+        const folded = sum[0] + @as(u256, sum[1]);
+        return if (folded == n) 0 else folded;
+    }
+    if (hi == 0) return mod(lo, n);
+    return fromLimbs(divRemLimbs(8, toLimbs(8, prod), toLimbs(4, n)).r);
+}
+
+/// `x` as little-endian 64-bit limbs.
+fn toLimbs(comptime N: usize, x: std.meta.Int(.unsigned, 64 * N)) [N]u64 {
+    var out: [N]u64 = undefined;
+    inline for (0..N) |i| out[i] = @truncate(x >> (64 * i));
+    return out;
+}
+
+/// The first four limbs as a `u256`. Callers only pass values known to fit.
+fn fromLimbs(limbs: anytype) u256 {
+    var x: u256 = 0;
+    inline for (0..4) |i| x |= @as(u256, limbs[i]) << (64 * i);
+    return x;
+}
+
+/// `(hi * 2^64 + lo) / d` and its remainder, for `hi < d` so the quotient
+/// fits in 64 bits. On x86-64 that is one `div` instruction (the same inline
+/// asm compiler-rt uses for this); elsewhere, the plain 128-bit expression.
+inline fn div2by1(hi: u64, lo: u64, d: u64) struct { q: u64, r: u64 } {
+    if (comptime builtin.target.cpu.arch == .x86_64) {
+        var r: u64 = undefined;
+        const q = asm (
+            \\divq %[d]
+            : [_] "={rax}" (-> u64),
+              [_] "={rdx}" (r),
+            : [d] "r" (d),
+              [_] "{rax}" (lo),
+              [_] "{rdx}" (hi),
+        );
+        return .{ .q = q, .r = r };
+    }
+    const n = (@as(u128, hi) << 64) | lo;
+    return .{ .q = @intCast(n / d), .r = @intCast(n % d) };
+}
+
+/// Test builds only: how often `divRemLimbs` took its rare add-back step, so
+/// the tests can show they reached it rather than assume so.
+var add_back_count: u64 = 0;
+
+/// `u / v` and `u % v` for a dividend of `N` 64-bit limbs and a nonzero
+/// divisor of up to four: Knuth's Algorithm D (TAOCP 4.3.1), in the shape of
+/// Hacker's Delight's `divmnu`, with 64-bit limbs.
+///
+/// compiler-rt runs the same algorithm for `/` and `%` on wide integers, but
+/// one generic version serves every width up to 65,535 bits, on 32-bit limbs.
+/// Here the sizes are fixed and each quotient digit is estimated with a single
+/// hardware 128-by-64 division, so a 512-by-256 remainder is about a quarter
+/// of the limb work. That remainder (`MULMOD`'s general case, from Uniswap V3's
+/// `FullMath.mulDiv`) was 15% of all replay time on 2021 blocks.
+fn divRemLimbs(comptime N: usize, u: [N]u64, v: [4]u64) struct { q: [N]u64, r: [4]u64 } {
+    var q: [N]u64 = .{0} ** N;
+    var r: [4]u64 = .{0} ** 4;
+
+    var n: usize = 4;
+    while (v[n - 1] == 0) n -= 1;
+    var m: usize = N;
+    while (m > 0 and u[m - 1] == 0) m -= 1;
+
+    // Fewer significant limbs than the divisor: the quotient is 0.
+    if (m < n) {
+        for (0..m) |i| r[i] = u[i];
+        return .{ .q = q, .r = r };
+    }
+
+    // A one-limb divisor needs no normalisation or correction.
+    if (n == 1) {
+        var rem: u64 = 0;
+        var i = m;
+        while (i > 0) {
+            i -= 1;
+            const d = div2by1(rem, u[i], v[0]);
+            q[i] = d.q;
+            rem = d.r;
+        }
+        r[0] = rem;
+        return .{ .q = q, .r = r };
+    }
+
+    // Normalise so the divisor's top limb has its top bit set, which is what
+    // makes the two-limb quotient estimate below at most 2 too large.
+    const s: u7 = @clz(v[n - 1]);
+    var vn: [4]u64 = undefined;
+    var i: usize = n - 1;
+    while (i > 0) : (i -= 1) vn[i] = @truncate((((@as(u128, v[i]) << 64) | v[i - 1]) << s) >> 64);
+    vn[0] = @truncate(@as(u128, v[0]) << s);
+
+    var un: [N + 1]u64 = undefined;
+    un[m] = @truncate((@as(u128, u[m - 1]) << s) >> 64);
+    i = m - 1;
+    while (i > 0) : (i -= 1) un[i] = @truncate((((@as(u128, u[i]) << 64) | u[i - 1]) << s) >> 64);
+    un[0] = @truncate(@as(u128, u[0]) << s);
+
+    var j: usize = m - n + 1;
+    while (j > 0) {
+        j -= 1;
+        // Estimate this quotient digit from the window's top two limbs. The
+        // window's top limb never exceeds the divisor's, and when they are
+        // equal the true digit is the largest one, b - 1.
+        var qhat: u64 = undefined;
+        var rhat: u128 = undefined;
+        if (un[j + n] >= vn[n - 1]) {
+            qhat = std.math.maxInt(u64);
+            rhat = @as(u128, un[j + n - 1]) + vn[n - 1];
+        } else {
+            const d = div2by1(un[j + n], un[j + n - 1], vn[n - 1]);
+            qhat = d.q;
+            rhat = d.r;
+        }
+        while (rhat <= std.math.maxInt(u64) and
+            @as(u128, qhat) * vn[n - 2] > ((rhat << 64) | un[j + n - 2]))
+        {
+            qhat -= 1;
+            rhat += vn[n - 1];
+        }
+
+        // Multiply and subtract `qhat * vn` from the window.
+        var borrow: i128 = 0;
+        for (0..n) |k| {
+            const p = @as(u128, qhat) * vn[k];
+            const t = @as(i128, un[k + j]) - borrow - @as(i128, @as(u64, @truncate(p)));
+            un[k + j] = @truncate(@as(u128, @bitCast(t)));
+            borrow = @as(i128, @intCast(p >> 64)) - (t >> 64);
+        }
+        const top = @as(i128, un[j + n]) - borrow;
+        un[j + n] = @truncate(@as(u128, @bitCast(top)));
+
+        // The estimate was still one too large: add one divisor back.
+        if (top < 0) {
+            if (builtin.is_test) add_back_count += 1;
+            qhat -= 1;
+            var carry: u128 = 0;
+            for (0..n) |k| {
+                const t = @as(u128, un[k + j]) + vn[k] + carry;
+                un[k + j] = @truncate(t);
+                carry = t >> 64;
+            }
+            un[j + n] = @truncate(@as(u128, un[j + n]) + carry);
+        }
+        q[j] = qhat;
+    }
+
+    // Undo the normalisation shift on the remainder, which is what is left
+    // in the window's low `n` limbs.
+    for (0..n) |k| {
+        const above: u64 = if (k + 1 < n) un[k + 1] else 0;
+        r[k] = @truncate((((@as(u128, above) << 64) | un[k])) >> s);
+    }
+    return .{ .q = q, .r = r };
 }
 fn expOp(base_val: u256, exponent: u256) u256 {
     var result: u256 = 1;
@@ -5117,4 +5305,88 @@ test "EIP-3529: clearing a slot refunds 4800 and SELFDESTRUCT refunds nothing fr
         try std.testing.expectEqual(Status.stopped, interp.status);
         try std.testing.expectEqual(@as(i64, if (fork == .london) 0 else 24000), interp.refund);
     }
+}
+
+test "DIV, MOD and MULMOD fast paths agree with plain wide arithmetic" {
+    // The references are exactly what these opcodes computed before their
+    // fast paths existed.
+    const max = std.math.maxInt(u256);
+    var prng: std.Random.DefaultPrng = .init(0x6d756c6d);
+    const rand = prng.random();
+    // Values spread across the widths each fast path keys on.
+    const edges = [_]u256{ 0, 1, 2, 3, 7, std.math.maxInt(u64) - 1, std.math.maxInt(u64), @as(u256, std.math.maxInt(u64)) + 1, std.math.maxInt(u128), @as(u256, std.math.maxInt(u128)) + 1, max - 2, max - 1, max };
+    var values: [13 + 60]u256 = undefined;
+    @memcpy(values[0..13], &edges);
+    for (values[13..], 0..) |*v, i| v.* = switch (i % 3) {
+        0 => rand.int(u64),
+        1 => rand.int(u128),
+        else => rand.int(u256),
+    };
+    for (values) |a| for (values) |b| {
+        try std.testing.expectEqual(if (b == 0) 0 else a / b, div(a, b));
+        try std.testing.expectEqual(if (b == 0) 0 else a % b, mod(a, b));
+    };
+    // MULMOD: every modulus class, with 2^256 - 1 (Uniswap's) included.
+    for (values[0..40]) |a| for (values[0..40]) |b| for (values) |n| {
+        const expected: u256 = if (n == 0) 0 else @truncate((@as(u512, a) * @as(u512, b)) % @as(u512, n));
+        try std.testing.expectEqual(expected, mulmod(a, b, n));
+    };
+    // The fold's boundaries: products whose `hi + lo` lands exactly on, or
+    // one past, the modulus.
+    try std.testing.expectEqual(@as(u256, 0), mulmod(max, 1, max));
+    try std.testing.expectEqual(@as(u256, 0), mulmod(max, max, max));
+    try std.testing.expectEqual(@as(u256, 1), mulmod(max - 1, max - 1, max));
+}
+
+test "the 64-bit-limb Algorithm D agrees with compiler-rt's wide division" {
+    // compiler-rt's `/` and `%` are the reference. Limbs are drawn from a
+    // structured set as well as at random: uniformly random limbs almost never
+    // reach the rare "add one divisor back" step, while limbs such as 0, 2^63
+    // and 2^64 - 1 hit it regularly.
+    const special = [_]u64{ 0, 1, 2, (1 << 63) - 1, 1 << 63, (1 << 63) + 1, std.math.maxInt(u64) - 1, std.math.maxInt(u64) };
+    var prng: std.Random.DefaultPrng = .init(0x6b6e7574);
+    const rand = prng.random();
+    const limb = struct {
+        fn pick(r: std.Random, sp: []const u64) u64 {
+            return if (r.boolean()) sp[r.uintLessThan(usize, sp.len)] else r.int(u64);
+        }
+    }.pick;
+    for (0..60_000) |_| {
+        var u_limbs: [8]u64 = undefined;
+        var v_limbs: [4]u64 = undefined;
+        for (&u_limbs) |*x| x.* = limb(rand, &special);
+        for (&v_limbs) |*x| x.* = limb(rand, &special);
+        // Vary how many limbs are significant, so every divisor length and
+        // dividend-shorter-than-divisor case is covered.
+        const vlen = rand.uintLessThan(usize, 4) + 1;
+        for (v_limbs[vlen..]) |*x| x.* = 0;
+        const ulen = rand.uintLessThan(usize, 9);
+        for (u_limbs[ulen..]) |*x| x.* = 0;
+        var v: u256 = 0;
+        for (v_limbs, 0..) |x, k| v |= @as(u256, x) << @intCast(64 * k);
+        if (v == 0) continue;
+        var u: u512 = 0;
+        for (u_limbs, 0..) |x, k| u |= @as(u512, x) << @intCast(64 * k);
+
+        const wide = divRemLimbs(8, toLimbs(8, u), toLimbs(4, v));
+        try std.testing.expectEqual(@as(u256, @truncate(u % v)), fromLimbs(wide.r));
+        var q: u512 = 0;
+        for (wide.q, 0..) |x, k| q |= @as(u512, x) << @intCast(64 * k);
+        try std.testing.expectEqual(u / v, q);
+
+        const u256v: u256 = @truncate(u);
+        const narrow = divRemLimbs(4, toLimbs(4, u256v), toLimbs(4, v));
+        try std.testing.expectEqual(u256v / v, fromLimbs(narrow.q));
+        try std.testing.expectEqual(u256v % v, fromLimbs(narrow.r));
+    }
+    // The randomized cases must have exercised the add-back branch.
+    try std.testing.expect(add_back_count > 0);
+    // Hacker's Delight's own add-back case, scaled to 64-bit limbs.
+    const u_hd: [4]u64 = .{ 0, 0, 1 << 63, (1 << 63) - 1 };
+    const v_hd: [4]u64 = .{ 1, 0, 1 << 63, 0 };
+    const hd = divRemLimbs(4, u_hd, v_hd);
+    const uu = fromLimbs(u_hd);
+    const vv = fromLimbs(v_hd);
+    try std.testing.expectEqual(uu / vv, fromLimbs(hd.q));
+    try std.testing.expectEqual(uu % vv, fromLimbs(hd.r));
 }
