@@ -1050,85 +1050,156 @@ pub fn snapshotStateRoot(allocator: std.mem.Allocator, bytes: []const u8) !Snaps
     const account_count = std.mem.readInt(u64, bytes[pos..][0..8], .little);
     pos += 8;
 
-    // Account leaves must all be live at once — the trie needs them sorted —
-    // so they share one arena. Storage tries do not: each is folded into its
-    // account immediately, so they reuse a second arena reset per account.
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-    const account_allocator = arena.allocator();
-
-    var storage_arena = std.heap.ArenaAllocator.init(allocator);
-    defer storage_arena.deinit();
-
-    var entries: std.ArrayListUnmanaged(Trie.Entry) = .empty;
-    try entries.ensureTotalCapacity(account_allocator, @intCast(account_count));
-
-    var i: u64 = 0;
-    while (i < account_count) : (i += 1) {
-        const address = std.mem.readInt(u160, bytes[pos..][0..20], .big);
-        pos += 20;
-        const balance = std.mem.readInt(u256, bytes[pos..][0..32], .little);
-        pos += 32;
-        const nonce = std.mem.readInt(u64, bytes[pos..][0..8], .little);
-        pos += 8;
-        const code_len = std.mem.readInt(u32, bytes[pos..][0..4], .little);
-        pos += 4;
-        const code = bytes[pos..][0..code_len];
-        pos += code_len;
-
-        const storage_count = std.mem.readInt(u64, bytes[pos..][0..8], .little);
-        pos += 8;
-
-        _ = storage_arena.reset(.retain_capacity);
-        const storage_allocator = storage_arena.allocator();
-        var slots: std.ArrayListUnmanaged(Trie.Entry) = .empty;
-        try slots.ensureTotalCapacity(storage_allocator, @intCast(storage_count));
-        var s: u64 = 0;
-        while (s < storage_count) : (s += 1) {
-            const slot = std.mem.readInt(u256, bytes[pos..][0..32], .little);
-            pos += 32;
-            const value = std.mem.readInt(u256, bytes[pos..][0..32], .little);
-            pos += 32;
-            // A slot holding zero is absent from the trie, not present as zero.
-            if (value == 0) continue;
-            var slot_bytes: [32]u8 = undefined;
-            std.mem.writeInt(u256, &slot_bytes, slot, .big);
-            const slot_key = try storage_allocator.alloc(u8, 32);
-            std.mem.writeInt(u256, slot_key[0..32], keccak256(&slot_bytes), .big);
-            slots.appendAssumeCapacity(.{
-                .key = slot_key,
-                .value = try Rlp.encodeInt(storage_allocator, value),
-            });
+    // Accounts are independent of each other, so their leaves are computed
+    // on every core. A sequential pass first marks out batches, reading only
+    // the lengths needed to skip from one record to the next; workers then
+    // take batches from a shared counter, so a batch of large contracts and
+    // a batch of plain accounts balance out. Single-threaded, this pass was
+    // ~20 minutes of every checkpoint at the Merge, 29% of a full replay.
+    var batches: std.ArrayListUnmanaged(RootBatch) = .empty;
+    defer batches.deinit(allocator);
+    {
+        var batch: RootBatch = .{ .pos = pos, .first = 0, .count = 0 };
+        var i: u64 = 0;
+        while (i < account_count) : (i += 1) {
+            const code_len = std.mem.readInt(u32, bytes[pos + 60 ..][0..4], .little);
+            const storage_count = std.mem.readInt(u64, bytes[pos + 64 + code_len ..][0..8], .little);
+            pos += 72 + code_len + storage_count * 64;
+            batch.count += 1;
+            if (batch.count == 4096 or pos - batch.pos >= 64 << 20) {
+                try batches.append(allocator, batch);
+                batch = .{ .pos = pos, .first = i + 1, .count = 0 };
+            }
         }
-        // `hashRoot` frees as it goes, so it gets the real allocator rather
-        // than the arena, whose frees are no-ops.
-        const storage_root = try Trie.hashRoot(allocator, slots.items);
-
-        var storage_root_bytes: [32]u8 = undefined;
-        std.mem.writeInt(u256, &storage_root_bytes, storage_root, .big);
-        var code_hash_bytes: [32]u8 = undefined;
-        std.mem.writeInt(u256, &code_hash_bytes, if (code_len == 0)
-            empty_code_hash
-        else
-            keccak256(code), .big);
-
-        var address_bytes: [20]u8 = undefined;
-        std.mem.writeInt(u160, &address_bytes, address, .big);
-        const key = try account_allocator.alloc(u8, 32);
-        std.mem.writeInt(u256, key[0..32], keccak256(&address_bytes), .big);
-
-        entries.appendAssumeCapacity(.{
-            .key = key,
-            .value = try Rlp.encodeList(account_allocator, &.{
-                try Rlp.encodeInt(account_allocator, nonce),
-                try Rlp.encodeInt(account_allocator, balance),
-                try Rlp.encodeBytes(account_allocator, &storage_root_bytes),
-                try Rlp.encodeBytes(account_allocator, &code_hash_bytes),
-            }),
-        });
+        if (batch.count != 0) try batches.append(allocator, batch);
     }
 
-    return .{ .block = block, .root = try Trie.hashRoot(allocator, entries.items) };
+    const entries = try allocator.alloc(Trie.Entry, @intCast(account_count));
+    defer allocator.free(entries);
+
+    const max_threads = 32;
+    const cpus = std.Thread.getCpuCount() catch 1;
+    const thread_count = @max(1, @min(max_threads, @min(cpus, batches.items.len)));
+
+    // Each worker's leaves live in its own arena until the trie is built.
+    var leaf_arenas: [max_threads]std.heap.ArenaAllocator = undefined;
+    for (leaf_arenas[0..thread_count]) |*a| a.* = std.heap.ArenaAllocator.init(allocator);
+    defer for (leaf_arenas[0..thread_count]) |*a| a.deinit();
+
+    var job: RootJob = .{ .allocator = allocator, .bytes = bytes, .batches = batches.items, .entries = entries };
+    var threads: [max_threads]std.Thread = undefined;
+    var failures: [max_threads]?anyerror = @splat(null);
+    var spawned: usize = 0;
+    while (spawned < thread_count) : (spawned += 1) {
+        threads[spawned] = std.Thread.spawn(.{}, rootWorker, .{ &job, &leaf_arenas[spawned], &failures[spawned] }) catch |err| {
+            job.next.store(batches.items.len, .monotonic);
+            for (threads[0..spawned]) |t| t.join();
+            return err;
+        };
+    }
+    for (threads[0..spawned]) |t| t.join();
+    for (failures[0..spawned]) |failure| if (failure) |err| return err;
+
+    return .{ .block = block, .root = try Trie.hashRootParallel(allocator, entries) };
+}
+
+/// A run of consecutive account records: `count` accounts, starting at byte
+/// `pos` of the snapshot with account number `first`.
+const RootBatch = struct { pos: usize, first: u64, count: u64 };
+
+const RootJob = struct {
+    allocator: std.mem.Allocator,
+    bytes: []const u8,
+    batches: []const RootBatch,
+    entries: []Trie.Entry,
+    next: std.atomic.Value(usize) = .init(0),
+};
+
+fn rootWorker(job: *RootJob, leaf_arena: *std.heap.ArenaAllocator, failure: *?anyerror) void {
+    // Storage tries are folded into their account straight away, so their
+    // scratch is reset per account rather than kept.
+    var storage_arena = std.heap.ArenaAllocator.init(job.allocator);
+    defer storage_arena.deinit();
+    while (true) {
+        const b = job.next.fetchAdd(1, .monotonic);
+        if (b >= job.batches.len) return;
+        const batch = job.batches[b];
+        var pos = batch.pos;
+        for (0..batch.count) |k| {
+            _ = storage_arena.reset(.retain_capacity);
+            job.entries[batch.first + k] = accountLeaf(job.allocator, leaf_arena.allocator(), storage_arena.allocator(), job.bytes, &pos) catch |err| {
+                failure.* = err;
+                job.next.store(job.batches.len, .monotonic);
+                return;
+            };
+        }
+    }
+}
+
+/// The account trie leaf for the record at `pos.*`, advancing `pos` past it.
+/// Its key and value are allocated in `leaf_allocator`; `storage_allocator`
+/// only holds scratch for the storage trie, and `allocator` serves
+/// `Trie.hashRoot`, which frees as it goes.
+fn accountLeaf(allocator: std.mem.Allocator, leaf_allocator: std.mem.Allocator, storage_allocator: std.mem.Allocator, bytes: []const u8, pos: *usize) !Trie.Entry {
+    const address = std.mem.readInt(u160, bytes[pos.*..][0..20], .big);
+    pos.* += 20;
+    const balance = std.mem.readInt(u256, bytes[pos.*..][0..32], .little);
+    pos.* += 32;
+    const nonce = std.mem.readInt(u64, bytes[pos.*..][0..8], .little);
+    pos.* += 8;
+    const code_len = std.mem.readInt(u32, bytes[pos.*..][0..4], .little);
+    pos.* += 4;
+    const code = bytes[pos.*..][0..code_len];
+    pos.* += code_len;
+
+    const storage_count = std.mem.readInt(u64, bytes[pos.*..][0..8], .little);
+    pos.* += 8;
+
+    var slots: std.ArrayListUnmanaged(Trie.Entry) = .empty;
+    try slots.ensureTotalCapacity(storage_allocator, @intCast(storage_count));
+    var s: u64 = 0;
+    while (s < storage_count) : (s += 1) {
+        const slot = std.mem.readInt(u256, bytes[pos.*..][0..32], .little);
+        pos.* += 32;
+        const value = std.mem.readInt(u256, bytes[pos.*..][0..32], .little);
+        pos.* += 32;
+        // A slot holding zero is absent from the trie, not present as zero.
+        if (value == 0) continue;
+        var slot_bytes: [32]u8 = undefined;
+        std.mem.writeInt(u256, &slot_bytes, slot, .big);
+        const slot_key = try storage_allocator.alloc(u8, 32);
+        std.mem.writeInt(u256, slot_key[0..32], keccak256(&slot_bytes), .big);
+        slots.appendAssumeCapacity(.{
+            .key = slot_key,
+            .value = try Rlp.encodeInt(storage_allocator, value),
+        });
+    }
+    // `hashRoot` frees as it goes, so it gets the real allocator rather
+    // than the arena, whose frees are no-ops.
+    const storage_root = try Trie.hashRoot(allocator, slots.items);
+
+    var storage_root_bytes: [32]u8 = undefined;
+    std.mem.writeInt(u256, &storage_root_bytes, storage_root, .big);
+    var code_hash_bytes: [32]u8 = undefined;
+    std.mem.writeInt(u256, &code_hash_bytes, if (code_len == 0)
+        empty_code_hash
+    else
+        keccak256(code), .big);
+
+    var address_bytes: [20]u8 = undefined;
+    std.mem.writeInt(u160, &address_bytes, address, .big);
+    const key = try leaf_allocator.alloc(u8, 32);
+    std.mem.writeInt(u256, key[0..32], keccak256(&address_bytes), .big);
+
+    return .{
+        .key = key,
+        .value = try Rlp.encodeList(leaf_allocator, &.{
+            try Rlp.encodeInt(leaf_allocator, nonce),
+            try Rlp.encodeInt(leaf_allocator, balance),
+            try Rlp.encodeBytes(leaf_allocator, &storage_root_bytes),
+            try Rlp.encodeBytes(leaf_allocator, &code_hash_bytes),
+        }),
+    };
 }
 
 test "a snapshot writes each account's storage slots in ascending order" {
@@ -2102,4 +2173,25 @@ test "a per-transaction map grown by one heavy transaction is given back after a
     // Correctness is unaffected either way: everything starts cold again.
     try std.testing.expect(!try state.warmSlot(0xaa, 1));
     try std.testing.expect(!try state.warmAddress(0xbb));
+}
+
+test "the parallel snapshot root matches the root of the state it was written from" {
+    // Enough accounts for several batches and threads, with code and storage
+    // spread across them, so the parallel paths are really exercised.
+    var origin = State.init(std.testing.allocator);
+    defer origin.deinit();
+    for (1..9001) |i| {
+        const a: Address = @intCast(0x5000 + i * 7919);
+        try origin.setBalance(a, i);
+        try origin.setNonce(a, i % 13);
+        if (i % 50 == 0) try origin.setCode(a, &.{ 0x60, @intCast(i % 256), 0x00 });
+        for (0..(i % 4)) |k| try origin.setStorage(a, k * 3 + i, i * 10 + k + 1);
+    }
+    const expected = try origin.stateRoot(std.testing.allocator);
+    var out = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer out.deinit();
+    try origin.writeSnapshot(&out.writer, 5, &.{});
+    const computed = try snapshotStateRoot(std.testing.allocator, out.writer.buffered());
+    try std.testing.expectEqual(@as(u64, 5), computed.block);
+    try std.testing.expectEqual(expected, computed.root);
 }

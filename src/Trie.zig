@@ -176,6 +176,95 @@ pub fn hashRoot(allocator: std.mem.Allocator, entries: []Entry) !Hash {
     return keccak256(root_node);
 }
 
+/// The same root as `hashRoot`, with the 16 subtries under the root sorted
+/// and built on separate threads. `allocator` must be thread-safe.
+///
+/// Keys sharing a first nibble form one of the root's 16 children and never
+/// interact with any other, so for a large set of hashed keys (which always
+/// spread over all 16) the root is a branch whose children can be computed
+/// independently. Entries are partitioned by first nibble in place, so no
+/// copy of a 181M-entry set is needed; each part is then sorted and built
+/// exactly as `buildNode` would build it at depth 1. Anything that would not
+/// make the root a branch of that shape (a small set, an empty key, every
+/// key under one nibble) takes the serial path instead.
+pub fn hashRootParallel(allocator: std.mem.Allocator, entries: []Entry) !Hash {
+    if (entries.len < 4096) return hashRoot(allocator, entries);
+
+    var counts = [_]usize{0} ** 16;
+    for (entries) |e| {
+        if (e.key.len == 0) return hashRoot(allocator, entries);
+        counts[nibbleAt(e.key, 0)] += 1;
+    }
+    var nonempty: usize = 0;
+    for (counts) |c| nonempty += @intFromBool(c != 0);
+    if (nonempty < 2) return hashRoot(allocator, entries);
+
+    // In-place partition by first nibble: `next[n]` is where bucket n's next
+    // entry goes; every entry is swapped straight into its own bucket.
+    var starts: [17]usize = undefined;
+    starts[0] = 0;
+    for (0..16) |n| starts[n + 1] = starts[n] + counts[n];
+    var next: [16]usize = undefined;
+    @memcpy(&next, starts[0..16]);
+    for (0..16) |n| {
+        while (next[n] < starts[n + 1]) {
+            const target = nibbleAt(entries[next[n]].key, 0);
+            if (target == n) {
+                next[n] += 1;
+            } else {
+                std.mem.swap(Entry, &entries[next[n]], &entries[next[target]]);
+                next[target] += 1;
+            }
+        }
+    }
+
+    var refs: [16][]const u8 = undefined;
+    var failures: [16]?anyerror = @splat(null);
+    var threads: [16]?std.Thread = @splat(null);
+    defer for (threads) |t| if (t) |thread| thread.join();
+    for (0..16) |n| {
+        const part = entries[starts[n]..starts[n + 1]];
+        if (part.len == 0) {
+            refs[n] = try Rlp.encodeBytes(allocator, &.{});
+            continue;
+        }
+        threads[n] = try std.Thread.spawn(.{}, buildChild, .{ allocator, part, &refs[n], &failures[n] });
+    }
+    for (&threads) |*t| if (t.*) |thread| {
+        thread.join();
+        t.* = null;
+    };
+    // Freed on every path: a failed child leaves an empty slice, which is a
+    // no-op to free, so one failure cannot leak the others' references.
+    defer for (refs) |r| allocator.free(r);
+    for (failures) |failure| if (failure) |err| return err;
+
+    // The root branch: the 16 child references, then an empty value slot
+    // (no key ends at depth 0, every one is at least a byte long).
+    var items: [17][]const u8 = undefined;
+    @memcpy(items[0..16], &refs);
+    items[16] = try Rlp.encodeBytes(allocator, &.{});
+    defer allocator.free(items[16]);
+    const root_node = try Rlp.encodeList(allocator, &items);
+    defer allocator.free(root_node);
+    return keccak256(root_node);
+}
+
+fn buildChild(allocator: std.mem.Allocator, part: []Entry, ref: *[]const u8, failure: *?anyerror) void {
+    std.mem.sort(Entry, part, {}, lessThanKey);
+    const child = buildNode(allocator, part, 1) catch |err| {
+        failure.* = err;
+        ref.* = &.{};
+        return;
+    };
+    defer allocator.free(child);
+    ref.* = nodeReference(allocator, child) catch |err| {
+        failure.* = err;
+        ref.* = &.{};
+        return;
+    };
+}
+
 test "an empty trie hashes to keccak256 of the empty RLP string" {
     var none: [0]Entry = .{};
     try std.testing.expectEqual(empty_root, try hashRoot(std.testing.allocator, &none));
@@ -260,4 +349,31 @@ test "long values force hashed child references rather than embedding" {
         .{ .key = "abb", .value = "different" },
     };
     try std.testing.expect(try hashRoot(std.testing.allocator, &changed) != root);
+}
+
+test "the parallel root matches the serial root" {
+    var prng: std.Random.DefaultPrng = .init(0x74726965);
+    const rand = prng.random();
+    const allocator = std.testing.allocator;
+    // Hashed-style 32-byte keys at sizes on both sides of the serial cutoff,
+    // plus a set whose keys all share a first nibble (serial fallback).
+    for ([_]usize{ 10, 4095, 4096, 20_000 }) |count| for ([_]bool{ false, true }) |one_nibble| {
+        const keys = try allocator.alloc([32]u8, count);
+        defer allocator.free(keys);
+        const values = try allocator.alloc([8]u8, count);
+        defer allocator.free(values);
+        const a = try allocator.alloc(Entry, count);
+        defer allocator.free(a);
+        const b = try allocator.alloc(Entry, count);
+        defer allocator.free(b);
+        for (keys, values, 0..) |*k, *v, i| {
+            rand.bytes(k);
+            if (one_nibble) k[0] = 0x30 | (k[0] & 0x0f);
+            std.mem.writeInt(u64, k[24..32], i, .big); // unique
+            std.mem.writeInt(u64, v, i * 7 + 1, .big);
+            a[i] = .{ .key = k, .value = v };
+            b[i] = a[i];
+        }
+        try std.testing.expectEqual(try hashRoot(allocator, a), try hashRootParallel(allocator, b));
+    };
 }
