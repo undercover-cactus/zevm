@@ -2300,6 +2300,7 @@ dependencies = [
  "hex",
  "revm",
  "rlp 0.6.1",
+ "rustc-hash",
  "secp256k1 0.28.2",
  "serde_json",
  "sha3 0.10.9",
