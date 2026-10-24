@@ -1579,14 +1579,21 @@ pub fn writeSnapshot(self: *const State, writer: *std.Io.Writer, block: u64, rec
         // Counted with one pass and written with a second, rather than
         // buffering the merged union: the largest contract here holds
         // 11.95M slots, which would be a 768MB scratch buffer.
+        //
+        // Both passes skip slots holding zero. A zero slot reads exactly like
+        // an absent one, and the state root leaves it out, but the merge
+        // yields one for every slot ever written back to zero, and each
+        // snapshot used to carry those forward: at the Merge they were 258M
+        // of 1,045M stored slots, ~16.5GB of every 100GB checkpoint.
         var counting = try account.slots(self.allocator, &sorted_slots);
         var total: u64 = 0;
-        while (counting.next()) |_| total += 1;
+        while (counting.next()) |pair| total += @intFromBool(pair.value != 0);
         std.mem.writeInt(u64, &buf8, total, .little);
         try writer.writeAll(&buf8);
 
         var writing = try account.slots(self.allocator, &sorted_slots);
         while (writing.next()) |pair| {
+            if (pair.value == 0) continue;
             std.mem.writeInt(u256, &buf32, pair.slot, .little);
             try writer.writeAll(&buf32);
             std.mem.writeInt(u256, &buf32, pair.value, .little);
@@ -2194,4 +2201,35 @@ test "the parallel snapshot root matches the root of the state it was written fr
     const computed = try snapshotStateRoot(std.testing.allocator, out.writer.buffered());
     try std.testing.expectEqual(@as(u64, 5), computed.block);
     try std.testing.expectEqual(expected, computed.root);
+}
+
+test "a snapshot stores no zero-valued slots, and reads are unchanged by their absence" {
+    var origin = State.init(std.testing.allocator);
+    defer origin.deinit();
+    try origin.setStorage(0xaa, 1, 11);
+    try origin.setStorage(0xaa, 2, 22);
+    try origin.setStorage(0xaa, 3, 0); // written to zero, never anything else
+    try origin.setStorage(0xbb, 9, 99);
+    var first = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer first.deinit();
+    try origin.writeSnapshot(&first.writer, 1, &.{});
+
+    var loaded = (try loadSnapshot(std.testing.allocator, first.writer.buffered())).state;
+    defer loaded.deinit();
+    try std.testing.expectEqual(@as(usize, 2), loaded.base.?.get(0xaa).?.slotCount());
+    // A base slot cleared in the overlay drops out of the next snapshot too.
+    try loaded.setStorage(0xaa, 2, 0);
+    var second = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer second.deinit();
+    try loaded.writeSnapshot(&second.writer, 2, &.{});
+
+    var reloaded = (try loadSnapshot(std.testing.allocator, second.writer.buffered())).state;
+    defer reloaded.deinit();
+    try std.testing.expectEqual(@as(usize, 1), reloaded.base.?.get(0xaa).?.slotCount());
+    try std.testing.expectEqual(@as(u256, 11), reloaded.getStorage(0xaa, 1));
+    try std.testing.expectEqual(@as(u256, 0), reloaded.getStorage(0xaa, 2));
+    try std.testing.expectEqual(@as(u256, 0), reloaded.getStorage(0xaa, 3));
+    try std.testing.expectEqual(@as(u256, 99), reloaded.getStorage(0xbb, 9));
+    // And the root, which never counted zeros, is the same either way.
+    try std.testing.expectEqual(try loaded.stateRoot(std.testing.allocator), try reloaded.stateRoot(std.testing.allocator));
 }
