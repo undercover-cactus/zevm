@@ -34,7 +34,7 @@ pub const Account = struct {
     /// snapshot. Unwritten slots still live in the snapshot and are read
     /// through, so this is the account's whole storage only when
     /// `base_storage_void` says so.
-    storage: std.AutoHashMapUnmanaged(u256, u256) = .empty,
+    storage: std.HashMapUnmanaged(u256, u256, KeyContext(u256), 80) = .empty,
     /// Overlay bookkeeping, not consensus state. False once the account has
     /// been erased, which is how a deletion overrides a `base` that still
     /// holds the account.
@@ -47,6 +47,53 @@ pub const Account = struct {
 };
 
 pub const SlotKey = struct { address: Address, slot: u256 };
+
+/// The hash map context every map in this file uses, in place of
+/// `std.hash_map.AutoContext`. That one feeds the key's bytes through
+/// wyhash's general byte-stream path (seeding, round loop, tail handling,
+/// finalisation), which was ~5% of block execution for keys that are just
+/// two to seven 64-bit words. This keeps wyhash's core step, a 64x64->128
+/// multiply folded back to 64 bits, applied once per pair of words.
+///
+/// The fold puts every input bit into both the low bits (the bucket index)
+/// and the top 7 (the probe fingerprint), which matters because storage
+/// slots are often small integers (0, 1, 2 for plain variables) rather than
+/// keccak outputs.
+pub fn KeyContext(comptime K: type) type {
+    return struct {
+        pub fn hash(_: @This(), key: K) u64 {
+            return switch (K) {
+                Address => hashWords(0, @truncate(key), @truncate(key >> 64), @truncate(key >> 128), 0),
+                u256 => hashWords(0, @truncate(key), @truncate(key >> 64), @truncate(key >> 128), @truncate(key >> 192)),
+                SlotKey => hashWords(
+                    hashWords(0, @truncate(key.address), @truncate(key.address >> 64), @truncate(key.address >> 128), 0),
+                    @truncate(key.slot),
+                    @truncate(key.slot >> 64),
+                    @truncate(key.slot >> 128),
+                    @truncate(key.slot >> 192),
+                ),
+                else => @compileError("no KeyContext hash for " ++ @typeName(K)),
+            };
+        }
+        pub fn eql(_: @This(), a: K, b: K) bool {
+            return std.meta.eql(a, b);
+        }
+    };
+}
+
+fn hashWords(seed: u64, w0: u64, w1: u64, w2: u64, w3: u64) u64 {
+    const h = foldMul(seed ^ w0 ^ 0xa0761d6478bd642f, w1 ^ 0xe7037ed1a0b428db);
+    const r = foldMul(h ^ w2 ^ 0x8ebc6af09c88c6e3, w3 ^ 0x589965cc75374cc3);
+    // When only `w3` varies, and by a little, the product's low bits follow
+    // the low bits of `w3` alone (and repeat if the other factor is even),
+    // so the bucket index would clump; its middle bits are well mixed.
+    return r ^ (r >> 32);
+}
+
+fn foldMul(a: u64, b: u64) u64 {
+    const p = @as(u128, a) * b;
+    return @as(u64, @truncate(p)) ^ @as(u64, @truncate(p >> 64));
+}
 
 const Change = union(enum) {
     created: Address,
@@ -77,7 +124,7 @@ allocator: std.mem.Allocator,
 /// Accounts that have been written since `base` was loaded, plus any read
 /// that had to be materialised. Everything else is read straight out of
 /// `base`, so this holds a chunk's working set rather than the whole chain.
-accounts: std.AutoHashMapUnmanaged(Address, Account) = .empty,
+accounts: std.HashMapUnmanaged(Address, Account, KeyContext(Address), 80) = .empty,
 /// The snapshot this state was resumed from, read in place. Null for a state
 /// built from genesis, in which case `accounts` is the whole story.
 base: ?Base = null,
@@ -96,14 +143,14 @@ snapshot_bytes: ?[]const u8 = null,
 /// analysing 10.3M contracts built 0.85GB of bitsets the vast majority of
 /// which no chunk ever executes. A derived cache, so `setCode` and account
 /// removal invalidate rather than update it.
-jumpdest_cache: std.AutoHashMapUnmanaged(Address, std.DynamicBitSetUnmanaged) = .empty,
+jumpdest_cache: std.HashMapUnmanaged(Address, std.DynamicBitSetUnmanaged, KeyContext(Address), 80) = .empty,
 /// Each slot's value as of the start of the current transaction, recorded
 /// the first time that transaction writes it. EIP-2200 prices an `SSTORE`
 /// on how *original*, current and new relate, so "what was this before
 /// anything in this transaction touched it" has to be answerable even after
 /// several writes. Cleared by `finalizeTransaction`, which is exactly the
 /// boundary the word "original" refers to.
-originals: std.AutoHashMapUnmanaged(SlotKey, u256) = .empty,
+originals: std.HashMapUnmanaged(SlotKey, u256, KeyContext(SlotKey), 80) = .empty,
 /// Slots already looked up in `base`, remembered so a hot one is searched
 /// for once rather than on every access. Finding a slot in the snapshot
 /// means a binary search over its account's region, and `SLOAD` is the
@@ -116,14 +163,14 @@ originals: std.AutoHashMapUnmanaged(SlotKey, u256) = .empty,
 /// `getStorage` consults first, and a destroyed or recreated account returns
 /// before the cache is reached. Entries are therefore only ever the
 /// snapshot's own unchanged values.
-slot_cache: std.AutoHashMapUnmanaged(SlotKey, u256) = .empty,
+slot_cache: std.HashMapUnmanaged(SlotKey, u256, KeyContext(SlotKey), 80) = .empty,
 /// EIP-2929's accessed addresses and storage keys for the transaction in
 /// progress: whatever is in here is "warm" and pays the small price. Seeded
 /// per transaction by `Evm.executeTransaction` and cleared by
 /// `finalizeTransaction`. Kept here rather than in the interpreter so the
 /// journal can undo a reverted frame's additions with everything else.
-warm_addresses: std.AutoHashMapUnmanaged(Address, void) = .empty,
-warm_slots: std.AutoHashMapUnmanaged(SlotKey, void) = .empty,
+warm_addresses: std.HashMapUnmanaged(Address, void, KeyContext(Address), 80) = .empty,
+warm_slots: std.HashMapUnmanaged(SlotKey, void, KeyContext(SlotKey), 80) = .empty,
 journal: std.ArrayListUnmanaged(Change) = .empty,
 /// Addresses `SELFDESTRUCT`ed during the transaction currently in
 /// progress, appended by `destroyAccount` in lockstep with its
@@ -229,7 +276,7 @@ fn removeAccount(self: *State, address: Address) void {
 
     self.deletions_since_rehash += 1;
     if (self.deletions_since_rehash >= rehash_after_deletions) {
-        self.accounts.rehash(std.hash_map.AutoContext(Address){});
+        self.accounts.rehash(KeyContext(Address){});
         self.deletions_since_rehash = 0;
     }
 }
@@ -763,7 +810,7 @@ pub const Merged = struct {
     /// account is overlay-only or its base storage has been voided.
     base_slots: []const u8,
     /// The overlay's written slots, or null when the account is base-only.
-    written: ?*const std.AutoHashMapUnmanaged(u256, u256),
+    written: ?*const std.HashMapUnmanaged(u256, u256, KeyContext(u256), 80),
 
     /// Yields every slot this account holds, ascending, with written values
     /// overriding `base`. Two passes are cheaper than buffering the union:
@@ -825,7 +872,7 @@ pub const Merged = struct {
 pub const Scan = struct {
     state: *const State,
     base_walk: ?Base.Walk,
-    overlay: std.AutoHashMapUnmanaged(Address, Account).Iterator,
+    overlay: std.HashMapUnmanaged(Address, Account, KeyContext(Address), 80).Iterator,
 
     pub fn next(self: *Scan) ?Merged {
         if (self.base_walk) |*walk| {
@@ -1628,7 +1675,7 @@ pub fn writeSnapshot(self: *const State, writer: *std.Io.Writer, block: u64, rec
 pub const Base = struct {
     /// The snapshot's bytes, owned by the caller and outliving this.
     bytes: []const u8,
-    index: std.AutoHashMapUnmanaged(Address, u64) = .empty,
+    index: std.HashMapUnmanaged(Address, u64, KeyContext(Address), 80) = .empty,
     block: u64 = 0,
 
     /// One account, pointing into `bytes`.
@@ -2232,4 +2279,36 @@ test "a snapshot stores no zero-valued slots, and reads are unchanged by their a
     try std.testing.expectEqual(@as(u256, 99), reloaded.getStorage(0xbb, 9));
     // And the root, which never counted zeros, is the same either way.
     try std.testing.expectEqual(try loaded.stateRoot(std.testing.allocator), try reloaded.stateRoot(std.testing.allocator));
+}
+
+test "KeyContext spreads structured keys evenly over buckets" {
+    // The keys real state is full of: small slot numbers, consecutive
+    // addresses, and slots or addresses that differ only in a high limb.
+    // Each set of 65536 keys goes into 4096 buckets by the low 12 bits (how
+    // the map picks a bucket), where a fair hash averages 16 per bucket.
+    // The fullest bucket of a fair hash stays well under 40.
+    const sets = [_][]const u8{ "small slots", "high-limb slots", "addresses", "high addresses", "slot keys" };
+    for (sets) |name| {
+        var buckets = [_]u16{0} ** 4096;
+        for (0..65536) |i| {
+            const n: u64 = @intCast(i);
+            const h = if (std.mem.eql(u8, name, "small slots"))
+                KeyContext(u256).hash(.{}, n)
+            else if (std.mem.eql(u8, name, "high-limb slots"))
+                KeyContext(u256).hash(.{}, @as(u256, n) << 192)
+            else if (std.mem.eql(u8, name, "addresses"))
+                KeyContext(Address).hash(.{}, n)
+            else if (std.mem.eql(u8, name, "high addresses"))
+                KeyContext(Address).hash(.{}, @as(Address, n) << 128)
+            else
+                KeyContext(SlotKey).hash(.{}, .{ .address = @as(Address, n % 256) << 100, .slot = n / 256 });
+            buckets[h & 4095] += 1;
+        }
+        var fullest: u16 = 0;
+        for (buckets) |b| fullest = @max(fullest, b);
+        std.testing.expect(fullest < 40) catch |err| {
+            std.debug.print("{s}: fullest bucket {d}\n", .{ name, fullest });
+            return err;
+        };
+    }
 }
