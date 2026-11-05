@@ -33,14 +33,22 @@ const log_ate_loop_count: u8 = 63;
 
 /// The base field `Fq`, mod `field_modulus`.
 pub const Fq = struct {
+    /// The element in Montgomery form, `value * R mod p` with `R = 2^256`.
+    /// `init` and `toInt` convert at the edges; `add`, `sub`, `neg` and `eq`
+    /// work on either form alike, and `mul` keeps the form.
     n: u256,
 
     pub fn init(n: u256) Fq {
-        return .{ .n = n % field_modulus };
+        return .{ .n = montMul(n % field_modulus, mont_r2) };
+    }
+
+    /// The plain value, in `[0, field_modulus)`.
+    pub fn toInt(a: Fq) u256 {
+        return montMul(a.n, 1);
     }
 
     pub const zero: Fq = .{ .n = 0 };
-    pub const one: Fq = .{ .n = 1 };
+    pub const one: Fq = .{ .n = @intCast((@as(u512, 1) << 256) % field_modulus) };
 
     pub fn add(a: Fq, b: Fq) Fq {
         var s = a.n + b.n;
@@ -53,39 +61,68 @@ pub const Fq = struct {
         return .{ .n = field_modulus - (b.n - a.n) };
     }
 
-    /// `a * b mod p`, by two Montgomery reductions rather than a `%`.
-    ///
-    /// `%` on a 512-bit product has no hardware instruction behind it and
-    /// compiles to a software long division, which was the floor under every
-    /// operation in this file. `redc(t)` instead computes `t / R mod p`
-    /// (`R = 2^256`) with multiplications and a shift. Applying it to `a * b`
-    /// gives `a * b / R`; applying it again to that times `R^2 mod p` cancels
-    /// the stray `1 / R`. So the result, and every `Fq` anywhere, stays in
-    /// plain (non-Montgomery) form.
+    /// `a * b mod p`. With both in Montgomery form, `montMul`'s stray
+    /// `1 / R` cancels one of the two `R`s, so the product is too.
     pub fn mul(a: Fq, b: Fq) Fq {
-        const x = redc(@as(u512, a.n) * b.n);
-        return .{ .n = redc(@as(u512, x) * mont_r2) };
+        return .{ .n = montMul(a.n, b.n) };
     }
 
-    /// `-p^-1 mod 2^256`. Newton's iteration doubles the number of correct
+    /// `-p^-1 mod 2^64`. Newton's iteration doubles the number of correct
     /// low bits each round, starting from 1 (correct mod 2, since `p` is
-    /// odd), so eight rounds reach 256.
-    const mont_n_prime: u256 = blk: {
-        var x: u256 = 1;
-        for (0..8) |_| x *%= 2 -% field_modulus *% x;
+    /// odd), so six rounds reach 64.
+    const mont_n_prime: u64 = blk: {
+        const p0: u64 = @truncate(field_modulus);
+        var x: u64 = 1;
+        for (0..6) |_| x *%= 2 -% p0 *% x;
         break :blk 0 -% x;
     };
-    /// `R^2 mod p`.
+    /// `R^2 mod p`, which `init` multiplies by to enter Montgomery form.
     const mont_r2: u256 = @intCast((@as(u1024, 1) << 512) % field_modulus);
+    /// `R^3 mod p`, which `inv` multiplies by to get back into form.
+    const mont_r3: u256 = @intCast((@as(u1024, 1) << 768) % field_modulus);
+    const p_limbs = limbs(field_modulus);
 
-    /// Montgomery reduction: `t * R^-1 mod p`, for any `t < p * R`. `m` is
-    /// chosen so `t + m * p` is a multiple of `R`, which makes the division
-    /// by `R` an exact shift. The sum stays under `2 * p * R < 2^511`, and
-    /// the quotient under `2p`, so one conditional subtraction finishes it.
-    fn redc(t: u512) u256 {
-        const m: u256 = @as(u256, @truncate(t)) *% mont_n_prime;
-        const sum = t + @as(u512, m) * field_modulus;
-        var r: u256 = @intCast(sum >> 256);
+    fn limbs(x: u256) [4]u64 {
+        return .{ @truncate(x), @truncate(x >> 64), @truncate(x >> 128), @truncate(x >> 192) };
+    }
+
+    /// `a * b / R mod p` for `a, b < p`: Montgomery multiplication, CIOS
+    /// over four 64-bit limbs. Each round adds `a * b[i]` and then a
+    /// multiple `m * p` chosen to zero the lowest limb, which is shifted
+    /// out, so the division by `R` happens one limb at a time and nothing
+    /// wider than `u128` is ever formed. Generic `u512` multiplication
+    /// instead built the full 512-bit products (three per `mul`, before
+    /// this) out of compiler-generated code that LLVM schedules poorly.
+    /// The result is below `2p < 2^255`, so it fits four limbs and one
+    /// conditional subtraction finishes it.
+    fn montMul(a: u256, b: u256) u256 {
+        const x = limbs(a);
+        const y = limbs(b);
+        var t: [6]u64 = .{0} ** 6;
+        inline for (0..4) |i| {
+            var c: u64 = 0;
+            inline for (0..4) |j| {
+                const s = @as(u128, t[j]) + @as(u128, x[j]) * y[i] + c;
+                t[j] = @truncate(s);
+                c = @intCast(s >> 64);
+            }
+            const s4 = @as(u128, t[4]) + c;
+            t[4] = @truncate(s4);
+            t[5] = @intCast(s4 >> 64);
+
+            const m = t[0] *% mont_n_prime;
+            var s = @as(u128, t[0]) + @as(u128, m) * p_limbs[0];
+            c = @intCast(s >> 64);
+            inline for (1..4) |j| {
+                s = @as(u128, t[j]) + @as(u128, m) * p_limbs[j] + c;
+                t[j - 1] = @truncate(s);
+                c = @intCast(s >> 64);
+            }
+            s = @as(u128, t[4]) + c;
+            t[3] = @truncate(s);
+            t[4] = t[5] + @as(u64, @intCast(s >> 64));
+        }
+        var r: u256 = @as(u256, t[0]) | @as(u256, t[1]) << 64 | @as(u256, t[2]) << 128 | @as(u256, t[3]) << 192;
         if (r >= field_modulus) r -= field_modulus;
         return r;
     }
@@ -116,7 +153,11 @@ pub const Fq = struct {
     ///
     /// Everything stays in `[0, field_modulus)`, and `field_modulus` is 254
     /// bits, so the `+ field_modulus` halving steps cannot overflow `u256`.
+    ///
+    /// The GCD inverts the stored `a R`, giving `a^-1 R^-1`; one `montMul`
+    /// by `R^3` turns that into `a^-1 R`, the Montgomery form of `a^-1`.
     pub fn inv(a: Fq) Fq {
+        @setEvalBranchQuota(100_000);
         if (a.n == 0) return a;
         var u: u256 = a.n;
         var v: u256 = field_modulus;
@@ -139,7 +180,7 @@ pub const Fq = struct {
                 x2 = (Fq{ .n = x2 }).sub(.{ .n = x1 }).n;
             }
         }
-        return .{ .n = if (u == 1) x1 else x2 };
+        return .{ .n = montMul(if (u == 1) x1 else x2, mont_r3) };
     }
 
     pub fn div(a: Fq, b: Fq) Fq {
@@ -226,6 +267,13 @@ pub fn Fqp(comptime degree: usize, comptime modulus_coeffs: [degree]i64) type {
 
         pub fn mul(a: Self, b: Self) Self {
             if (comptime is_bn254_fq12) return .{ .coeffs = tower.mul12(a.coeffs, b.coeffs) };
+            // `Fq2` is the tower's bottom level (`u^2 = -1`): three `Fq`
+            // multiplications, where the schoolbook path spends four plus
+            // two more reducing by the modulus.
+            if (comptime degree == 2 and modulus_coeffs[0] == 1 and modulus_coeffs[1] == 0) {
+                const t = tower.mul2(.{ .a = a.coeffs[0], .b = a.coeffs[1] }, .{ .a = b.coeffs[0], .b = b.coeffs[1] });
+                return .{ .coeffs = .{ t.a, t.b } };
+            }
             return a.mulSchoolbook(b);
         }
 
@@ -484,12 +532,152 @@ const tower = struct {
 
     /// `(g0 + h0 w)(g1 + h1 w) = (g0 g1 + h0 h1 v) + ((g0 + h0)(g1 + h1) - g0 g1 - h0 h1) w`
     fn mul12(a: [12]Fq, b: [12]Fq) [12]Fq {
-        const x = fromFlat(a);
-        const y = fromFlat(b);
+        return toFlat(mul12T(fromFlat(a), fromFlat(b)));
+    }
+    fn mul12T(x: T12, y: T12) T12 {
         const t0 = mul6(x.g, y.g);
         const t1 = mul6(x.h, y.h);
         const cross = sub6(sub6(mul6(add6(x.g, x.h), add6(y.g, y.h)), t0), t1);
-        return toFlat(.{ .g = add6(t0, mulV(t1)), .h = cross });
+        return .{ .g = add6(t0, mulV(t1)), .h = cross };
+    }
+    /// `(g + h w)^2 = g^2 + h^2 v + 2 g h w`, with `g^2 + h^2 v` taken as
+    /// `(g + h)(g + h v) - g h - g h v`: two `Fq6` multiplications, not three.
+    fn sqr12T(x: T12) T12 {
+        const t = mul6(x.g, x.h);
+        const c0 = sub6(sub6(mul6(add6(x.g, x.h), add6(x.g, mulV(x.h))), t), mulV(t));
+        return .{ .g = c0, .h = add6(t, t) };
+    }
+    /// `x^(p^6)`, which on `g + h w` is `g - h w`. For `x` in the cyclotomic
+    /// subgroup (everything after the easy part of the final
+    /// exponentiation) that is also `x^-1`.
+    fn conj12(x: T12) T12 {
+        return .{ .g = x.g, .h = .{ neg2(x.h[0]), neg2(x.h[1]), neg2(x.h[2]) } };
+    }
+    fn frob12(x: T12, comptime n: usize) T12 {
+        return fromFlat(frobeniusPow(.{ .coeffs = toFlat(x) }, n).coeffs);
+    }
+
+    /// Squaring in the cyclotomic subgroup, Granger and Scott, "Faster
+    /// Squaring in the Cyclotomic Subgroup of Sixth Degree Extensions"
+    /// (2010). Elements there satisfy `x^(p^6 + 1) = 1`, which ties the
+    /// coefficients together enough that a square needs three `Fq4`
+    /// squarings (each two `Fq2` multiplications here) rather than a full
+    /// `Fq12` one. Ported from arkworks' `cyclotomic_square_in_place`, which
+    /// uses this same tower, with its `r0..r5` naming of the coefficients.
+    /// Only valid on the cyclotomic subgroup.
+    fn cycSqr(x: T12) T12 {
+        const r0 = x.g[0];
+        const r4 = x.g[1];
+        const r3 = x.g[2];
+        const r2 = x.h[0];
+        const r1 = x.h[1];
+        const r5 = x.h[2];
+        // (z0 + z1 y)^2 for the three Fq4 pairs, y^2 = xi.
+        var tmp = mul2(r0, r1);
+        const t0 = sub2(sub2(mul2(add2(r0, r1), add2(mulXi(r1), r0)), tmp), mulXi(tmp));
+        const t1 = add2(tmp, tmp);
+        tmp = mul2(r2, r3);
+        const t2 = sub2(sub2(mul2(add2(r2, r3), add2(mulXi(r3), r2)), tmp), mulXi(tmp));
+        const t3 = add2(tmp, tmp);
+        tmp = mul2(r4, r5);
+        const t4 = sub2(sub2(mul2(add2(r4, r5), add2(mulXi(r5), r4)), tmp), mulXi(tmp));
+        const t5 = add2(tmp, tmp);
+        // 3 t - 2 z and 3 t + 2 z.
+        const z0 = add2(t0, double2(sub2(t0, r0)));
+        const z1 = add2(t1, double2(add2(t1, r1)));
+        const xt5 = mulXi(t5);
+        const z2 = add2(xt5, double2(add2(xt5, r2)));
+        const z3 = add2(t4, double2(sub2(t4, r3)));
+        const z4 = add2(t2, double2(sub2(t2, r4)));
+        const z5 = add2(t3, double2(add2(t3, r5)));
+        return .{ .g = .{ z0, z4, z3 }, .h = .{ z2, z1, z5 } };
+    }
+    /// A Miller-loop line value `l0 + l1 w + l3 w^3`, each coefficient in
+    /// `Fq2`: in tower form `g = (l0, 0, 0)` and `h = (l1, l3, 0)`.
+    const Line = struct { l0: T2, l1: T2, l3: T2 };
+    fn line(l0: Fq2, l1: Fq2, l3: Fq2) Line {
+        return .{
+            .l0 = .{ .a = l0.coeffs[0], .b = l0.coeffs[1] },
+            .l1 = .{ .a = l1.coeffs[0], .b = l1.coeffs[1] },
+            .l3 = .{ .a = l3.coeffs[0], .b = l3.coeffs[1] },
+        };
+    }
+    /// `f * l` for a line `l`, skipping its zero coefficients: 13 `Fq2`
+    /// multiplications against `mul12T`'s 18.
+    fn mulLine(f: T12, l: Line) T12 {
+        const a: T6 = .{ mul2(f.g[0], l.l0), mul2(f.g[1], l.l0), mul2(f.g[2], l.l0) };
+        const b = mul6By01(f.h, l.l1, l.l3);
+        const c = mul6By01(add6(f.g, f.h), add2(l.l0, l.l1), l.l3);
+        return .{ .g = add6(a, mulV(b)), .h = sub6(sub6(c, a), b) };
+    }
+    /// `x * (e0 + e1 v)`: five `Fq2` multiplications against `mul6`'s six.
+    fn mul6By01(x: T6, e0: T2, e1: T2) T6 {
+        const t0 = mul2(x[0], e0);
+        const t1 = mul2(x[1], e1);
+        const c0 = add2(t0, mulXi(mul2(x[2], e1)));
+        const c1 = sub2(sub2(mul2(add2(x[0], x[1]), add2(e0, e1)), t0), t1);
+        const c2 = add2(t1, mul2(x[2], e0));
+        return .{ c0, c1, c2 };
+    }
+
+    fn double2(x: T2) T2 {
+        return add2(x, x);
+    }
+
+    /// The BN parameter `u` the curve is generated from: `p` and
+    /// `curve_order` are polynomials in it, and `ate_loop_count = 6u + 2`.
+    const bn_u: u64 = 4965661367192848881;
+
+    /// `x^u` for `x` in the cyclotomic subgroup.
+    fn expU(x: T12) T12 {
+        var r = x;
+        var bit: u6 = 63 - @clz(bn_u);
+        while (bit > 0) {
+            bit -= 1;
+            r = cycSqr(r);
+            if ((bn_u >> bit) & 1 == 1) r = mul12T(r, x);
+        }
+        return r;
+    }
+
+    /// `x^((p^4 - p^2 + 1) / curve_order)`, the hard part of the final
+    /// exponentiation, for `x` in the cyclotomic subgroup.
+    ///
+    /// Writing the exponent in base `p` with coefficients that are
+    /// polynomials in `u` turns one 761-bit exponentiation into three by the
+    /// 63-bit `u`, plus Frobenius maps, which are nearly free. This is the
+    /// addition chain of Scott et al., "On the Final Exponentiation for
+    /// Calculating Pairings on Ordinary Elliptic Curves" (2009), line for
+    /// line as go-ethereum's `finalExponentiation` (crypto/bn256/cloudflare)
+    /// has it. It computes exactly the same power, not a multiple of it
+    /// (checked against `hard_exponent` in the tests).
+    fn hardPart(t: T12) T12 {
+        const fp = frob12(t, 1);
+        const fp2 = frob12(t, 2);
+        const fp3 = frob12(fp2, 1);
+
+        const fu = expU(t);
+        const fu2 = expU(fu);
+        const fu3 = expU(fu2);
+
+        const fu2p = frob12(fu2, 1);
+        const fu3p = frob12(fu3, 1);
+        const y2 = frob12(fu2, 2);
+
+        const y0 = mul12T(mul12T(fp, fp2), fp3);
+        const y1 = conj12(t);
+        const y5 = conj12(fu2);
+        const y3 = conj12(frob12(fu, 1));
+        const y4 = conj12(mul12T(fu, fu2p));
+        const y6 = conj12(mul12T(fu3, fu3p));
+
+        var t0 = mul12T(mul12T(cycSqr(y6), y4), y5);
+        var t1 = mul12T(mul12T(y3, y5), t0);
+        t0 = mul12T(t0, y2);
+        t1 = cycSqr(mul12T(cycSqr(t1), t0));
+        t0 = mul12T(t1, y1);
+        t1 = mul12T(t1, y0);
+        return mul12T(cycSqr(t0), t1);
     }
     /// `(g + h w)^-1 = (g - h w) / (g^2 - h^2 v)`.
     fn inv12(a: [12]Fq) [12]Fq {
@@ -538,7 +726,7 @@ pub fn frobenius(a: Fq12) Fq12 {
     inline for (0..12) |i| {
         inline for (0..12) |j| {
             if (comptime frobenius_gamma[i][j] != 0) {
-                out[j] = out[j].add(a.coeffs[i].mul(.{ .n = frobenius_gamma[i][j] }));
+                out[j] = out[j].add(a.coeffs[i].mul(comptime Fq.init(frobenius_gamma[i][j])));
             }
         }
     }
@@ -554,7 +742,8 @@ fn frobeniusPow(a: Fq12, comptime n: usize) Fq12 {
 
 /// `(field_modulus^4 - field_modulus^2 + 1) / curve_order`, the only factor
 /// of `final_exponent` that still needs a real exponentiation. 761 bits
-/// against the whole exponent's 2790.
+/// against the whole exponent's 2790. `tower.hardPart` computes this power
+/// without ever spelling it out; the value stays as what it is tested against.
 const hard_exponent: u761 = 10486551571378427818905133077457505975217533156541166536005452068033223782873764572151541189142778783267711471998854717549389605644966361077867290379973073897271417449614939788000730910148473503528371060814157528868116901618729649;
 
 /// `f^((field_modulus^12 - 1) / curve_order)`, the pairing's final
@@ -564,13 +753,15 @@ const hard_exponent: u761 = 1048655157137842781890513307745750597521753315654116
 /// (asserted in the test below). The first two factors cost a Frobenius and
 /// a single inversion each; only the third is exponentiated, and it is a
 /// quarter the width. Square-and-multiply over the undecomposed 2790-bit
-/// exponent was 71% of a pairing's time.
+/// exponent was 71% of a pairing's time. The third goes through
+/// `tower.hardPart`'s addition chain rather than square-and-multiply over
+/// its 761 bits, which was still half a pairing.
 pub fn finalExponentiate(f: Fq12) Fq12 {
     // Matches what `pow` would do with a zero base; `inv` below would not.
     if (f.isZero()) return Fq12.zero;
     const easy = frobeniusPow(f, 6).mul(f.inv());
     const m = frobeniusPow(easy, 2).mul(easy);
-    return m.pow(u761, hard_exponent);
+    return .{ .coeffs = tower.toFlat(tower.hardPart(tower.fromFlat(m.coeffs))) };
 }
 
 /// An affine point over field `F`, or `null` for the point at infinity —
@@ -806,67 +997,75 @@ pub fn millerLoop(q: ?G2Point, p: ?G1Point) Fq12 {
 }
 
 /// `millerLoopRaw`'s loop with `Q` kept in `G2` over `Fq2` rather than
-/// twisted into `Fq12`, producing the very same `Fq12` value.
+/// twisted into `Fq12`, in Jacobian coordinates, with `f` kept in `tower`
+/// form throughout.
 ///
 /// The twisted point is `(x w^2, y w^3)` for `Q = (x, y)`, so every slope the
 /// reference divides out in `Fq12` is `lambda * w` for the `lambda` of the
 /// same step over `Fq2`, and the twist commutes with doubling and adding.
-/// Point arithmetic and slopes therefore stay in `Fq2`, where an inversion is
-/// a single `Fq` inversion; the reference performed three `Fq12` inversions
-/// per round (one each in `linefunc`, `double` and `add`), which were about
-/// two thirds of a pairing once multiplication was cheap. Only squaring `f`
-/// and multiplying in each line still happen in `Fq12`.
+/// Each line through `R` (and `Q`) evaluated at `P` is then
+///
+///     -yp + (lambda xp) w + (yr - lambda xr) w^3
+///
+/// Jacobian `R` avoids the division in `lambda` by scaling the whole line by
+/// its denominator, an `Fq2` element (see `doubleStep`/`addStep`). That
+/// changes `f` by a product of `Fq2` factors, which the final
+/// exponentiation sends to 1: `Fq2` lies inside `Fq6`, and the exponent's
+/// `p^6 - 1` factor kills all of `Fq6`. So the value differs from the
+/// reference's here, but not after `finalExponentiate` (tested).
+///
+/// Requires `Q` in the order-`curve_order` subgroup, as `ECPAIRING` checks
+/// before calling this: then no step meets the point at infinity or a
+/// vertical line.
 fn millerLoopFq2(q: G2Point, p: G1Point) Fq12 {
-    var r = q;
-    var f = Fq12.one;
+    var r: Jacobian(Fq2) = .{ .x = q.x, .y = q.y, .z = Fq2.one };
+    var f = tower.fromFlat(Fq12.one.coeffs);
     var i: i16 = log_ate_loop_count;
     while (i >= 0) : (i -= 1) {
-        f = f.mul(f).mul(lineAt(r, r, p));
-        r = double(Fq2, r);
+        f = tower.mulLine(tower.sqr12T(f), doubleStep(&r, p));
         if (ate_loop_count & (@as(u256, 1) << @intCast(i)) != 0) {
-            f = f.mul(lineAt(r, q, p));
-            r = add(Fq2, r, q).?;
+            f = tower.mulLine(f, addStep(&r, q, p));
         }
     }
     const q1 = frobeniusG2(q);
     const nq2 = neg(Fq2, frobeniusG2(q1)).?;
-    f = f.mul(lineAt(r, q1, p));
-    r = add(Fq2, r, q1).?;
-    f = f.mul(lineAt(r, nq2, p));
-    return f;
+    f = tower.mulLine(f, addStep(&r, q1, p));
+    f = tower.mulLine(f, addStep(&r, nq2, p));
+    return .{ .coeffs = tower.toFlat(f) };
 }
 
-/// `linefunc(twist(r), twist(s), castPointToFq12(p))`: the line through `r`
-/// and `s` (the tangent if they are equal) evaluated at `p`, built directly.
-/// With the twisted `x1 = xr w^2`, `y1 = yr w^3` and slope `lambda w`, the
-/// reference's `m (xt - x1) - (yt - y1)` expands to
+/// The tangent at `r` evaluated at `p`, then `r = 2r`. With `x = X/Z^2`,
+/// `y = Y/Z^3` and `lambda = 3x^2 / 2y`, the line times `2 Y Z^3` is
 ///
-///     -yp + (lambda xp) w + (yr - lambda xr) w^3
-///
-/// and the vertical line `xt - x1` to `xp - xr w^2`.
-fn lineAt(r: G2Point, s: G2Point, p: G1Point) Fq12 {
-    var c: [12]Fq = .{Fq.zero} ** 12;
-    if (r.x.eq(s.x) and !r.y.eq(s.y)) {
-        c[0] = p.x;
-        placeFq2(&c, 2, r.x.neg());
-        return .{ .coeffs = c };
-    }
-    const lambda = if (r.x.eq(s.x))
-        r.x.mul(r.x).mulScalar(Fq.init(3)).div(r.y.mulScalar(Fq.init(2)))
-    else
-        s.y.sub(r.y).div(s.x.sub(r.x));
-    c[0] = p.y.neg();
-    placeFq2(&c, 1, lambda.mulScalar(p.x));
-    placeFq2(&c, 3, r.y.sub(lambda.mul(r.x)));
-    return .{ .coeffs = c };
+///     -(2 Y Z^3) yp + (3 X^2 Z^2) xp w + (2 Y^2 - 3 X^3) w^3
+fn doubleStep(r: *Jacobian(Fq2), p: G1Point) tower.Line {
+    const xx = r.x.mul(r.x);
+    const yy = r.y.mul(r.y);
+    const zz = r.z.mul(r.z);
+    const xx3 = xx.add(xx).add(xx);
+    const yz = r.y.mul(r.z);
+    const l0 = yz.add(yz).mul(zz).mulScalar(p.y).neg();
+    const l1 = xx3.mul(zz).mulScalar(p.x);
+    const l3 = yy.add(yy).sub(xx3.mul(r.x));
+    r.* = jacobianDouble(Fq2, r.*);
+    return tower.line(l0, l1, l3);
 }
 
-/// Adds `b * w^k` into the flat coefficients `c`, for `b` in `Fq2`. `twist`
-/// embeds `Fq2` through `i = w^6 - 9`, so `(b0 + b1 i) w^k` is
-/// `(b0 - 9 b1) w^k + b1 w^(k+6)`.
-fn placeFq2(c: *[12]Fq, k: usize, b: Fq2) void {
-    c[k] = c[k].add(b.coeffs[0].sub(tower.times9(b.coeffs[1])));
-    c[k + 6] = c[k + 6].add(b.coeffs[1]);
+/// The line through `r` and the affine `q` evaluated at `p`, then
+/// `r = r + q`. With `h = xq Z^2 - X` and `s = yq Z^3 - Y`,
+/// `lambda = s / (Z h)`, and the line times `Z h` is
+///
+///     -(Z h) yp + s xp w + (yq Z h - s xq) w^3
+fn addStep(r: *Jacobian(Fq2), q: G2Point, p: G1Point) tower.Line {
+    const zz = r.z.mul(r.z);
+    const h = q.x.mul(zz).sub(r.x);
+    const s = q.y.mul(r.z).mul(zz).sub(r.y);
+    const zh = r.z.mul(h);
+    const l0 = zh.mulScalar(p.y).neg();
+    const l1 = s.mulScalar(p.x);
+    const l3 = q.y.mul(zh).sub(s.mul(q.x));
+    r.* = jacobianAddAffine(Fq2, r.*, q);
+    return tower.line(l0, l1, l3);
 }
 
 /// The `G2` point whose twist is the Frobenius image of `twist(q)`, which is
@@ -1028,22 +1227,26 @@ test "the direct Fq2 inverse agrees with the generic polynomial Euclid" {
 }
 
 test "Montgomery Fq.mul agrees with a plain 512-bit remainder" {
-    // The reference is the exact expression `mul` used to be.
+    // The reference is the plain-integer product reduced with `%`, through
+    // `init`/`toInt`, so this also checks the conversions in and out.
     var prng: std.Random.DefaultPrng = .init(0x6d6f6e74);
     const rand = prng.random();
     for (0..2000) |_| {
-        const a = Fq.init(rand.int(u256));
-        const b = Fq.init(rand.int(u256));
-        const expected: u256 = @intCast((@as(u512, a.n) * b.n) % field_modulus);
-        try std.testing.expectEqual(expected, a.mul(b).n);
+        const x = rand.int(u256) % field_modulus;
+        const y = rand.int(u256) % field_modulus;
+        const expected: u256 = @intCast((@as(u512, x) * y) % field_modulus);
+        try std.testing.expectEqual(expected, Fq.init(x).mul(Fq.init(y)).toInt());
     }
     // Edges: zero, one, the largest element, and squaring it (the largest
-    // possible product, which is what bounds `redc`'s input).
+    // possible product).
     const edges = [_]u256{ 0, 1, 2, field_modulus - 1, field_modulus - 2 };
     for (edges) |x| for (edges) |y| {
         const expected: u256 = @intCast((@as(u512, x) * y) % field_modulus);
-        try std.testing.expectEqual(expected, (Fq{ .n = x }).mul(.{ .n = y }).n);
+        try std.testing.expectEqual(expected, Fq.init(x).mul(Fq.init(y)).toInt());
     };
+    // Every stored form round-trips, and `one` is the multiplicative unit.
+    for (edges) |x| try std.testing.expectEqual(x, Fq.init(x).toInt());
+    try std.testing.expectEqual(@as(u256, 1), Fq.one.toInt());
 }
 
 test "the Fq12 tower multiplies and inverts exactly like the flat reference" {
@@ -1095,16 +1298,42 @@ test "Jacobian multiply agrees with the affine reference on G1 and G2" {
     try std.testing.expectEqual(@as(?G1Point, null), multiply(Fq, g1, curve_order));
 }
 
-test "the Fq2 Miller loop computes exactly the reference's Fq12 value" {
-    // Exact equality before the final exponentiation, not just after it:
-    // both loops are meant to produce the same field element.
+test "the Fq2 Miller loop agrees with the reference after the final exponentiation" {
+    // The Jacobian loop's value differs from the reference's by `Fq2`
+    // factors (its scaled lines), which the final exponentiation removes, so
+    // the comparison is made after it.
     const ps = [_]u256{ 1, 2, 7, 1234567, curve_order - 1 };
     const qs = [_]u256{ 1, 3, 11, 7654321, curve_order - 2 };
     for (ps) |a| for (qs) |b| {
         const p = multiply(Fq, g1, a).?;
         const q = multiply(Fq2, g2, b).?;
-        try std.testing.expect(millerLoop(q, p).eq(millerLoopRaw(twist(q), castPointToFq12(p))));
+        const expected = finalExponentiate(millerLoopRaw(twist(q), castPointToFq12(p)));
+        try std.testing.expect(finalExponentiate(millerLoop(q, p)).eq(expected));
     };
     try std.testing.expect(millerLoop(null, g1).eq(Fq12.one));
     try std.testing.expect(millerLoop(g2, null).eq(Fq12.one));
+}
+
+test "cyclotomic squaring and the hard-part chain agree with plain arithmetic" {
+    // Elements of the cyclotomic subgroup, which both are only valid on,
+    // made the way the final exponentiation makes them: the easy part
+    // applied to a random element.
+    var prng: std.Random.DefaultPrng = .init(0x63796373);
+    const rand = prng.random();
+    for (0..3) |_| {
+        var coeffs: [12]Fq = undefined;
+        for (&coeffs) |*c| c.* = Fq.init(rand.int(u256));
+        const f: Fq12 = .{ .coeffs = coeffs };
+        const easy = frobeniusPow(f, 6).mul(f.inv());
+        const m = frobeniusPow(easy, 2).mul(easy);
+        const t = tower.fromFlat(m.coeffs);
+        try std.testing.expect((Fq12{ .coeffs = tower.toFlat(tower.cycSqr(t)) }).eq(m.mul(m)));
+        try std.testing.expect((Fq12{ .coeffs = tower.toFlat(tower.sqr12T(t)) }).eq(m.mul(m)));
+        try std.testing.expect((Fq12{ .coeffs = tower.toFlat(tower.hardPart(t)) }).eq(m.pow(u761, hard_exponent)));
+    }
+    // Plain squaring is not limited to the subgroup.
+    var coeffs: [12]Fq = undefined;
+    for (&coeffs) |*c| c.* = Fq.init(rand.int(u256));
+    const a: Fq12 = .{ .coeffs = coeffs };
+    try std.testing.expect((Fq12{ .coeffs = tower.toFlat(tower.sqr12T(tower.fromFlat(coeffs))) }).eq(a.mul(a)));
 }

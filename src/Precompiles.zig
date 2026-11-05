@@ -642,8 +642,8 @@ fn encodeG1(allocator: std.mem.Allocator, pt: ?bn128.G1Point) ![]u8 {
     const out = try allocator.alloc(u8, 64);
     @memset(out, 0);
     if (pt) |p| {
-        std.mem.writeInt(u256, out[0..32], p.x.n, .big);
-        std.mem.writeInt(u256, out[32..64], p.y.n, .big);
+        std.mem.writeInt(u256, out[0..32], p.x.toInt(), .big);
+        std.mem.writeInt(u256, out[32..64], p.y.toInt(), .big);
     }
     return out;
 }
@@ -947,16 +947,16 @@ test "ECPAIRING checks a product of pairings, not each pairing separately" {
     var pair: [192]u8 = undefined;
     const writeG1 = struct {
         fn f(buf: []u8, pt: bn.G1Point) void {
-            std.mem.writeInt(u256, buf[0..32], pt.x.n, .big);
-            std.mem.writeInt(u256, buf[32..64], pt.y.n, .big);
+            std.mem.writeInt(u256, buf[0..32], pt.x.toInt(), .big);
+            std.mem.writeInt(u256, buf[32..64], pt.y.toInt(), .big);
         }
     }.f;
     const writeG2 = struct {
         fn f(buf: []u8, pt: bn.G2Point) void {
-            std.mem.writeInt(u256, buf[0..32], pt.x.coeffs[1].n, .big);
-            std.mem.writeInt(u256, buf[32..64], pt.x.coeffs[0].n, .big);
-            std.mem.writeInt(u256, buf[64..96], pt.y.coeffs[1].n, .big);
-            std.mem.writeInt(u256, buf[96..128], pt.y.coeffs[0].n, .big);
+            std.mem.writeInt(u256, buf[0..32], pt.x.coeffs[1].toInt(), .big);
+            std.mem.writeInt(u256, buf[32..64], pt.x.coeffs[0].toInt(), .big);
+            std.mem.writeInt(u256, buf[64..96], pt.y.coeffs[1].toInt(), .big);
+            std.mem.writeInt(u256, buf[96..128], pt.y.coeffs[0].toInt(), .big);
         }
     }.f;
 
