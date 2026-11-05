@@ -93,6 +93,9 @@ gas_remaining: u64,
 refund: i64 = 0,
 status: Status = .running,
 jumpdest: std.DynamicBitSetUnmanaged,
+/// Whether `jumpdest` is this frame's own analysis (freed by `deinit`) or
+/// a borrow of `State`'s cached one.
+owns_jumpdest: bool,
 
 /// Output captured by `RETURN`/`REVERT`, owned by this interpreter. Empty
 /// (not an error) if execution halted via `STOP` or ran off the end of code.
@@ -139,7 +142,11 @@ pub const CallParams = struct {
     block: BlockContext = .{},
     /// Already-analyzed jumpdests for `code`, when the caller has one on
     /// hand (`State.getJumpdest`, for an existing on-chain contract) —
-    /// cloned rather than re-scanning `code` from scratch. `null` (the
+    /// borrowed rather than re-scanning `code` from scratch. Copying the
+    /// struct shares its bits, which outlive this frame for the same reason
+    /// the borrowed `code` does: the cache only drops an entry when its
+    /// code goes away, at the end of the transaction or when rolling back a
+    /// creation whose frames have already returned. `null` (the
     /// default: every test, and `CREATE`'s one-shot init code) falls back
     /// to analyzing `code` directly, same as always.
     jumpdest: ?*const std.DynamicBitSetUnmanaged = null,
@@ -152,9 +159,10 @@ pub fn initCall(allocator: std.mem.Allocator, code: []const u8, gas_limit: u64, 
         .memory = Memory.init(allocator),
         .gas_remaining = gas_limit,
         .jumpdest = if (params.jumpdest) |precomputed|
-            try precomputed.clone(allocator)
+            precomputed.*
         else
             try analyzeJumpdests(allocator, code),
+        .owns_jumpdest = params.jumpdest == null,
         .stack = try Stack.init(allocator),
         .address = params.address,
         .caller = params.caller,
@@ -171,7 +179,7 @@ pub fn initCall(allocator: std.mem.Allocator, code: []const u8, gas_limit: u64, 
 pub fn deinit(self: *Interpreter) void {
     self.stack.deinit();
     self.memory.deinit();
-    self.jumpdest.deinit(self.allocator);
+    if (self.owns_jumpdest) self.jumpdest.deinit(self.allocator);
     if (self.return_data.len != 0) self.allocator.free(self.return_data);
     if (self.last_return_data.len != 0) self.allocator.free(self.last_return_data);
 }
@@ -2620,7 +2628,7 @@ test "a CALLed contract's own internal JUMP loop runs correctly through State's 
     // callee: the same counts-a-stack-value-down-to-zero loop as the
     // JUMP/JUMPDEST unit test above, but reached via `state.setCode` +
     // `CALL` instead of a bare `Interpreter.init`, so this exercises
-    // `State.getJumpdest`'s cached bitset (cloned into the child
+    // `State.getJumpdest`'s cached bitset (borrowed by the child
     // `Interpreter`) rather than a fresh `analyzeJumpdests` scan — the
     // two must validate `JUMP`/`JUMPI` identically.
     const push1 = @intFromEnum(OpCode.PUSH1);
