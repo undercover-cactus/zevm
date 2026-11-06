@@ -889,29 +889,27 @@ fn blockHash(self: *const Interpreter, requested: u256) u256 {
 
 // --- calldata ---
 
-/// Reads a byte from `data` at `index`, or 0 if beyond `data`'s bounds.
-/// Calldata (and code) reads are always zero-padded, unlike memory/stack.
-fn readPadded(data: []const u8, index: usize) u8 {
-    return if (index < data.len) data[index] else 0;
+/// Fills `dest` from `src` starting at `src_offset`, with zeros past `src`'s
+/// end. Calldata (and code) reads are always zero-padded, unlike memory/stack.
+fn copyPadded(dest: []u8, src: []const u8, src_offset: usize) void {
+    const start = @min(src_offset, src.len);
+    const n = @min(src.len - start, dest.len);
+    @memcpy(dest[0..n], src[start..][0..n]);
+    @memset(dest[n..], 0);
 }
 
 fn calldataload(self: *Interpreter) void {
     if (!self.chargeGas(gas.verylow)) return;
     const offset256 = self.popStack() orelse return;
-    var word: [32]u8 = [_]u8{0} ** 32;
-    if (std.math.cast(usize, offset256)) |offset| {
-        var i: usize = 0;
-        while (i < 32) : (i += 1) {
-            word[i] = readPadded(self.calldata, offset +| i);
-        }
-    }
+    var word: [32]u8 = undefined;
+    copyPadded(&word, self.calldata, std.math.cast(usize, offset256) orelse std.math.maxInt(usize));
     self.pushStack(std.mem.readInt(u256, &word, .big));
     self.pc += 1;
 }
 
 /// Shared by `CALLDATACOPY`/`CODECOPY`/`EXTCODECOPY`: all three copy from
 /// some byte slice into memory with the same zero-padded semantics (see
-/// `readPadded`); only the source slice and the caller's own base gas differ.
+/// `copyPadded`); only the source slice and the caller's own base gas differ.
 fn copyToMemory(self: *Interpreter, src: []const u8, dest256: u256, offset256: u256, size256: u256) !void {
     const region = self.toMemRegion(dest256, size256) orelse return;
     if (!self.chargeMemoryExpansion(region.offset, region.size)) return;
@@ -921,14 +919,9 @@ fn copyToMemory(self: *Interpreter, src: []const u8, dest256: u256, offset256: u
         return;
     }
 
-    const src_offset = std.math.cast(usize, offset256) orelse std.math.maxInt(usize);
-    const buf = try self.allocator.alloc(u8, region.size);
-    defer self.allocator.free(buf);
-    var i: usize = 0;
-    while (i < region.size) : (i += 1) {
-        buf[i] = readPadded(src, src_offset +| i);
-    }
-    try self.memory.write(region.offset, buf);
+    try self.memory.expand(region.offset, region.size);
+    const dest = self.memory.bytes.items[region.offset..][0..region.size];
+    copyPadded(dest, src, std.math.cast(usize, offset256) orelse std.math.maxInt(usize));
     self.pc += 1;
 }
 
@@ -2561,6 +2554,22 @@ test "CALLDATALOAD reads a word, zero-padded past the end of calldata" {
     defer interp.deinit();
     try interp.run();
     try std.testing.expectEqual(@as(u256, 0xff) << (31 * 8), try interp.stack.pop());
+}
+
+test "copyPadded zero-pads a read that straddles or starts past the end" {
+    const src = [_]u8{ 1, 2, 3 };
+    var dest: [4]u8 = undefined;
+    copyPadded(&dest, &src, 0);
+    try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3, 0 }, &dest);
+    copyPadded(&dest, &src, 2);
+    try std.testing.expectEqualSlices(u8, &.{ 3, 0, 0, 0 }, &dest);
+    copyPadded(&dest, &src, 3);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0 }, &dest);
+    copyPadded(&dest, &src, std.math.maxInt(usize));
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0 }, &dest);
+    var short: [2]u8 = undefined;
+    copyPadded(&short, &src, 1);
+    try std.testing.expectEqualSlices(u8, &.{ 2, 3 }, &short);
 }
 
 test "CALLDATACOPY copies calldata into memory, zero-padded past the end" {
