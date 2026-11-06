@@ -741,14 +741,15 @@ fn ternaryOp(self: *Interpreter, cost: u64, comptime f: fn (u256, u256, u256) u2
 
 fn pushN(self: *Interpreter, n: u8) void {
     if (!self.chargeGas(gas.verylow)) return;
-    var value: u256 = 0;
-    var i: usize = 0;
-    while (i < n) : (i += 1) {
-        const idx = self.pc + 1 + i;
-        const byte: u8 = if (idx < self.code.len) self.code[idx] else 0;
-        value = (value << 8) | byte;
+    const start = self.pc + 1;
+    if (n <= 8 and start + 8 <= self.code.len) {
+        const high = std.mem.readInt(u64, self.code[start..][0..8], .big);
+        self.pushStack(high >> @intCast(64 - 8 * @as(usize, n)));
+    } else {
+        var word: [32]u8 = [_]u8{0} ** 32;
+        copyPadded(word[32 - n..], self.code, start);
+        self.pushStack(std.mem.readInt(u256, &word, .big));
     }
-    self.pushStack(value);
     self.pc += 1 + @as(usize, n);
 }
 
@@ -2337,6 +2338,27 @@ test "jumping to a non-JUMPDEST byte halts as invalid_jump" {
     defer interp.deinit();
     try interp.run();
     try std.testing.expectEqual(Status.invalid_jump, interp.status);
+}
+
+test "PUSH matches byte-by-byte reading for every size and truncation" {
+    var code: [64]u8 = undefined;
+    for (&code, 0..) |*byte, i| byte.* = @intCast(0x80 + i);
+    var n: u8 = 1;
+    while (n <= 32) : (n += 1) {
+        code[0] = @intFromEnum(OpCode.PUSH1) + n - 1;
+        var len: usize = 1;
+        while (len <= code.len) : (len += 1) {
+            var expected: u256 = 0;
+            for (1..@as(usize, n) + 1) |i| {
+                expected = (expected << 8) | (if (i < len) code[i] else 0);
+            }
+            var interp = try Interpreter.init(std.testing.allocator, code[0..len], 100);
+            defer interp.deinit();
+            try interp.step();
+            try std.testing.expectEqual(expected, try interp.stack.pop());
+            try std.testing.expectEqual(1 + @as(usize, n), interp.pc);
+        }
+    }
 }
 
 test "jumping into a PUSH's immediate data halts as invalid_jump" {
