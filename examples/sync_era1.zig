@@ -293,12 +293,10 @@ fn recoverSenders(secp: Secp256k1, items: []const zevm.Rlp.Item, senders: []zevm
 
     var threads: [max_threads]std.Thread = undefined;
     var failures: [max_threads]?anyerror = @splat(null);
-    const per_thread = (items.len + thread_count - 1) / thread_count;
+    var next: std.atomic.Value(usize) = .init(0);
     var spawned: usize = 0;
     while (spawned < thread_count) : (spawned += 1) {
-        const lo = @min(items.len, spawned * per_thread);
-        const hi = @min(items.len, lo + per_thread);
-        threads[spawned] = std.Thread.spawn(.{}, recoverSendersWorker, .{ secp, items[lo..hi], senders[lo..hi], &failures[spawned] }) catch |err| {
+        threads[spawned] = std.Thread.spawn(.{}, recoverSendersWorker, .{ secp, items, senders, &next, &failures[spawned] }) catch |err| {
             for (threads[0..spawned]) |t| t.join();
             return err;
         };
@@ -376,15 +374,24 @@ fn prewarmBlock(allocator: std.mem.Allocator, p: *Prewarm, b: usize) !void {
     }
 }
 
-fn recoverSendersWorker(secp: Secp256k1, items: []const zevm.Rlp.Item, senders: []zevm.Address, failure: *?anyerror) void {
+/// Workers take small batches from `next` rather than a fixed share each:
+/// efficiency cores and busy hyperthreads recover slower, and a fixed split
+/// leaves the whole file waiting on whichever thread drew the slowest core.
+fn recoverSendersWorker(secp: Secp256k1, items: []const zevm.Rlp.Item, senders: []zevm.Address, next: *std.atomic.Value(usize), failure: *?anyerror) void {
+    const batch = 64;
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
-    for (items, senders) |item, *sender| {
-        sender.* = txSender(arena.allocator(), secp, item) catch |err| {
-            failure.* = err;
-            return;
-        };
-        _ = arena.reset(.retain_capacity);
+    while (true) {
+        const lo = next.fetchAdd(batch, .monotonic);
+        if (lo >= items.len) return;
+        const hi = @min(items.len, lo + batch);
+        for (items[lo..hi], senders[lo..hi]) |item, *sender| {
+            sender.* = txSender(arena.allocator(), secp, item) catch |err| {
+                failure.* = err;
+                return;
+            };
+            _ = arena.reset(.retain_capacity);
+        }
     }
 }
 
