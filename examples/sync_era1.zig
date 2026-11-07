@@ -79,7 +79,10 @@ fn decodeHeader(header: zevm.Rlp.Item) DecodedHeader {
         .miner = bytesToAddress(header.list[2].string),
         .timestamp = bytesToU64(header.list[11].string),
         .gas_limit = bytesToU64(header.list[9].string),
-        .difficulty = bytesToU256(header.list[7].string),
+        // From the Merge on, headers carry difficulty 0 (EIP-3675) and
+        // mixHash holds PREVRANDAO (EIP-4399), which DIFFICULTY's opcode now
+        // returns. Every proof-of-work block had a nonzero difficulty.
+        .difficulty = if (bytesToU256(header.list[7].string) == 0) bytesToU256(header.list[13].string) else bytesToU256(header.list[7].string),
         .state_root = bytesToU256(header.list[3].string),
         .gas_used = bytesToU64(header.list[10].string),
     };
@@ -431,9 +434,7 @@ fn lessThanStr(_: void, a: []const u8, b: []const u8) bool {
 /// of the era1 files. Ground truth with no network and no trusted third
 /// party — the same bytes the replay is being checked against.
 fn era1StateRoot(allocator: std.mem.Allocator, io: std.Io, block: u64) !zevm.Hash {
-    var dir = try std.Io.Dir.cwd().openDir(io, "data/era1", .{ .iterate = true });
-    defer dir.close(io);
-    const names = try era1FileNames(allocator, io, dir);
+    const names = try historyFileNames(allocator, io);
     defer {
         for (names) |n| allocator.free(n);
         allocator.free(names);
@@ -441,16 +442,16 @@ fn era1StateRoot(allocator: std.mem.Allocator, io: std.Io, block: u64) !zevm.Has
 
     const file_index = block / blocks_per_file;
     if (file_index >= names.len) return error.BlockNotInEra1Files;
-    const raw = try dir.readFileAlloc(io, names[file_index], allocator, .unlimited);
+    const raw = try std.Io.Dir.cwd().readFileAlloc(io, names[file_index], allocator, .unlimited);
     defer allocator.free(raw);
     const records = try readRecords(allocator, raw);
     defer allocator.free(records);
+    const headers = try recordsOfKind(allocator, records, record_type.compressed_header);
+    defer allocator.free(headers);
 
-    // One version record, then four per block (header, body, receipts,
-    // total difficulty) — same layout the replay loop walks.
-    const index = 1 + (block % blocks_per_file) * 4;
-    if (index >= records.len) return error.BlockNotInEra1Files;
-    const header_rlp = try Snappy.frameDecompress(allocator, records[index].data);
+    const index = block % blocks_per_file;
+    if (index >= headers.len) return error.BlockNotInEra1Files;
+    const header_rlp = try Snappy.frameDecompress(allocator, headers[index]);
     defer allocator.free(header_rlp);
     const item = try zevm.Rlp.decode(allocator, header_rlp);
     defer item.deinit(allocator);
@@ -460,20 +461,71 @@ fn era1StateRoot(allocator: std.mem.Allocator, io: std.Io, block: u64) !zevm.Has
     return header.state_root;
 }
 
-fn era1FileNames(allocator: std.mem.Allocator, io: std.Io, dir: std.Io.Dir) ![][]u8 {
+/// The data of every record of one `kind`, in file order. era1 interleaves
+/// each block's header, body, receipts and total difficulty; eraE groups all
+/// headers, then all bodies, and so on. Either way the n-th header and the
+/// n-th body belong to the file's n-th block.
+fn recordsOfKind(allocator: std.mem.Allocator, records: []const Record, kind: [2]u8) ![][]const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    errdefer out.deinit(allocator);
+    for (records) |record| {
+        if (std.mem.eql(u8, &record.kind, &kind)) try out.append(allocator, record.data);
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+/// Every history file, one per 8192-block epoch in block order, as paths
+/// from the working directory. era1 (`data/era1`) stops at the Merge, part
+/// way into epoch 1896; eraE (`data/erae`) continues in the same epochs, and
+/// takes over any epoch both have, so that last era1 file is replaced by its
+/// complete eraE counterpart.
+fn historyFileNames(allocator: std.mem.Allocator, io: std.Io) ![][]u8 {
     var files: std.ArrayList([]u8) = .empty;
     errdefer {
         for (files.items) |f| allocator.free(f);
         files.deinit(allocator);
     }
 
-    var it = dir.iterate();
-    while (try it.next(io)) |entry| {
-        if (!std.mem.endsWith(u8, entry.name, ".era1")) continue;
-        try files.append(allocator, try allocator.dupe(u8, entry.name));
-    }
+    for ([_][]const u8{ "data/era1", "data/erae" }, [_][]const u8{ ".era1", ".erae" }) |dir_path, extension| {
+        var dir = std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch |err| switch (err) {
+            error.FileNotFound => continue,
+            else => return err,
+        };
+        defer dir.close(io);
 
-    std.mem.sort([]u8, files.items, {}, lessThanStr);
+        var names: std.ArrayList([]u8) = .empty;
+        defer {
+            for (names.items) |n| allocator.free(n);
+            names.deinit(allocator);
+        }
+        var it = dir.iterate();
+        while (try it.next(io)) |entry| {
+            if (!std.mem.endsWith(u8, entry.name, extension)) continue;
+            try names.append(allocator, try allocator.dupe(u8, entry.name));
+        }
+        std.mem.sort([]u8, names.items, {}, lessThanStr);
+
+        // Named `<network>-<5-digit epoch>-<hash>.<extension>`.
+        for (names.items) |name| {
+            const dash = std.mem.indexOfScalar(u8, name, '-') orelse return error.BadHistoryFileName;
+            if (name.len < dash + 6) return error.BadHistoryFileName;
+            const epoch = try std.fmt.parseInt(usize, name[dash + 1 ..][0..5], 10);
+            const path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir_path, name });
+            if (epoch < files.items.len) {
+                allocator.free(files.items[epoch]);
+                files.items[epoch] = path;
+            } else if (epoch == files.items.len) {
+                files.append(allocator, path) catch |err| {
+                    allocator.free(path);
+                    return err;
+                };
+            } else {
+                allocator.free(path);
+                std.debug.print("history files skip from epoch {d} to {d} ({s})\n", .{ files.items.len, epoch, name });
+                return error.MissingHistoryFile;
+            }
+        }
+    }
     return files.toOwnedSlice(allocator);
 }
 
@@ -573,10 +625,9 @@ pub fn main(io: std.Io, args: []const []const u8) anyerror!void {
                 dump_at_block = try std.fmt.parseInt(u64, args[i + 1], 10);
                 dump_path = args[i + 2];
                 i += 2;
-                // Any block may be dumped. Only *resuming* from a mid-file
-                // dump is unsafe, and `--resume-from` refuses that below.
-                // The final era1 file ends at the Merge, mid-file, and its
-                // last block is exactly where this replay has to stop.
+                // Any block may be dumped, and resumed from: a resume skips
+                // the blocks of its first file that the snapshot already
+                // holds. Fork boundaries (the Merge, Shanghai) fall mid-file.
             } else if (std.mem.eql(u8, args[i], "--resume-from") and i + 1 < args.len) {
                 resume_path = args[i + 1];
                 i += 1;
@@ -778,9 +829,7 @@ pub fn main(io: std.Io, args: []const []const u8) anyerror!void {
     }
 
     if (scan_miner) |target| {
-        var era1_dir = try std.Io.Dir.cwd().openDir(io, "data/era1", .{ .iterate = true });
-        defer era1_dir.close(io);
-        const all_files = try era1FileNames(allocator, io, era1_dir);
+        const all_files = try historyFileNames(allocator, io);
         defer {
             for (all_files) |f| allocator.free(f);
             allocator.free(all_files);
@@ -794,18 +843,18 @@ pub fn main(io: std.Io, args: []const []const u8) anyerror!void {
         var out_total: u256 = 0;
         var out_gas_total: u256 = 0;
         outer: for (scan_files) |file_name| {
-            const raw = try era1_dir.readFileAlloc(io, file_name, allocator, .unlimited);
+            const raw = try std.Io.Dir.cwd().readFileAlloc(io, file_name, allocator, .unlimited);
             defer allocator.free(raw);
             const records = try readRecords(allocator, raw);
             defer allocator.free(records);
+            const header_records = try recordsOfKind(allocator, records, record_type.compressed_header);
+            defer allocator.free(header_records);
+            const body_records = try recordsOfKind(allocator, records, record_type.compressed_body);
+            defer allocator.free(body_records);
+            if (header_records.len != body_records.len) return error.HeaderBodyCountMismatch;
 
-            var idx: usize = 1; // skip version record
-            while (idx < records.len and std.mem.eql(u8, &records[idx].kind, &record_type.compressed_header)) {
-                const header_record = records[idx];
-                const body_record = records[idx + 1];
-                idx += 4;
-
-                const header_rlp = try Snappy.frameDecompress(allocator, header_record.data);
+            for (header_records, body_records) |header_record, body_record| {
+                const header_rlp = try Snappy.frameDecompress(allocator, header_record);
                 defer allocator.free(header_rlp);
                 const header_item = try zevm.Rlp.decode(allocator, header_rlp);
                 defer header_item.deinit(allocator);
@@ -817,7 +866,7 @@ pub fn main(io: std.Io, args: []const []const u8) anyerror!void {
                     std.debug.print("MATCH: block {d} miner\n", .{header.number});
                 }
 
-                const body_rlp = try Snappy.frameDecompress(allocator, body_record.data);
+                const body_rlp = try Snappy.frameDecompress(allocator, body_record);
                 defer allocator.free(body_rlp);
                 const body_item = try zevm.Rlp.decode(allocator, body_rlp);
                 defer body_item.deinit(allocator);
@@ -905,14 +954,6 @@ pub fn main(io: std.Io, args: []const []const u8) anyerror!void {
         std.debug.print("  load (index the snapshot):     {d:.2}ms\n", .{
             @as(f64, @floatFromInt(load_start.durationTo(std.Io.Clock.Timestamp.now(io, .awake)).raw.nanoseconds)) / 1_000_000.0,
         });
-        // Resuming restarts at the dumped block's *file*, not the block
-        // itself, so a snapshot taken mid-file would have that file's earlier
-        // blocks replayed a second time, silently double-applying their
-        // transactions. Only a file's last block is a safe place to resume.
-        if ((snapshot.block + 1) % blocks_per_file != 0) {
-            std.debug.print("cannot resume from block {d}: not a file's last block ((block+1) % {d} must be 0)\n", .{ snapshot.block, blocks_per_file });
-            return error.UnalignedResumeBlock;
-        }
         state = snapshot.state;
         starting_block = snapshot.block + 1;
         resumed_hashes = snapshot.recent_hashes;
@@ -954,17 +995,14 @@ pub fn main(io: std.Io, args: []const []const u8) anyerror!void {
     }
     defer state.deinit();
 
-    var era1_dir = try std.Io.Dir.cwd().openDir(io, "data/era1", .{ .iterate = true });
-    defer era1_dir.close(io);
-
-    const all_files = try era1FileNames(allocator, io, era1_dir);
+    const all_files = try historyFileNames(allocator, io);
     defer {
         for (all_files) |f| allocator.free(f);
         allocator.free(all_files);
     }
     const start_file_index = starting_block / blocks_per_file;
     const files = all_files[@min(start_file_index, all_files.len)..];
-    std.debug.print("found {d} era1 files ({d} remaining after skip)\n", .{ all_files.len, files.len });
+    std.debug.print("found {d} history files ({d} remaining after skip)\n", .{ all_files.len, files.len });
 
     var evm = zevm.Evm{ .allocator = allocator, .state = &state };
     const secp = try Secp256k1.init();
@@ -997,17 +1035,28 @@ pub fn main(io: std.Io, args: []const []const u8) anyerror!void {
     defer recent_hashes.deinit(allocator);
 
     for (files, start_file_index..) |file_name, file_index| {
-        const raw = try era1_dir.readFileAlloc(io, file_name, allocator, .unlimited);
+        const raw = try std.Io.Dir.cwd().readFileAlloc(io, file_name, allocator, .unlimited);
         defer allocator.free(raw);
 
         const records = try readRecords(allocator, raw);
         defer allocator.free(records);
 
-        var idx: usize = 0;
         if (records.len == 0 or !std.mem.eql(u8, &records[0].kind, &record_type.version)) {
             return error.MissingVersionRecord;
         }
-        idx += 1;
+        const all_header_records = try recordsOfKind(allocator, records, record_type.compressed_header);
+        defer allocator.free(all_header_records);
+        const all_body_records = try recordsOfKind(allocator, records, record_type.compressed_body);
+        defer allocator.free(all_body_records);
+        if (all_header_records.len != all_body_records.len) return error.HeaderBodyCountMismatch;
+        // A resume from a mid-file snapshot starts part way into its first
+        // file: the blocks before `starting_block` are already in the state,
+        // and replaying them would apply their transactions twice. Each file
+        // starts at block `file_index * blocks_per_file`.
+        const skip: usize = if (file_index == start_file_index) @intCast(starting_block % blocks_per_file) else 0;
+        if (skip > all_header_records.len) return error.ResumeBlockPastFileEnd;
+        const header_records = all_header_records[skip..];
+        const body_records = all_body_records[skip..];
 
         // Every sender in this file, recovered up front across all cores.
         // Recovery reads nothing but each transaction's own bytes, so it can
@@ -1039,18 +1088,17 @@ pub fn main(io: std.Io, args: []const []const u8) anyerror!void {
         var block_start: std.ArrayList(usize) = .empty;
         defer block_start.deinit(allocator);
         {
-            var r = idx;
-            while (r < records.len and std.mem.eql(u8, &records[r].kind, &record_type.compressed_header)) : (r += 4) {
+            for (header_records, body_records) |header_record, body_record| {
                 try bodies.ensureUnusedCapacity(allocator, 1);
                 try decoded.ensureUnusedCapacity(allocator, 1);
-                const body = try Snappy.frameDecompress(allocator, records[r + 1].data);
+                const body = try Snappy.frameDecompress(allocator, body_record);
                 bodies.appendAssumeCapacity(body);
                 const item = try zevm.Rlp.decode(allocator, body);
                 decoded.appendAssumeCapacity(item);
                 try block_start.append(allocator, tx_items.items.len);
                 try tx_items.appendSlice(allocator, item.list[0].list);
                 if (state.base != null) {
-                    const header_rlp = try Snappy.frameDecompress(allocator, records[r].data);
+                    const header_rlp = try Snappy.frameDecompress(allocator, header_record);
                     defer allocator.free(header_rlp);
                     const header_item = try zevm.Rlp.decode(allocator, header_rlp);
                     defer header_item.deinit(allocator);
@@ -1093,22 +1141,13 @@ pub fn main(io: std.Io, args: []const []const u8) anyerror!void {
 
         var blocks_in_file: u64 = 0;
         var transactions_in_file: u64 = 0;
-        while (idx < records.len and std.mem.eql(u8, &records[idx].kind, &record_type.compressed_header)) {
-            const header_record = records[idx];
-            const body_record = records[idx + 1];
-            const receipts_record = records[idx + 2];
-            // records[idx + 3] is the total-difficulty record (stored raw,
-            // not Snappy-compressed), unused here.
-            std.debug.assert(std.mem.eql(u8, &body_record.kind, &record_type.compressed_body));
-            std.debug.assert(std.mem.eql(u8, &receipts_record.kind, &record_type.compressed_receipts));
-            idx += 4;
-
+        for (header_records, body_records) |header_record, body_record| {
             const decode_start = std.Io.Clock.Timestamp.now(io, .awake);
 
             const snappy_start = std.Io.Clock.Timestamp.now(io, .awake);
-            const header_rlp = try Snappy.frameDecompress(allocator, header_record.data);
+            const header_rlp = try Snappy.frameDecompress(allocator, header_record);
             defer allocator.free(header_rlp);
-            const body_rlp = try Snappy.frameDecompress(allocator, body_record.data);
+            const body_rlp = try Snappy.frameDecompress(allocator, body_record);
             defer allocator.free(body_rlp);
             snappy_ns += @intCast(snappy_start.durationTo(std.Io.Clock.Timestamp.now(io, .awake)).raw.nanoseconds);
 

@@ -1,7 +1,7 @@
 //! Executes a decoded `Transaction` against a `State`.
 //!
-//! Frontier through London are implemented (Muir, Arrow and Gray Glacier
-//! only delayed the difficulty bomb and change nothing this executes). `processBlock` panics on any block from a later fork (see
+//! Frontier through the Merge (Paris) are implemented (Muir, Arrow and Gray
+//! Glacier only delayed the difficulty bomb and change nothing this executes). `processBlock` panics on any block from a later fork (see
 //! `Fork`) instead of silently applying stale rules.
 //!
 //! Constantinople and Petersburg share a block on mainnet (7,280,000):
@@ -211,9 +211,9 @@ pub fn processBlock(self: *Evm, block: Block) !void {
     const fork = Fork.at(block.number);
     // Muir Glacier delayed the difficulty bomb and changed nothing this
     // executes, so Istanbul's rules carry through it unchanged.
-    if (fork.atLeast(.merge)) {
+    if (fork.atLeast(.shanghai)) {
         std.debug.panic(
-            "block {d} is past Gray Glacier (fork: {s}): this Evm only implements up to London's rules",
+            "block {d} is past the Merge (fork: {s}): this Evm only implements up to Paris's rules",
             .{ block.number, @tagName(fork) },
         );
     }
@@ -241,6 +241,13 @@ pub fn processBlock(self: *Evm, block: Block) !void {
         const result = try self.executeTransaction(entry.tx, entry.from);
         self.block_gas_used += result.gas_used;
         self.allocator.free(result.return_data);
+    }
+
+    // EIP-3675 (the Merge): proof of stake pays validators on the beacon
+    // chain, so execution blocks carry no block or uncle rewards.
+    if (fork.atLeast(.merge)) {
+        self.state.debugDumpBlockAccounts();
+        return;
     }
 
     // A whole block is never rolled back once processed, so rewards credit
@@ -1375,6 +1382,17 @@ test "processBlock with no transactions credits the flat block reward" {
     try evm.processBlock(.{ .number = 10, .miner = 0xaa, .transactions = &.{} });
 
     try std.testing.expectEqual(@as(u256, 5_000_000_000_000_000_000), state.getBalance(0xaa));
+}
+
+test "processBlock credits no block reward from the Merge on (EIP-3675)" {
+    var state = State.init(std.testing.allocator);
+    defer state.deinit();
+
+    var evm = Evm{ .allocator = std.testing.allocator, .state = &state };
+    try evm.processBlock(.{ .number = 15_537_393, .miner = 0xaa, .transactions = &.{} });
+    try std.testing.expectEqual(@as(u256, 2_000_000_000_000_000_000), state.getBalance(0xaa));
+    try evm.processBlock(.{ .number = 15_537_394, .miner = 0xbb, .transactions = &.{} });
+    try std.testing.expectEqual(@as(u256, 0), state.getBalance(0xbb));
 }
 
 test "processBlock credits the reduced 3 ETH block reward from Byzantium on" {
