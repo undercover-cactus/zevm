@@ -1238,15 +1238,18 @@ fn accountLeaf(allocator: std.mem.Allocator, leaf_allocator: std.mem.Allocator, 
     const key = try leaf_allocator.alloc(u8, 32);
     std.mem.writeInt(u256, key[0..32], keccak256(&address_bytes), .big);
 
-    return .{
-        .key = key,
-        .value = try Rlp.encodeList(leaf_allocator, &.{
-            try Rlp.encodeInt(leaf_allocator, nonce),
-            try Rlp.encodeInt(leaf_allocator, balance),
-            try Rlp.encodeBytes(leaf_allocator, &storage_root_bytes),
-            try Rlp.encodeBytes(leaf_allocator, &code_hash_bytes),
-        }),
-    };
+    // The four field encodings and `encodeList`'s payload copy are scratch:
+    // an arena never frees them, so built in `leaf_allocator` they would
+    // outlive the run at roughly twice the size of the value kept. Only the
+    // finished list is copied out. At 219M accounts (block 18,079,743) the
+    // difference is ~30GB, and without it verification ran out of memory.
+    const value = try Rlp.encodeList(storage_allocator, &.{
+        try Rlp.encodeInt(storage_allocator, nonce),
+        try Rlp.encodeInt(storage_allocator, balance),
+        try Rlp.encodeBytes(storage_allocator, &storage_root_bytes),
+        try Rlp.encodeBytes(storage_allocator, &code_hash_bytes),
+    });
+    return .{ .key = key, .value = try leaf_allocator.dupe(u8, value) };
 }
 
 test "a snapshot writes each account's storage slots in ascending order" {

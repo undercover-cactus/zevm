@@ -18,6 +18,10 @@ pub const high: u64 = 10;
 
 pub const keccak256_base: u64 = 30;
 pub const keccak256_word: u64 = 6;
+/// EIP-3860 (Shanghai): per 32-byte word of init code, charged on CREATE,
+/// CREATE2 and contract-creation transactions for the jumpdest analysis it
+/// costs. Before it, init code length was only paid for as calldata.
+pub const initcode_word: u64 = 2;
 
 pub const exp_base: u64 = 10;
 /// Pre-EIP-160 (Spurious Dragon) value; that fork later raised this to 50.

@@ -9,6 +9,9 @@ pub const Block = struct {
     miner: Address,
     transactions: []const Entry,
     uncles: []const Uncle = &.{},
+    /// EIP-4895 (Shanghai): beacon chain withdrawals, credited after the
+    /// block's transactions.
+    withdrawals: []const Withdrawal = &.{},
 
     timestamp: u64 = 0,
     gas_limit: u64 = 0,
@@ -22,6 +25,13 @@ pub const Block = struct {
     pub const Entry = struct {
         tx: Transaction,
         from: Address,
+    };
+
+    /// A withdrawal, reduced to what its balance credit needs.
+    pub const Withdrawal = struct {
+        address: Address,
+        /// In gwei, as the beacon chain counts it.
+        amount: u64,
     };
 
     /// An uncle (ommer) block, reduced to what its reward calculation needs.

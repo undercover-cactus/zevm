@@ -71,6 +71,9 @@ const max_call_depth: u16 = 1024;
 /// bytes of runtime code fails. Also used by `Evm.create` for top-level
 /// contract-creation transactions.
 pub const max_code_size: usize = 24576;
+/// EIP-3860 (Shanghai): the most init code a CREATE/CREATE2 or a
+/// contract-creation transaction may carry.
+pub const max_initcode_size: usize = 2 * max_code_size;
 
 /// The RIPEMD160 precompile. In block 2,675,119, it was touched-and-cleared
 /// (EIP-161) despite the calling frame running out of gas — an obscure,
@@ -411,7 +414,8 @@ fn step(self: *Interpreter) !void {
                 self.status = .invalid_opcode;
                 return;
             }
-            if (!self.chargeGas(gas.verylow)) return;
+            // EIP-3855 prices it at `base`, below the PUSH1-32 `verylow`.
+            if (!self.chargeGas(gas.base)) return;
             self.pushStack(0);
             self.pc += 1;
         },
@@ -1420,6 +1424,16 @@ fn createOp(self: *Interpreter, kind: CreateKind) !void {
     try self.memory.expand(offset, size);
     if (!self.chargeGas(gas.create_base)) return;
     if (kind == .create2 and !self.chargeGas(gas.keccak256_word * ((size + 31) / 32))) return;
+    // EIP-3860 (Shanghai): init code is paid for per word, and too much of
+    // it is an exceptional halt of this frame, after the charges above, as
+    // execution-specs orders it.
+    if (self.block.fork.atLeast(.shanghai)) {
+        if (!self.chargeGas(gas.initcode_word * ((size + 31) / 32))) return;
+        if (size > max_initcode_size) {
+            self.status = .out_of_gas;
+            return;
+        }
+    }
 
     const state = self.state orelse {
         self.status = .invalid_opcode;
@@ -2174,6 +2188,7 @@ test "PUSH0 pushes zero" {
     defer interp.deinit();
     try interp.run();
     try std.testing.expectEqual(@as(u256, 0), try interp.stack.pop());
+    try std.testing.expectEqual(@as(u64, 1_000_000 - gas.base), interp.gas_remaining);
 }
 
 test "PUSH0 is invalid before Shanghai" {
@@ -5432,4 +5447,41 @@ test "the 64-bit-limb Algorithm D agrees with compiler-rt's wide division" {
     const vv = fromLimbs(v_hd);
     try std.testing.expectEqual(uu / vv, fromLimbs(hd.q));
     try std.testing.expectEqual(uu % vv, fromLimbs(hd.r));
+}
+
+/// `CREATE` of `size` bytes of zeroed memory (init code that just STOPs),
+/// returning the gas it left.
+fn createOfZeros(size: u16, fork: Fork) !struct { status: Status, gas_remaining: u64 } {
+    const code = [_]u8{
+        @intFromEnum(OpCode.PUSH2), @intCast(size >> 8), @truncate(size),
+        @intFromEnum(OpCode.PUSH1), 0, // offset
+        @intFromEnum(OpCode.PUSH1), 0, // value
+        @intFromEnum(OpCode.CREATE),
+        @intFromEnum(OpCode.STOP),
+    };
+    var state = State.init(std.testing.allocator);
+    defer state.deinit();
+    var interp = try Interpreter.initCall(std.testing.allocator, &code, 1_000_000, .{
+        .address = 0xaa,
+        .state = &state,
+        .block = .{ .fork = fork },
+    });
+    defer interp.deinit();
+    try interp.run();
+    return .{ .status = interp.status, .gas_remaining = interp.gas_remaining };
+}
+
+test "EIP-3860: CREATE pays 2 gas per init code word from Shanghai on" {
+    const paris = try createOfZeros(64, .merge);
+    const shanghai = try createOfZeros(64, .shanghai);
+    try std.testing.expectEqual(Status.stopped, paris.status);
+    try std.testing.expectEqual(Status.stopped, shanghai.status);
+    try std.testing.expectEqual(paris.gas_remaining - 2 * gas.initcode_word, shanghai.gas_remaining);
+}
+
+test "EIP-3860: CREATE with more than max_initcode_size bytes halts from Shanghai on, not before" {
+    const size: u16 = @intCast(max_initcode_size + 1);
+    try std.testing.expectEqual(Status.stopped, (try createOfZeros(size, .merge)).status);
+    try std.testing.expectEqual(Status.out_of_gas, (try createOfZeros(size, .shanghai)).status);
+    try std.testing.expectEqual(Status.stopped, (try createOfZeros(@intCast(max_initcode_size), .shanghai)).status);
 }

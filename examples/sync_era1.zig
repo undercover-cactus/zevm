@@ -16,7 +16,7 @@ const Secp256k1 = secp256k1.Secp256k1;
 // `State.debug_enabled`. Gated by an explicit boolean rather than a
 // sentinel block number, so block 0 is not accidentally special.
 const debug_dump_block_enabled = false;
-const debug_dump_block: u64 = 6831202;
+const debug_dump_block: u64 = 17035080;
 
 fn millisSince(io: std.Io, start: std.Io.Clock.Timestamp) f64 {
     const elapsed = start.durationTo(std.Io.Clock.Timestamp.now(io, .awake));
@@ -442,6 +442,7 @@ fn era1StateRoot(allocator: std.mem.Allocator, io: std.Io, block: u64) !zevm.Has
 
     const file_index = block / blocks_per_file;
     if (file_index >= names.len) return error.BlockNotInEra1Files;
+    if (names[file_index].len == 0) return error.MissingHistoryFile;
     const raw = try std.Io.Dir.cwd().readFileAlloc(io, names[file_index], allocator, .unlimited);
     defer allocator.free(raw);
     const records = try readRecords(allocator, raw);
@@ -478,7 +479,8 @@ fn recordsOfKind(allocator: std.mem.Allocator, records: []const Record, kind: [2
 /// from the working directory. era1 (`data/era1`) stops at the Merge, part
 /// way into epoch 1896; eraE (`data/erae`) continues in the same epochs, and
 /// takes over any epoch both have, so that last era1 file is replaced by its
-/// complete eraE counterpart.
+/// complete eraE counterpart. An epoch with no file on disk gets an empty
+/// name, so files already replayed can be deleted; reading one is an error.
 fn historyFileNames(allocator: std.mem.Allocator, io: std.Io) ![][]u8 {
     var files: std.ArrayList([]u8) = .empty;
     errdefer {
@@ -514,15 +516,10 @@ fn historyFileNames(allocator: std.mem.Allocator, io: std.Io) ![][]u8 {
             if (epoch < files.items.len) {
                 allocator.free(files.items[epoch]);
                 files.items[epoch] = path;
-            } else if (epoch == files.items.len) {
-                files.append(allocator, path) catch |err| {
-                    allocator.free(path);
-                    return err;
-                };
             } else {
-                allocator.free(path);
-                std.debug.print("history files skip from epoch {d} to {d} ({s})\n", .{ files.items.len, epoch, name });
-                return error.MissingHistoryFile;
+                errdefer allocator.free(path);
+                while (files.items.len < epoch) try files.append(allocator, try allocator.dupe(u8, ""));
+                try files.append(allocator, path);
             }
         }
     }
@@ -843,6 +840,7 @@ pub fn main(io: std.Io, args: []const []const u8) anyerror!void {
         var out_total: u256 = 0;
         var out_gas_total: u256 = 0;
         outer: for (scan_files) |file_name| {
+            if (file_name.len == 0) return error.MissingHistoryFile;
             const raw = try std.Io.Dir.cwd().readFileAlloc(io, file_name, allocator, .unlimited);
             defer allocator.free(raw);
             const records = try readRecords(allocator, raw);
@@ -1035,6 +1033,10 @@ pub fn main(io: std.Io, args: []const []const u8) anyerror!void {
     defer recent_hashes.deinit(allocator);
 
     for (files, start_file_index..) |file_name, file_index| {
+        if (file_name.len == 0) {
+            std.debug.print("no history file on disk for epoch {d}\n", .{file_index});
+            return error.MissingHistoryFile;
+        }
         const raw = try std.Io.Dir.cwd().readFileAlloc(io, file_name, allocator, .unlimited);
         defer allocator.free(raw);
 
@@ -1055,8 +1057,16 @@ pub fn main(io: std.Io, args: []const []const u8) anyerror!void {
         // starts at block `file_index * blocks_per_file`.
         const skip: usize = if (file_index == start_file_index) @intCast(starting_block % blocks_per_file) else 0;
         if (skip > all_header_records.len) return error.ResumeBlockPastFileEnd;
-        const header_records = all_header_records[skip..];
-        const body_records = all_body_records[skip..];
+        // Likewise, a `--dump-at` block part way into this file ends the run
+        // there, so the blocks after it are never decoded. Sender recovery
+        // below parses every body it is given up front, and past the dump
+        // block that can mean a fork's transactions this Evm does not know
+        // (blob transactions after Shanghai's last block, 19,426,586).
+        const file_start = @as(u64, file_index) * blocks_per_file;
+        const end: usize = if (dump_at_block) |d| (if (d >= file_start and d - file_start < all_header_records.len) @intCast(d - file_start + 1) else all_header_records.len) else all_header_records.len;
+        if (skip > end) return error.ResumeBlockPastFileEnd;
+        const header_records = all_header_records[skip..end];
+        const body_records = all_body_records[skip..end];
 
         // Every sender in this file, recovered up front across all cores.
         // Recovery reads nothing but each transaction's own bytes, so it can
@@ -1187,12 +1197,35 @@ pub fn main(io: std.Io, args: []const []const u8) anyerror!void {
                 for (entries.items, 0..) |e, ti| {
                     std.debug.print("DEBUG   tx[{d}] from={x} to={?x} nonce={d} value={d} gas_limit={d} gas_price={d}\n", .{ ti, e.from, e.tx.to, e.tx.nonce, e.tx.value, e.tx.gas_limit, e.tx.gas_price });
                 }
+                // eraE's slim receipts, `[type, status, cumulativeGas, logs]`
+                // each: the real chain's gas per transaction to diff against.
+                const receipt_records = try recordsOfKind(allocator, records, .{ 0x0a, 0x00 });
+                defer allocator.free(receipt_records);
+                const receipts_rlp = try Snappy.frameDecompress(allocator, receipt_records[header.number % blocks_per_file]);
+                defer allocator.free(receipts_rlp);
+                const receipts_item = try zevm.Rlp.decode(allocator, receipts_rlp);
+                defer receipts_item.deinit(allocator);
+                var previous_cumulative: u64 = 0;
+                for (receipts_item.list, 0..) |receipt, ri| {
+                    const cumulative = bytesToU64(receipt.list[2].string);
+                    std.debug.print("DEBUG   receipt[{d}] gas_used={d} status={d}\n", .{ ri, cumulative - previous_cumulative, bytesToU64(receipt.list[1].string) });
+                    previous_cumulative = cumulative;
+                }
             }
 
             var uncles: std.ArrayList(zevm.Block.Uncle) = .empty;
             defer uncles.deinit(allocator);
             for (uncles_rlp) |uncle_item| {
                 try uncles.append(allocator, decodeUncle(uncle_item));
+            }
+            // EIP-4895 (Shanghai) appended a third list to the body, each
+            // withdrawal `[index, validatorIndex, address, amount]`.
+            var withdrawals: std.ArrayList(zevm.Block.Withdrawal) = .empty;
+            defer withdrawals.deinit(allocator);
+            if (body_item.list.len > 2) {
+                for (body_item.list[2].list) |w| {
+                    try withdrawals.append(allocator, .{ .address = bytesToAddress(w.list[2].string), .amount = bytesToU64(w.list[3].string) });
+                }
             }
             tx_parse_ns += @intCast(tx_parse_start.durationTo(std.Io.Clock.Timestamp.now(io, .awake)).raw.nanoseconds);
 
@@ -1211,6 +1244,7 @@ pub fn main(io: std.Io, args: []const []const u8) anyerror!void {
                     .miner = header.miner,
                     .transactions = entries.items,
                     .uncles = uncles.items,
+                    .withdrawals = withdrawals.items,
                     .timestamp = header.timestamp,
                     .gas_limit = header.gas_limit,
                     .difficulty = header.difficulty,

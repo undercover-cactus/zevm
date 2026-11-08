@@ -171,6 +171,8 @@ pub fn executeTransaction(self: *Evm, tx: Transaction, from: Address) !Result {
             _ = try self.state.warmAddress(entry.address);
             for (entry.storage_keys) |key| _ = try self.state.warmSlot(entry.address, key);
         }
+        // EIP-3651 (Shanghai): so does the block's coinbase.
+        if (self.block.fork.atLeast(.shanghai)) _ = try self.state.warmAddress(self.block.coinbase);
     }
     const access_list_cost = gas.accessListCost(tx.access_list);
 
@@ -211,9 +213,9 @@ pub fn processBlock(self: *Evm, block: Block) !void {
     const fork = Fork.at(block.number);
     // Muir Glacier delayed the difficulty bomb and changed nothing this
     // executes, so Istanbul's rules carry through it unchanged.
-    if (fork.atLeast(.shanghai)) {
+    if (fork.atLeast(.cancun)) {
         std.debug.panic(
-            "block {d} is past the Merge (fork: {s}): this Evm only implements up to Paris's rules",
+            "block {d} is past Shanghai (fork: {s}): this Evm only implements up to Shanghai's rules",
             .{ block.number, @tagName(fork) },
         );
     }
@@ -244,8 +246,15 @@ pub fn processBlock(self: *Evm, block: Block) !void {
     }
 
     // EIP-3675 (the Merge): proof of stake pays validators on the beacon
-    // chain, so execution blocks carry no block or uncle rewards.
+    // chain, so execution blocks carry no block or uncle rewards. From
+    // Shanghai on (EIP-4895), what validators withdraw from the beacon chain
+    // is credited here instead, in gwei, using no gas and outside any
+    // transaction. A zero amount credits nothing and creates no account
+    // (reth skips it the same way).
     if (fork.atLeast(.merge)) {
+        for (block.withdrawals) |withdrawal| {
+            if (withdrawal.amount != 0) try self.state.creditBalance(withdrawal.address, @as(u256, withdrawal.amount) * 1_000_000_000);
+        }
         self.state.debugDumpBlockAccounts();
         return;
     }
@@ -378,6 +387,9 @@ fn gasUsed(status: Interpreter.Status, gas_remaining: u64, refund: i64, executio
 }
 
 fn create(self: *Evm, nonce: u64, value: u256, data: []const u8, access_list_cost: u64, gas_limit: u64, from: Address) !Result {
+    // EIP-3860 (Shanghai): a creation transaction carrying more init code
+    // than this is invalid, so no real block contains one.
+    if (self.block.fork.atLeast(.shanghai) and data.len > Interpreter.max_initcode_size) return error.InitcodeTooLarge;
     const new_address = try Interpreter.createAddress(self.allocator, from, nonce);
     if (self.block.fork.atLeast(.berlin)) _ = try self.state.warmAddress(new_address);
 
@@ -409,6 +421,8 @@ fn create(self: *Evm, nonce: u64, value: u256, data: []const u8, access_list_cos
     // Nested `CREATE`/`CREATE2` (`Interpreter.createOp`) are unaffected.
     var intrinsic = gas.intrinsicCost(data, self.block.fork) + access_list_cost;
     if (self.block.fork != .frontier) intrinsic += gas.create_base;
+    // EIP-3860 (Shanghai): init code also pays per word.
+    if (self.block.fork.atLeast(.shanghai)) intrinsic += gas.initcode_word * ((data.len + 31) / 32);
     if (gas_limit < intrinsic) {
         self.state.revertTo(cp);
         return .{
@@ -1683,4 +1697,70 @@ test "EIP-3541: deployed code may not start with 0xEF from London on" {
             try std.testing.expectEqualSlices(u8, &.{0xef}, state.getCode(result.created_address.?));
         }
     }
+}
+
+test "EIP-3651: the coinbase starts warm from Shanghai on" {
+    const OpCode = @import("OpCode.zig").OpCode;
+    const code = [_]u8{ @intFromEnum(OpCode.COINBASE), @intFromEnum(OpCode.BALANCE), @intFromEnum(OpCode.STOP) };
+    var used: [2]u64 = undefined;
+    for ([_]Fork{ .merge, .shanghai }, &used) |fork, *u| {
+        var state = State.init(std.testing.allocator);
+        defer state.deinit();
+        try state.setCode(0xdd, &code);
+        var evm = Evm{ .allocator = std.testing.allocator, .state = &state, .block = .{ .fork = fork, .coinbase = 0xcc } };
+        var tx = testTx();
+        tx.to = 0xdd;
+        const result = try evm.executeTransaction(tx, 0x1);
+        defer std.testing.allocator.free(result.return_data);
+        u.* = result.gas_used;
+    }
+    // A cold account access (2600) against a warm one (100).
+    try std.testing.expectEqual(used[0] - 2500, used[1]);
+}
+
+test "EIP-3860: a contract-creation transaction's init code pays per word from Shanghai on" {
+    const init_code = [_]u8{0} ** 64; // STOPs at once
+    var used: [2]u64 = undefined;
+    for ([_]Fork{ .merge, .shanghai }, &used) |fork, *u| {
+        var state = State.init(std.testing.allocator);
+        defer state.deinit();
+        var evm = Evm{ .allocator = std.testing.allocator, .state = &state, .block = .{ .fork = fork } };
+        var tx = testTx();
+        tx.data = &init_code;
+        const result = try evm.executeTransaction(tx, 0x1);
+        defer std.testing.allocator.free(result.return_data);
+        u.* = result.gas_used;
+    }
+    try std.testing.expectEqual(used[0] + 2 * gas.initcode_word, used[1]);
+}
+
+test "EIP-3860: a contract-creation transaction over max_initcode_size is invalid from Shanghai on" {
+    const init_code = [_]u8{0} ** (Interpreter.max_initcode_size + 1);
+    var state = State.init(std.testing.allocator);
+    defer state.deinit();
+    var evm = Evm{ .allocator = std.testing.allocator, .state = &state, .block = .{ .fork = .shanghai } };
+    var tx = testTx();
+    tx.data = &init_code;
+    try std.testing.expectError(error.InitcodeTooLarge, evm.executeTransaction(tx, 0x1));
+}
+
+test "EIP-4895: withdrawals credit their amount in gwei, and a zero amount creates nothing" {
+    var state = State.init(std.testing.allocator);
+    defer state.deinit();
+    try state.setBalance(0xa1, 5);
+
+    var evm = Evm{ .allocator = std.testing.allocator, .state = &state };
+    try evm.processBlock(.{
+        .number = 17_034_870,
+        .miner = 0xaa,
+        .transactions = &.{},
+        .withdrawals = &.{
+            .{ .address = 0xa1, .amount = 3 },
+            .{ .address = 0xa2, .amount = 0 },
+            .{ .address = 0xa1, .amount = 1 },
+        },
+    });
+    try std.testing.expectEqual(@as(u256, 5 + 4_000_000_000), state.getBalance(0xa1));
+    try std.testing.expect(!state.exists(0xa2));
+    try std.testing.expectEqual(@as(u256, 0), state.getBalance(0xaa));
 }
