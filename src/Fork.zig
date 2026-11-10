@@ -31,6 +31,7 @@ pub const Fork = enum {
     merge,
     shanghai,
     cancun,
+    prague,
 
     /// Mainnet activation block for each fork, oldest first. `at` walks
     /// this looking for the last entry at or before a given block number.
@@ -52,6 +53,7 @@ pub const Fork = enum {
         .{ .fork = .merge, .block = 15_537_394 },
         .{ .fork = .shanghai, .block = 17_034_870 },
         .{ .fork = .cancun, .block = 19_426_587 },
+        .{ .fork = .prague, .block = 22_431_084 },
     };
 
     pub fn at(block_number: u64) Fork {
@@ -80,7 +82,7 @@ test "Homestead's own activation block is already Homestead" {
 }
 
 test "far in the future resolves to the latest known fork" {
-    try std.testing.expectEqual(Fork.cancun, Fork.at(30_000_000));
+    try std.testing.expectEqual(Fork.prague, Fork.at(30_000_000));
 }
 
 test "atLeast compares chronological order, inclusive of equal forks" {

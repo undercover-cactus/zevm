@@ -51,6 +51,8 @@ pub const BlockContext = struct {
     /// behaviors that differ across forks (e.g. `DELEGATECALL`'s
     /// availability, `CREATE`'s code-deposit-OOG behavior).
     fork: Fork = .frontier,
+    /// EIP-4844 (Cancun): what `BLOBBASEFEE` returns. 0 before Cancun.
+    blob_base_fee: u256 = 0,
 };
 
 /// The transaction currently executing, constant across every nested call
@@ -58,6 +60,9 @@ pub const BlockContext = struct {
 pub const TxContext = struct {
     origin: Address = 0,
     gas_price: u256 = 0,
+    /// EIP-4844 (Cancun): the transaction's blob versioned hashes, what
+    /// `BLOBHASH` indexes into.
+    blob_hashes: []const u256 = &.{},
 };
 
 /// No realistic gas budget reaches this much memory; bounding offsets/sizes
@@ -600,6 +605,27 @@ fn step(self: *Interpreter) !void {
             self.pushStack(self.block.base_fee);
             self.pc += 1;
         },
+        .BLOBHASH => {
+            // EIP-4844: not available before Cancun.
+            if (!self.block.fork.atLeast(.cancun)) {
+                self.status = .invalid_opcode;
+                return;
+            }
+            if (!self.chargeGas(gas.verylow)) return;
+            const index = self.popStack() orelse return;
+            self.pushStack(if (index < self.tx.blob_hashes.len) self.tx.blob_hashes[@intCast(index)] else 0);
+            self.pc += 1;
+        },
+        .BLOBBASEFEE => {
+            // EIP-7516: not available before Cancun.
+            if (!self.block.fork.atLeast(.cancun)) {
+                self.status = .invalid_opcode;
+                return;
+            }
+            if (!self.chargeGas(gas.base)) return;
+            self.pushStack(self.block.blob_base_fee);
+            self.pc += 1;
+        },
         .CHAINID => {
             // EIP-1344: not available before Istanbul.
             if (!self.block.fork.atLeast(.istanbul)) {
@@ -627,6 +653,46 @@ fn step(self: *Interpreter) !void {
 
         .SLOAD => try self.sload(),
         .SSTORE => try self.sstore(),
+        .TLOAD => {
+            // EIP-1153: not available before Cancun.
+            if (!self.block.fork.atLeast(.cancun)) {
+                self.status = .invalid_opcode;
+                return;
+            }
+            if (!self.chargeGas(gas.transient_storage)) return;
+            const slot = self.popStack() orelse return;
+            const state = self.state orelse {
+                self.status = .invalid_opcode;
+                return;
+            };
+            self.pushStack(state.getTransient(self.address, slot));
+            self.pc += 1;
+        },
+        .TSTORE => {
+            // EIP-1153: not available before Cancun, and a write, so not
+            // allowed in a static frame either.
+            if (!self.block.fork.atLeast(.cancun) or self.is_static) {
+                self.status = .invalid_opcode;
+                return;
+            }
+            if (!self.chargeGas(gas.transient_storage)) return;
+            const slot = self.popStack() orelse return;
+            const value = self.popStack() orelse return;
+            const state = self.state orelse {
+                self.status = .invalid_opcode;
+                return;
+            };
+            try state.setTransient(self.address, slot, value);
+            self.pc += 1;
+        },
+        .MCOPY => {
+            // EIP-5656: not available before Cancun.
+            if (!self.block.fork.atLeast(.cancun)) {
+                self.status = .invalid_opcode;
+                return;
+            }
+            try self.mcopy();
+        },
 
         .RETURN => try self.haltWithOutput(.stopped),
         .REVERT => {
@@ -865,6 +931,32 @@ fn mstore8(self: *Interpreter) !void {
     const offset = self.toMemIndex(offset256) orelse return;
     if (!self.chargeMemoryExpansion(offset, 1)) return;
     try self.memory.write(offset, &[_]u8{@truncate(value)});
+    self.pc += 1;
+}
+
+/// EIP-5656's `MCOPY`: copies `size` bytes within memory, from `src` to
+/// `dest`, as if through an intermediate buffer, so overlapping ranges copy
+/// correctly. Memory grows to cover whichever range ends later.
+fn mcopy(self: *Interpreter) !void {
+    if (!self.chargeGas(gas.verylow)) return;
+    const dest256 = self.popStack() orelse return;
+    const src256 = self.popStack() orelse return;
+    const size256 = self.popStack() orelse return;
+    const src = self.toMemRegion(src256, size256) orelse return;
+    const dest = self.toMemRegion(dest256, size256) orelse return;
+    if (!self.chargeMemoryExpansion(@max(src.offset, dest.offset), dest.size)) return;
+    if (!self.chargeGas(gas.copy_word * ((dest.size + 31) / 32))) return;
+    if (dest.size == 0) {
+        self.pc += 1;
+        return;
+    }
+    try self.memory.expand(@max(src.offset, dest.offset), dest.size);
+    const bytes = self.memory.bytes.items;
+    if (dest.offset <= src.offset) {
+        std.mem.copyForwards(u8, bytes[dest.offset..][0..dest.size], bytes[src.offset..][0..dest.size]);
+    } else {
+        std.mem.copyBackwards(u8, bytes[dest.offset..][0..dest.size], bytes[src.offset..][0..dest.size]);
+    }
     self.pc += 1;
 }
 
@@ -1515,6 +1607,7 @@ fn createOp(self: *Interpreter, kind: CreateKind) !void {
     }
 
     const cp = state.checkpoint();
+    if (self.block.fork.atLeast(.cancun)) try state.markCreated(new_address);
 
     // EIP-161, from Spurious Dragon on: a freshly created contract's own
     // nonce starts at 1, not 0 — set before its init code runs (real
@@ -1683,11 +1776,16 @@ fn selfdestruct(self: *Interpreter) !void {
     // address is charged the 25,000 new-account fee zevm no longer expects).
     // From Spurious Dragon on, `markTouchedIfEmpty` below hands that same
     // empty account to the EIP-161 sweep, so it only survives where it should.
+    // EIP-6780 (Cancun): only a contract created in this same transaction is
+    // still destroyed. Any other just sends its balance to the beneficiary
+    // and stops, keeping its code and storage, and naming itself as the
+    // beneficiary moves nothing, so nothing is burned.
+    const destroys = !self.block.fork.atLeast(.cancun) or state.createdThisTransaction(self.address);
     if (beneficiary != self.address) {
         // Already confirmed the balance is there; `transfer` can only
         // fail on insufficient balance, which can't happen here.
         _ = try state.transfer(self.address, beneficiary, balance);
-    } else if (balance != 0) {
+    } else if (balance != 0 and destroys) {
         // Destroying yourself to yourself just burns the balance.
         try state.setBalance(self.address, 0);
     }
@@ -1702,6 +1800,10 @@ fn selfdestruct(self: *Interpreter) !void {
     // this transaction, so a contract that gets `CALL`ed (and
     // self-destructs) repeatedly doesn't rack up the refund again on
     // every repeat.
+    if (!destroys) {
+        self.status = .stopped;
+        return;
+    }
     const already_marked = state.isPendingDestruction(self.address);
     try state.destroyAccount(self.address);
     // EIP-3529 (London) removed this refund outright.
@@ -5484,4 +5586,199 @@ test "EIP-3860: CREATE with more than max_initcode_size bytes halts from Shangha
     try std.testing.expectEqual(Status.stopped, (try createOfZeros(size, .merge)).status);
     try std.testing.expectEqual(Status.out_of_gas, (try createOfZeros(size, .shanghai)).status);
     try std.testing.expectEqual(Status.stopped, (try createOfZeros(@intCast(max_initcode_size), .shanghai)).status);
+}
+
+/// Runs `code` as contract 0xaa against `state`, under `fork`'s rules.
+fn runAt(state: *State, code: []const u8, fork: Fork) !struct { status: Status, gas_remaining: u64, top: ?u256 } {
+    var interp = try Interpreter.initCall(std.testing.allocator, code, 1_000_000, .{
+        .address = 0xaa,
+        .state = state,
+        .block = .{ .fork = fork, .blob_base_fee = 7 },
+        .tx = .{ .blob_hashes = &.{ 0x0111, 0x0122 } },
+    });
+    defer interp.deinit();
+    try interp.run();
+    return .{ .status = interp.status, .gas_remaining = interp.gas_remaining, .top = interp.stack.pop() catch null };
+}
+
+test "EIP-1153: TSTORE then TLOAD reads the value back for 100 gas each" {
+    const code = [_]u8{
+        @intFromEnum(OpCode.PUSH1), 0x42, // value
+        @intFromEnum(OpCode.PUSH1), 0x01, // slot
+        @intFromEnum(OpCode.TSTORE),
+        @intFromEnum(OpCode.PUSH1), 0x01,
+        @intFromEnum(OpCode.TLOAD),
+        @intFromEnum(OpCode.STOP),
+    };
+    var state = State.init(std.testing.allocator);
+    defer state.deinit();
+    const result = try runAt(&state, &code, .cancun);
+    try std.testing.expectEqual(Status.stopped, result.status);
+    try std.testing.expectEqual(@as(?u256, 0x42), result.top);
+    try std.testing.expectEqual(@as(u64, 1_000_000 - 3 * gas.verylow - 2 * gas.transient_storage), result.gas_remaining);
+    // Transient storage is gone once the transaction ends, and was never
+    // persistent storage.
+    try std.testing.expectEqual(@as(u256, 0), state.getStorage(0xaa, 1));
+    state.finalizeTransaction();
+    try std.testing.expectEqual(@as(u256, 0), state.getTransient(0xaa, 1));
+}
+
+test "EIP-1153: a reverted frame's TSTORE is undone" {
+    var state = State.init(std.testing.allocator);
+    defer state.deinit();
+    try state.setTransient(0xaa, 1, 5);
+    const cp = state.checkpoint();
+    try state.setTransient(0xaa, 1, 6);
+    try state.setTransient(0xaa, 2, 7);
+    state.revertTo(cp);
+    try std.testing.expectEqual(@as(u256, 5), state.getTransient(0xaa, 1));
+    try std.testing.expectEqual(@as(u256, 0), state.getTransient(0xaa, 2));
+}
+
+test "EIP-1153: TSTORE in a static frame and TLOAD/TSTORE before Cancun are invalid" {
+    var state = State.init(std.testing.allocator);
+    defer state.deinit();
+    const tstore = [_]u8{ @intFromEnum(OpCode.PUSH1), 1, @intFromEnum(OpCode.PUSH1), 1, @intFromEnum(OpCode.TSTORE), @intFromEnum(OpCode.STOP) };
+    var interp = try Interpreter.initCall(std.testing.allocator, &tstore, 1_000_000, .{ .address = 0xaa, .state = &state, .block = .{ .fork = .cancun }, .is_static = true });
+    defer interp.deinit();
+    try interp.run();
+    try std.testing.expectEqual(Status.invalid_opcode, interp.status);
+    try std.testing.expectEqual(Status.invalid_opcode, (try runAt(&state, &tstore, .shanghai)).status);
+    const tload = [_]u8{ @intFromEnum(OpCode.PUSH1), 1, @intFromEnum(OpCode.TLOAD), @intFromEnum(OpCode.STOP) };
+    try std.testing.expectEqual(Status.invalid_opcode, (try runAt(&state, &tload, .shanghai)).status);
+}
+
+test "EIP-5656: MCOPY copies overlapping ranges as if through a buffer" {
+    // Memory 0..32 holds 0x0102...20; copy 32 bytes from 0 to 1, overlapping.
+    var code: std.ArrayListUnmanaged(u8) = .empty;
+    defer code.deinit(std.testing.allocator);
+    try code.append(std.testing.allocator, @intFromEnum(OpCode.PUSH32));
+    for (1..33) |i| try code.append(std.testing.allocator, @intCast(i));
+    try code.appendSlice(std.testing.allocator, &.{
+        @intFromEnum(OpCode.PUSH1), 0, @intFromEnum(OpCode.MSTORE),
+        @intFromEnum(OpCode.PUSH1), 32, // size
+        @intFromEnum(OpCode.PUSH1), 0, // src
+        @intFromEnum(OpCode.PUSH1), 1, // dest
+        @intFromEnum(OpCode.MCOPY),
+        @intFromEnum(OpCode.PUSH1), 1, @intFromEnum(OpCode.MLOAD),
+        @intFromEnum(OpCode.STOP),
+    });
+    var expected: [32]u8 = undefined;
+    for (&expected, 1..) |*b, i| b.* = @intCast(i);
+    var state = State.init(std.testing.allocator);
+    defer state.deinit();
+    const result = try runAt(&state, code.items, .cancun);
+    try std.testing.expectEqual(Status.stopped, result.status);
+    try std.testing.expectEqual(@as(?u256, std.mem.readInt(u256, &expected, .big)), result.top);
+}
+
+test "EIP-5656: MCOPY pays 3 per word plus expansion to the later range end" {
+    const code = [_]u8{
+        @intFromEnum(OpCode.PUSH1), 32, // size
+        @intFromEnum(OpCode.PUSH1), 0, // src
+        @intFromEnum(OpCode.PUSH1), 64, // dest
+        @intFromEnum(OpCode.MCOPY),
+        @intFromEnum(OpCode.STOP),
+    };
+    var state = State.init(std.testing.allocator);
+    defer state.deinit();
+    const result = try runAt(&state, &code, .cancun);
+    try std.testing.expectEqual(Status.stopped, result.status);
+    const expected = 1_000_000 - 4 * gas.verylow - gas.copy_word - gas.memoryExpansionCost(0, 64, 32);
+    try std.testing.expectEqual(@as(u64, expected), result.gas_remaining);
+    try std.testing.expectEqual(Status.invalid_opcode, (try runAt(&state, &code, .shanghai)).status);
+}
+
+test "EIP-4844: BLOBHASH reads the transaction's versioned hashes, 0 past the end" {
+    var state = State.init(std.testing.allocator);
+    defer state.deinit();
+    const second = [_]u8{ @intFromEnum(OpCode.PUSH1), 1, @intFromEnum(OpCode.BLOBHASH), @intFromEnum(OpCode.STOP) };
+    try std.testing.expectEqual(@as(?u256, 0x0122), (try runAt(&state, &second, .cancun)).top);
+    const past = [_]u8{ @intFromEnum(OpCode.PUSH1), 2, @intFromEnum(OpCode.BLOBHASH), @intFromEnum(OpCode.STOP) };
+    try std.testing.expectEqual(@as(?u256, 0), (try runAt(&state, &past, .cancun)).top);
+    try std.testing.expectEqual(Status.invalid_opcode, (try runAt(&state, &second, .shanghai)).status);
+}
+
+test "EIP-7516: BLOBBASEFEE pushes the block's blob base fee for 2 gas" {
+    var state = State.init(std.testing.allocator);
+    defer state.deinit();
+    const code = [_]u8{ @intFromEnum(OpCode.BLOBBASEFEE), @intFromEnum(OpCode.STOP) };
+    const result = try runAt(&state, &code, .cancun);
+    try std.testing.expectEqual(@as(?u256, 7), result.top);
+    try std.testing.expectEqual(@as(u64, 1_000_000 - gas.base), result.gas_remaining);
+    try std.testing.expectEqual(Status.invalid_opcode, (try runAt(&state, &code, .shanghai)).status);
+}
+
+const selfdestruct_to_bb = [_]u8{ @intFromEnum(OpCode.PUSH1), 0xbb, @intFromEnum(OpCode.SELFDESTRUCT) };
+const selfdestruct_to_self = [_]u8{ @intFromEnum(OpCode.ADDRESS), @intFromEnum(OpCode.SELFDESTRUCT) };
+
+test "EIP-6780: SELFDESTRUCT of a contract not created this transaction only moves its balance" {
+    var state = State.init(std.testing.allocator);
+    defer state.deinit();
+    try state.setCode(0xaa, &selfdestruct_to_bb);
+    try state.setBalance(0xaa, 100);
+    try state.setStorage(0xaa, 1, 9);
+    state.finalizeTransaction();
+
+    try std.testing.expectEqual(Status.stopped, (try runAt(&state, &selfdestruct_to_bb, .cancun)).status);
+    state.finalizeTransaction();
+    try std.testing.expectEqual(@as(u256, 0), state.getBalance(0xaa));
+    try std.testing.expectEqual(@as(u256, 100), state.getBalance(0xbb));
+    try std.testing.expectEqual(selfdestruct_to_bb.len, state.getCode(0xaa).len);
+    try std.testing.expectEqual(@as(u256, 9), state.getStorage(0xaa, 1));
+}
+
+test "EIP-6780: SELFDESTRUCT to itself of a contract not created this transaction burns nothing" {
+    var state = State.init(std.testing.allocator);
+    defer state.deinit();
+    try state.setCode(0xaa, &selfdestruct_to_self);
+    try state.setBalance(0xaa, 100);
+    state.finalizeTransaction();
+
+    try std.testing.expectEqual(Status.stopped, (try runAt(&state, &selfdestruct_to_self, .cancun)).status);
+    state.finalizeTransaction();
+    try std.testing.expectEqual(@as(u256, 100), state.getBalance(0xaa));
+    try std.testing.expect(state.exists(0xaa));
+}
+
+test "EIP-6780: SELFDESTRUCT still deletes a contract created in the same transaction" {
+    var state = State.init(std.testing.allocator);
+    defer state.deinit();
+    try state.setCode(0xaa, &selfdestruct_to_self);
+    try state.setBalance(0xaa, 100);
+    try state.markCreated(0xaa);
+
+    try std.testing.expectEqual(Status.stopped, (try runAt(&state, &selfdestruct_to_self, .cancun)).status);
+    state.finalizeTransaction();
+    try std.testing.expect(!state.exists(0xaa));
+}
+
+test "EIP-6780: before Cancun SELFDESTRUCT deletes any contract" {
+    var state = State.init(std.testing.allocator);
+    defer state.deinit();
+    try state.setCode(0xaa, &selfdestruct_to_bb);
+    try state.setBalance(0xaa, 100);
+    state.finalizeTransaction();
+
+    try std.testing.expectEqual(Status.stopped, (try runAt(&state, &selfdestruct_to_bb, .shanghai)).status);
+    state.finalizeTransaction();
+    try std.testing.expect(!state.exists(0xaa));
+    try std.testing.expectEqual(@as(u256, 100), state.getBalance(0xbb));
+}
+
+test "EIP-6780: CREATE marks the new contract as created in this transaction" {
+    var state = State.init(std.testing.allocator);
+    defer state.deinit();
+    const code = [_]u8{
+        @intFromEnum(OpCode.PUSH1), 1, // size
+        @intFromEnum(OpCode.PUSH1), 0, // offset
+        @intFromEnum(OpCode.PUSH1), 0, // value
+        @intFromEnum(OpCode.CREATE),
+        @intFromEnum(OpCode.STOP),
+    };
+    try std.testing.expectEqual(Status.stopped, (try runAt(&state, &code, .cancun)).status);
+    const created = try createAddress(std.testing.allocator, 0xaa, 0);
+    try std.testing.expect(state.createdThisTransaction(created));
+    state.finalizeTransaction();
+    try std.testing.expect(!state.createdThisTransaction(created));
 }

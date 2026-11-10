@@ -65,6 +65,11 @@ const DecodedHeader = struct {
     /// written) but free to check and, unlike the root, cheap enough to
     /// check on every single block.
     gas_used: u64,
+    /// EIP-4844 (Cancun) appended `blobGasUsed` and `excessBlobGas` (the
+    /// 18th and 19th fields) and EIP-4788 `parentBeaconBlockRoot` (the
+    /// 20th). Zero before that.
+    excess_blob_gas: u64,
+    parent_beacon_block_root: zevm.Hash,
 };
 
 /// Frontier-era headers RLP-encode as a 15-field list (`parentHash,
@@ -85,6 +90,8 @@ fn decodeHeader(header: zevm.Rlp.Item) DecodedHeader {
         .difficulty = if (bytesToU256(header.list[7].string) == 0) bytesToU256(header.list[13].string) else bytesToU256(header.list[7].string),
         .state_root = bytesToU256(header.list[3].string),
         .gas_used = bytesToU64(header.list[10].string),
+        .excess_blob_gas = if (header.list.len > 18) bytesToU64(header.list[18].string) else 0,
+        .parent_beacon_block_root = if (header.list.len > 19) bytesToU256(header.list[19].string) else 0,
     };
 }
 
@@ -182,11 +189,13 @@ fn txSender(allocator: std.mem.Allocator, secp: Secp256k1, tx_item: zevm.Rlp.Ite
 /// How many fields a typed transaction carries before its signature
 /// (`y_parity, r, s`), or null for a type this decoder does not know.
 /// EIP-1559 (type 2) splits EIP-2930's single `gas_price` into a tip cap and
-/// a fee cap, so everything after `nonce` sits one field later.
+/// a fee cap, so everything after `nonce` sits one field later. EIP-4844
+/// (type 3) appends a blob fee cap and the blob versioned hashes.
 fn signedFieldCount(tx_type: u8) ?usize {
     return switch (tx_type) {
         0x01 => 8,
         0x02 => 9,
+        0x03 => 11,
         else => null,
     };
 }
@@ -246,13 +255,16 @@ fn parseTransaction(arena: std.mem.Allocator, tx_item: zevm.Rlp.Item, from: zevm
 /// `rlp([chain_id, nonce, max_priority_fee, max_fee, gas_limit, to, value,
 /// data, access_list, y_parity, r, s])`, the same shape with `gas_price`
 /// split in two, so the fields after it are read one position later.
+/// EIP-4844 (type 3, Cancun): type 2's fields, then `max_fee_per_blob_gas,
+/// blob_versioned_hashes` before the signature.
 fn parseTypedTransaction(arena: std.mem.Allocator, bytes: []const u8, from: zevm.Address) !zevm.Block.Entry {
     if (bytes.len == 0) return error.UnsupportedTransactionType;
     const signed_count = signedFieldCount(bytes[0]) orelse return error.UnsupportedTransactionType;
     const payload = try zevm.Rlp.decode(arena, bytes[1..]);
     const fields = payload.list;
     if (fields.len != signed_count + 3) return error.MalformedTransaction;
-    const fee_market = bytes[0] == 0x02;
+    const fee_market = bytes[0] == 0x02 or bytes[0] == 0x03;
+    const blob = bytes[0] == 0x03;
     const shift: usize = if (fee_market) 1 else 0;
 
     const access_list = fields[7 + shift].list;
@@ -261,6 +273,12 @@ fn parseTypedTransaction(arena: std.mem.Allocator, bytes: []const u8, from: zevm
         const keys = try arena.alloc(u256, item.list[1].list.len);
         for (item.list[1].list, keys) |key, *out| out.* = bytesToU256(key.string);
         entry.* = .{ .address = bytesToAddress(item.list[0].string), .storage_keys = keys };
+    }
+
+    var blob_hashes: []u256 = &.{};
+    if (blob) {
+        blob_hashes = try arena.alloc(u256, fields[10].list.len);
+        for (fields[10].list, blob_hashes) |item, *out| out.* = bytesToU256(item.string);
     }
 
     const to_bytes = fields[4 + shift].string;
@@ -280,6 +298,8 @@ fn parseTypedTransaction(arena: std.mem.Allocator, bytes: []const u8, from: zevm
             .chain_id = bytesToU256(fields[0].string),
             .access_list = entries,
             .max_priority_fee = if (fee_market) bytesToU256(fields[2].string) else null,
+            .max_fee_per_blob_gas = if (blob) bytesToU256(fields[9].string) else null,
+            .blob_versioned_hashes = blob_hashes,
         },
     };
 }
@@ -363,6 +383,7 @@ fn prewarmBlock(allocator: std.mem.Allocator, p: *Prewarm, b: usize) !void {
         .difficulty = header.difficulty,
         .base_fee = header.base_fee,
         .fork = zevm.Fork.at(header.number),
+        .blob_base_fee = zevm.gas.blobBaseFee(header.excess_blob_gas),
     };
     for (p.block_start[b]..p.block_start[b + 1]) |i| {
         if (p.stop.load(.monotonic)) return;
@@ -371,7 +392,8 @@ fn prewarmBlock(allocator: std.mem.Allocator, p: *Prewarm, b: usize) !void {
         // since the snapshot. The throwaway state is given whatever the
         // transaction needs to get past those checks and actually run.
         state.setNonce(entry.from, entry.tx.nonce) catch continue;
-        const upfront = @as(u256, entry.tx.gas_limit) * entry.tx.gas_price + entry.tx.value;
+        const blob_fee = @as(u256, entry.tx.blob_versioned_hashes.len) * zevm.gas.blob_gas_per_blob * (entry.tx.max_fee_per_blob_gas orelse 0);
+        const upfront = @as(u256, entry.tx.gas_limit) * entry.tx.gas_price + entry.tx.value + blob_fee;
         if (state.getBalance(entry.from) < upfront) state.setBalance(entry.from, upfront) catch continue;
         _ = evm.executeTransaction(entry.tx, entry.from) catch {};
     }
@@ -1141,6 +1163,7 @@ pub fn main(io: std.Io, args: []const []const u8) anyerror!void {
         }
         if (state.base != null) {
             zevm.Precompiles.initSecp();
+            zevm.Precompiles.initKzg();
             while (prewarm_spawned < prewarm_threads) : (prewarm_spawned += 1) {
                 prewarm_pool[prewarm_spawned] = std.Thread.spawn(.{}, prewarmWorker, .{ &prewarm, prewarm_spawned, prewarm_threads }) catch break;
             }
@@ -1250,6 +1273,8 @@ pub fn main(io: std.Io, args: []const []const u8) anyerror!void {
                     .difficulty = header.difficulty,
                     .base_fee = header.base_fee,
                     .recent_hashes = recent_hashes.items,
+                    .excess_blob_gas = header.excess_blob_gas,
+                    .parent_beacon_block_root = header.parent_beacon_block_root,
                 }) catch |err| {
                     std.debug.print("block {d} failed: {s}\n", .{ header.number, @errorName(err) });
                     return err;

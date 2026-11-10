@@ -1,8 +1,9 @@
 //! Executes a decoded `Transaction` against a `State`.
 //!
-//! Frontier through the Merge (Paris) are implemented (Muir, Arrow and Gray
-//! Glacier only delayed the difficulty bomb and change nothing this executes). `processBlock` panics on any block from a later fork (see
-//! `Fork`) instead of silently applying stale rules.
+//! Frontier through Cancun are implemented (Muir, Arrow and Gray Glacier
+//! only delayed the difficulty bomb and change nothing this executes).
+//! `processBlock` panics on any block from a later fork (see `Fork`) instead
+//! of silently applying stale rules.
 //!
 //! Constantinople and Petersburg share a block on mainnet (7,280,000):
 //! Constantinople's EIP-1283 SSTORE repricing was withdrawn by Petersburg
@@ -11,6 +12,7 @@
 
 const std = @import("std");
 const Address = @import("Address.zig").Address;
+const Hash = @import("Hash.zig").Hash;
 const State = @import("State.zig");
 const Interpreter = @import("Interpreter.zig");
 const Transaction = @import("Transaction.zig").Transaction;
@@ -36,6 +38,13 @@ tx: Interpreter.TxContext = .{},
 block_gas_used: u64 = 0,
 
 const Evm = @This();
+
+/// EIP-4788 (Cancun): the contract that keeps recent beacon block roots,
+/// and the address its once-per-block update is sent from.
+const beacon_roots_address: Address = 0x000F3df6D732807Ef1319fB7B8bB8522d0Beac02;
+const system_address: Address = 0xfffffffffffffffffffffffffffffffffffffffe;
+/// Gas given to a system call. It does not count toward the block's gas.
+const system_call_gas: u64 = 30_000_000;
 
 /// Miner reward for a block with no uncles: Frontier's flat 5 ETH, cut to
 /// 3 ETH by EIP-649 at Byzantium and again to 2 ETH by EIP-1234 at
@@ -136,8 +145,19 @@ pub fn executeTransaction(self: *Evm, tx: Transaction, from: Address) !Result {
         effective_gas_price = base_fee + @min(tip, tx.gas_price - base_fee);
     } else if (tx.gas_price < base_fee) return error.GasPriceBelowBaseFee;
 
+    // EIP-4844 (Cancun): a blob transaction also buys blob gas, at the
+    // block's blob base fee, which it must be willing to pay. All of that
+    // fee is burned and none is refunded, so it is charged in full up front
+    // and checked against the transaction's maximum like the gas fee is.
+    const blob_gas = @as(u256, tx.blob_versioned_hashes.len) * gas.blob_gas_per_blob;
+    var max_blob_fee: u256 = 0;
+    if (tx.max_fee_per_blob_gas) |max_fee_per_blob_gas| {
+        if (max_fee_per_blob_gas < self.block.blob_base_fee) return error.BlobFeeBelowBaseFee;
+        max_blob_fee = blob_gas * max_fee_per_blob_gas;
+    }
+
     const gas_fee = @as(u256, tx.gas_limit) * tx.gas_price;
-    const upfront_cost = gas_fee + tx.value;
+    const upfront_cost = gas_fee + tx.value + max_blob_fee;
     const balance_before = self.state.getBalance(from);
     if (upfront_cost > balance_before) {
         // Fatal path: this aborts the whole replay, so the detail is worth
@@ -150,14 +170,14 @@ pub fn executeTransaction(self: *Evm, tx: Transaction, from: Address) !Result {
     }
     // Only the fee is debited here; `value` moves separately, through the
     // transfer inside the call/create this transaction turns into.
-    try self.state.setBalance(from, balance_before - @as(u256, tx.gas_limit) * effective_gas_price);
+    try self.state.setBalance(from, balance_before - @as(u256, tx.gas_limit) * effective_gas_price - blob_gas * self.block.blob_base_fee);
 
     // A transaction's nonce always advances, whether it succeeds, reverts,
     // or fails outright.
     try self.state.setNonce(from, current_nonce + 1);
 
     // GASPRICE reports what is actually being paid per gas.
-    self.tx = .{ .origin = from, .gas_price = effective_gas_price };
+    self.tx = .{ .origin = from, .gas_price = effective_gas_price, .blob_hashes = tx.blob_versioned_hashes };
 
     // EIP-2929/2930 (Berlin): the sender, every precompile and everything in
     // the access list start warm. The target (or the address being created)
@@ -165,8 +185,10 @@ pub fn executeTransaction(self: *Evm, tx: Transaction, from: Address) !Result {
     // reverted: it all precedes the checkpoint either of them takes.
     if (self.block.fork.atLeast(.berlin)) {
         _ = try self.state.warmAddress(from);
+        // Cancun added the point evaluation precompile at 0x0a.
+        const last_precompile: Address = if (self.block.fork.atLeast(.cancun)) 0x0a else 0x09;
         var precompile: Address = 1;
-        while (precompile <= 9) : (precompile += 1) _ = try self.state.warmAddress(precompile);
+        while (precompile <= last_precompile) : (precompile += 1) _ = try self.state.warmAddress(precompile);
         for (tx.access_list) |entry| {
             _ = try self.state.warmAddress(entry.address);
             for (entry.storage_keys) |key| _ = try self.state.warmSlot(entry.address, key);
@@ -213,9 +235,9 @@ pub fn processBlock(self: *Evm, block: Block) !void {
     const fork = Fork.at(block.number);
     // Muir Glacier delayed the difficulty bomb and changed nothing this
     // executes, so Istanbul's rules carry through it unchanged.
-    if (fork.atLeast(.cancun)) {
+    if (fork.atLeast(.prague)) {
         std.debug.panic(
-            "block {d} is past Shanghai (fork: {s}): this Evm only implements up to Shanghai's rules",
+            "block {d} is past Cancun (fork: {s}): this Evm only implements up to Cancun's rules",
             .{ block.number, @tagName(fork) },
         );
     }
@@ -236,7 +258,10 @@ pub fn processBlock(self: *Evm, block: Block) !void {
         .chain_id = block.chain_id,
         .recent_hashes = block.recent_hashes,
         .fork = fork,
+        .blob_base_fee = if (fork.atLeast(.cancun)) gas.blobBaseFee(block.excess_blob_gas) else 0,
     };
+
+    if (fork.atLeast(.cancun)) try self.storeBeaconRoot(block.parent_beacon_block_root);
 
     self.block_gas_used = 0;
     for (block.transactions) |entry| {
@@ -271,6 +296,35 @@ pub fn processBlock(self: *Evm, block: Block) !void {
     }
     try self.state.creditBalance(block.miner, miner_reward);
     self.state.debugDumpBlockAccounts();
+}
+
+/// EIP-4788 (Cancun): before any of a block's transactions, the system
+/// address calls the beacon roots contract with the parent beacon block
+/// root, which it stores keyed by the block's timestamp. A system call: no
+/// sender account, no fee, no value, and its gas counts toward nothing. If
+/// the contract has not been deployed there is nothing to call.
+fn storeBeaconRoot(self: *Evm, root: Hash) !void {
+    const code = self.state.getCode(beacon_roots_address);
+    if (code.len == 0) return;
+    var calldata: [32]u8 = undefined;
+    std.mem.writeInt(u256, &calldata, root, .big);
+    self.tx = .{ .origin = system_address, .gas_price = self.block.base_fee };
+
+    const cp = self.state.checkpoint();
+    var interp = try Interpreter.initCall(self.allocator, code, system_call_gas, .{
+        .address = beacon_roots_address,
+        .caller = system_address,
+        .value = 0,
+        .calldata = &calldata,
+        .tx = self.tx,
+        .state = self.state,
+        .block = self.block,
+        .jumpdest = try self.state.getJumpdest(beacon_roots_address),
+    });
+    defer interp.deinit();
+    try interp.run();
+    if (interp.status != .stopped) self.state.revertTo(cp);
+    self.state.finalizeTransaction();
 }
 
 fn call(self: *Evm, value: u256, data: []const u8, access_list_cost: u64, gas_limit: u64, from: Address, to: Address) !Result {
@@ -410,6 +464,7 @@ fn create(self: *Evm, nonce: u64, value: u256, data: []const u8, access_list_cos
     }
 
     const cp = self.state.checkpoint();
+    if (self.block.fork.atLeast(.cancun)) try self.state.markCreated(new_address);
 
     // EIP-161, from Spurious Dragon on: a freshly created contract's own
     // nonce starts at 1, not 0 (mirrors `Interpreter.createOp`'s nested
@@ -1763,4 +1818,86 @@ test "EIP-4895: withdrawals credit their amount in gwei, and a zero amount creat
     try std.testing.expectEqual(@as(u256, 5 + 4_000_000_000), state.getBalance(0xa1));
     try std.testing.expect(!state.exists(0xa2));
     try std.testing.expectEqual(@as(u256, 0), state.getBalance(0xaa));
+}
+
+test "EIP-4844: a blob transaction pays its blob gas at the blob base fee, all of it burned" {
+    var state = State.init(std.testing.allocator);
+    defer state.deinit();
+    try state.setBalance(0x1, 1_000_000_000_000);
+
+    var evm = Evm{ .allocator = std.testing.allocator, .state = &state, .block = .{ .coinbase = 0xcc, .fork = .cancun, .blob_base_fee = 3 } };
+    var tx = testTx();
+    tx.to = 0xdd;
+    tx.gas_limit = 21_000;
+    tx.max_fee_per_blob_gas = 10;
+    tx.blob_versioned_hashes = &.{ 0x01aa, 0x01bb };
+
+    const result = try evm.executeTransaction(tx, 0x1);
+    defer std.testing.allocator.free(result.return_data);
+    try std.testing.expectEqual(Interpreter.Status.stopped, result.status);
+    // Two blobs at 3 wei per blob gas: what the sender loses, and nobody gains.
+    try std.testing.expectEqual(@as(u256, 1_000_000_000_000 - 2 * gas.blob_gas_per_blob * 3), state.getBalance(0x1));
+    try std.testing.expectEqual(@as(u256, 0), state.getBalance(0xcc));
+}
+
+test "EIP-4844: a blob fee cap below the blob base fee is invalid, and the balance check counts the cap" {
+    var state = State.init(std.testing.allocator);
+    defer state.deinit();
+    var evm = Evm{ .allocator = std.testing.allocator, .state = &state, .block = .{ .fork = .cancun, .blob_base_fee = 3 } };
+    var tx = testTx();
+    tx.to = 0xdd;
+    tx.gas_limit = 21_000;
+    tx.blob_versioned_hashes = &.{0x01aa};
+
+    tx.max_fee_per_blob_gas = 2;
+    try state.setBalance(0x1, 1_000_000_000_000);
+    try std.testing.expectError(error.BlobFeeBelowBaseFee, evm.executeTransaction(tx, 0x1));
+
+    // Enough for the blob gas at the base fee, not at the cap of 10.
+    tx.max_fee_per_blob_gas = 10;
+    try state.setBalance(0x2, gas.blob_gas_per_blob * 3);
+    try std.testing.expectError(error.InsufficientBalance, evm.executeTransaction(tx, 0x2));
+}
+
+test "EIP-4788: from Cancun on, processBlock first calls the beacon roots contract from the system address" {
+    const OpCode = @import("OpCode.zig").OpCode;
+    // Stores the caller in slot 0 and the calldata word in slot 1.
+    const code = [_]u8{
+        @intFromEnum(OpCode.CALLER),       @intFromEnum(OpCode.PUSH0),        @intFromEnum(OpCode.SSTORE),
+        @intFromEnum(OpCode.PUSH0),        @intFromEnum(OpCode.CALLDATALOAD), @intFromEnum(OpCode.PUSH1),
+        1,                                 @intFromEnum(OpCode.SSTORE),       @intFromEnum(OpCode.STOP),
+    };
+    var state = State.init(std.testing.allocator);
+    defer state.deinit();
+    try state.setCode(beacon_roots_address, &code);
+
+    var evm = Evm{ .allocator = std.testing.allocator, .state = &state };
+    try evm.processBlock(.{ .number = 19_426_587, .miner = 0xaa, .transactions = &.{}, .parent_beacon_block_root = 0x1234 });
+    try std.testing.expectEqual(@as(u256, system_address), state.getStorage(beacon_roots_address, 0));
+    try std.testing.expectEqual(@as(u256, 0x1234), state.getStorage(beacon_roots_address, 1));
+    // A system call: no gas toward the block, no account for the sender.
+    try std.testing.expectEqual(@as(u64, 0), evm.block_gas_used);
+    try std.testing.expect(!state.exists(system_address));
+
+    // Not before Cancun.
+    try evm.processBlock(.{ .number = 19_426_586, .miner = 0xaa, .transactions = &.{}, .parent_beacon_block_root = 0x5678 });
+    try std.testing.expectEqual(@as(u256, 0x1234), state.getStorage(beacon_roots_address, 1));
+}
+
+test "from Cancun on, the point evaluation precompile starts warm" {
+    const OpCode = @import("OpCode.zig").OpCode;
+    const code = [_]u8{ @intFromEnum(OpCode.PUSH1), 0x0a, @intFromEnum(OpCode.BALANCE), @intFromEnum(OpCode.STOP) };
+    var gas_used: [2]u64 = undefined;
+    for ([_]Fork{ .shanghai, .cancun }, &gas_used) |fork, *used| {
+        var state = State.init(std.testing.allocator);
+        defer state.deinit();
+        try state.setCode(0xdd, &code);
+        var evm = Evm{ .allocator = std.testing.allocator, .state = &state, .block = .{ .fork = fork } };
+        var tx = testTx();
+        tx.to = 0xdd;
+        const result = try evm.executeTransaction(tx, 0x1);
+        defer std.testing.allocator.free(result.return_data);
+        used.* = result.gas_used;
+    }
+    try std.testing.expectEqual(gas.cold_account_access_2929 - gas.warm_storage_read_2929, gas_used[0] - gas_used[1]);
 }

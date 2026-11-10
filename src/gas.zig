@@ -126,6 +126,49 @@ pub const warm_storage_read_2929: u64 = 100;
 pub const cold_sload_2929: u64 = 2100;
 pub const cold_account_access_2929: u64 = 2600;
 
+/// EIP-1153 (Cancun): `TLOAD` and `TSTORE` cost a warm storage read, with
+/// no cold surcharge and no refunds.
+pub const transient_storage: u64 = warm_storage_read_2929;
+
+/// EIP-4844 (Cancun). Each blob uses this much blob gas, a separate resource
+/// from ordinary gas with its own base fee, which `blobBaseFee` derives from
+/// the header's `excess_blob_gas`.
+pub const blob_gas_per_blob: u64 = 1 << 17;
+const min_blob_base_fee: u256 = 1;
+const blob_base_fee_update_fraction: u256 = 3_338_477;
+
+/// EIP-4844: the blob base fee, `min_blob_base_fee * e^(excess_blob_gas /
+/// update_fraction)`, approximated by the EIP's integer Taylor series.
+pub fn blobBaseFee(excess_blob_gas: u64) u256 {
+    return fakeExponential(min_blob_base_fee, excess_blob_gas, blob_base_fee_update_fraction);
+}
+
+/// EIP-4844's `fake_exponential`: `factor * e^(numerator / denominator)`,
+/// summed term by term until a term rounds to zero. Exactly the EIP's
+/// integer arithmetic, since consensus depends on its rounding.
+fn fakeExponential(factor: u256, numerator: u256, denominator: u256) u256 {
+    var output: u256 = 0;
+    var accumulator = factor * denominator;
+    var i: u256 = 1;
+    while (accumulator > 0) : (i += 1) {
+        output += accumulator;
+        accumulator = (accumulator * numerator) / (denominator * i);
+    }
+    return output / denominator;
+}
+
+test "fakeExponential matches EIP-4844's reference values" {
+    try std.testing.expectEqual(@as(u256, 1), fakeExponential(1, 0, 1));
+    try std.testing.expectEqual(@as(u256, 6), fakeExponential(1, 2, 1));
+    try std.testing.expectEqual(@as(u256, 16), fakeExponential(1, 3, 1));
+    try std.testing.expectEqual(@as(u256, 5709098764), fakeExponential(1, 50000000, 2225652));
+}
+
+test "blobBaseFee is 1 wei with no excess blob gas" {
+    try std.testing.expectEqual(@as(u256, 1), blobBaseFee(0));
+    try std.testing.expectEqual(@as(u256, 10203769476395), blobBaseFee(100_000_000));
+}
+
 /// EIP-2930 (Berlin). Intrinsic gas per entry in a transaction's access
 /// list, paid up front in exchange for those accounts and slots starting
 /// warm. Cheaper than the cold surcharge they avoid, which is the point.

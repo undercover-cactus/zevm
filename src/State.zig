@@ -116,6 +116,9 @@ const Change = union(enum) {
     /// accesses never happened as far as later pricing is concerned.
     warmed_address: Address,
     warmed_slot: SlotKey,
+    /// EIP-1153: a transient slot held `old` before a `TSTORE` in a frame
+    /// that may still revert.
+    transient: struct { key: SlotKey, old: u256 },
 };
 
 pub const Checkpoint = usize;
@@ -172,6 +175,16 @@ slot_cache: std.HashMapUnmanaged(SlotKey, u256, KeyContext(SlotKey), 80) = .empt
 warm_addresses: std.HashMapUnmanaged(Address, void, KeyContext(Address), 80) = .empty,
 warm_slots: std.HashMapUnmanaged(SlotKey, void, KeyContext(SlotKey), 80) = .empty,
 journal: std.ArrayListUnmanaged(Change) = .empty,
+/// EIP-1153 (Cancun): `TSTORE`/`TLOAD`'s storage, which lasts for one
+/// transaction. Journaled like persistent storage, so a reverted frame's
+/// writes are undone, and emptied by `finalizeTransaction`.
+transient: std.HashMapUnmanaged(SlotKey, u256, KeyContext(SlotKey), 80) = .empty,
+/// EIP-6780 (Cancun): contracts created during the transaction in progress,
+/// the only ones `SELFDESTRUCT` still deletes. Not journaled: an address
+/// whose creation reverted holds no code, so nothing can run there to
+/// self-destruct unless a later creation in the same transaction puts code
+/// back, which marks it again anyway. Emptied by `finalizeTransaction`.
+created_this_transaction: std.HashMapUnmanaged(Address, void, KeyContext(Address), 80) = .empty,
 /// Addresses `SELFDESTRUCT`ed during the transaction currently in
 /// progress, appended by `destroyAccount` in lockstep with its
 /// `.marked_for_destruction` journal entry (so a `revertTo` that undoes one
@@ -222,6 +235,8 @@ pub fn deinit(self: *State) void {
     self.slot_cache.deinit(self.allocator);
     self.warm_addresses.deinit(self.allocator);
     self.warm_slots.deinit(self.allocator);
+    self.transient.deinit(self.allocator);
+    self.created_this_transaction.deinit(self.allocator);
     if (self.base) |*base| base.deinit(self.allocator);
 
     var jd = self.jumpdest_cache.valueIterator();
@@ -321,6 +336,35 @@ pub fn finalizeTransaction(self: *State) void {
     if (self.originals.capacity() > 4 * @max(self.originals.count(), 256)) self.originals.clearAndFree(self.allocator) else self.originals.clearRetainingCapacity();
     if (self.warm_addresses.capacity() > 4 * @max(self.warm_addresses.count(), 256)) self.warm_addresses.clearAndFree(self.allocator) else self.warm_addresses.clearRetainingCapacity();
     if (self.warm_slots.capacity() > 4 * @max(self.warm_slots.count(), 256)) self.warm_slots.clearAndFree(self.allocator) else self.warm_slots.clearRetainingCapacity();
+    // Nearly always empty, and clearing an empty table still zero-fills it.
+    if (self.transient.count() != 0) self.transient.clearRetainingCapacity();
+    if (self.created_this_transaction.count() != 0) self.created_this_transaction.clearRetainingCapacity();
+}
+
+/// EIP-1153: `address`'s transient `slot`, 0 if this transaction never set it.
+pub fn getTransient(self: *const State, address: Address, slot: u256) u256 {
+    return self.transient.get(.{ .address = address, .slot = slot }) orelse 0;
+}
+
+/// EIP-1153: sets `address`'s transient `slot` until the transaction ends,
+/// or until the frame that set it reverts.
+pub fn setTransient(self: *State, address: Address, slot: u256, value: u256) !void {
+    const key: SlotKey = .{ .address = address, .slot = slot };
+    const entry = try self.transient.getOrPut(self.allocator, key);
+    const old = if (entry.found_existing) entry.value_ptr.* else 0;
+    entry.value_ptr.* = value;
+    try self.journal.append(self.allocator, .{ .transient = .{ .key = key, .old = old } });
+}
+
+/// EIP-6780: records that a contract is being created at `address` in this
+/// transaction.
+pub fn markCreated(self: *State, address: Address) !void {
+    try self.created_this_transaction.put(self.allocator, address, {});
+}
+
+/// EIP-6780: whether a contract was created at `address` in this transaction.
+pub fn createdThisTransaction(self: *const State, address: Address) bool {
+    return self.created_this_transaction.contains(address);
 }
 
 /// Marks `address` warm (EIP-2929), returning whether it already was. The
@@ -783,6 +827,7 @@ pub fn revertTo(self: *State, cp: Checkpoint) void {
             },
             .warmed_address => |address| _ = self.warm_addresses.remove(address),
             .warmed_slot => |key| _ = self.warm_slots.remove(key),
+            .transient => |c| self.transient.getPtr(c.key).?.* = c.old,
         }
     }
 }

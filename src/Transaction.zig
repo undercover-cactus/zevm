@@ -1,6 +1,7 @@
 //! A decoded Ethereum transaction: Legacy, EIP-2930's access-list type
-//! (type 1, Berlin) or EIP-1559's fee-market type (type 2, London). EIP-4844
-//! blobs and EIP-7702 authorizations are not supported.
+//! (type 1, Berlin), EIP-1559's fee-market type (type 2, London) or
+//! EIP-4844's blob type (type 3, Cancun). EIP-7702 authorizations are not
+//! supported.
 
 const Address = @import("Address.zig").Address;
 
@@ -39,4 +40,10 @@ pub const Transaction = struct {
     /// per gas on top of the base fee. Null for every other type, which
     /// pays `gas_price` outright.
     max_priority_fee: ?u256 = null,
+    /// EIP-4844 (type 3): the most it will pay per unit of blob gas. Null
+    /// for every other type.
+    max_fee_per_blob_gas: ?u256 = null,
+    /// EIP-4844: one versioned hash per blob the transaction carries, what
+    /// `BLOBHASH` reads. The blobs themselves never reach execution.
+    blob_versioned_hashes: []const u256 = &.{},
 };

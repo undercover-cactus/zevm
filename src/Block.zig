@@ -21,6 +21,12 @@ pub const Block = struct {
     base_fee: u256 = 0,
     chain_id: u256 = 1,
     recent_hashes: []const Hash = &.{},
+    /// EIP-4844 (Cancun): the header's `excess_blob_gas`, which sets the
+    /// block's blob base fee. 0 before Cancun.
+    excess_blob_gas: u64 = 0,
+    /// EIP-4788 (Cancun): the header's `parent_beacon_block_root`, written
+    /// into the beacon roots contract before the block's transactions.
+    parent_beacon_block_root: Hash = 0,
 
     pub const Entry = struct {
         tx: Transaction,

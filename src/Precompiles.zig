@@ -14,6 +14,7 @@ const Ripemd160 = @import("Ripemd160.zig");
 const secp256k1 = @import("Secp256k1.zig");
 const bn128 = @import("Bn128.zig");
 const Fork = @import("Fork.zig").Fork;
+const Kzg = @import("Kzg.zig");
 
 const Kind = enum {
     ecrecover,
@@ -25,6 +26,7 @@ const Kind = enum {
     ecmul,
     ecpairing,
     blake2f,
+    point_evaluation,
 
     /// Addresses 5-8 (Byzantium's MODEXP/ECADD/ECMUL/ECPAIRING) only
     /// resolve to a precompile from Byzantium on; before that, real
@@ -42,6 +44,7 @@ const Kind = enum {
             7 => if (byzantium) .ecmul else null,
             8 => if (byzantium) .ecpairing else null,
             9 => if (fork.atLeast(.istanbul)) .blake2f else null,
+            0x0a => if (fork.atLeast(.cancun)) .point_evaluation else null,
             else => null,
         };
     }
@@ -73,6 +76,8 @@ const Kind = enum {
             // chosen, so the price has to scale with it. A malformed input
             // is charged nothing because it never gets this far.
             .blake2f => if (input.len == 213) std.mem.readInt(u32, input[0..4], .big) else 0,
+            // EIP-4844: flat, whatever the input.
+            .point_evaluation => 50000,
         };
     }
 };
@@ -287,8 +292,82 @@ pub fn call(allocator: std.mem.Allocator, address: Address, input: []const u8, g
             error.InvalidInput => return .{ .success = false, .gas_remaining = 0, .output = &.{} },
             else => |e| return e,
         },
+        .point_evaluation => pointEvaluationOutput(allocator, input) catch |err| switch (err) {
+            error.InvalidInput => return .{ .success = false, .gas_remaining = 0, .output = &.{} },
+            else => |e| return e,
+        },
     };
     return .{ .success = true, .gas_remaining = gas_limit - cost, .output = output };
+}
+
+/// The BLS12-381 scalar field's modulus, which the point evaluation
+/// precompile returns alongside the blob size.
+const bls_modulus: u256 = 0x73eda753299d7d483339d80809a1d80553bda402fffe5bfeffffffff00000001;
+/// Field elements in a blob (EIP-4844).
+const field_elements_per_blob: u256 = 4096;
+
+/// EIP-4844's point evaluation precompile (0x0a, Cancun). Its 192 bytes are
+/// `versioned_hash | z | y | commitment | proof`: it checks that the
+/// commitment is the one the versioned hash names (`0x01` followed by the
+/// last 31 bytes of its SHA-256), then that `proof` shows the committed
+/// polynomial takes the value `y` at `z`. Any failure, malformed input
+/// included, is `error.InvalidInput`, which forfeits all gas.
+fn pointEvaluationOutput(allocator: std.mem.Allocator, input: []const u8) ![]const u8 {
+    if (input.len != 192) return error.InvalidInput;
+    const commitment = input[96..144];
+    var hash: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(commitment, &hash, .{});
+    hash[0] = 0x01;
+    if (!std.mem.eql(u8, &hash, input[0..32])) return error.InvalidInput;
+    if (!Kzg.verifyProof(commitment[0..48], input[32..64], input[64..96], input[144..192])) return error.InvalidInput;
+
+    const out = try allocator.alloc(u8, 64);
+    std.mem.writeInt(u256, out[0..32], field_elements_per_blob, .big);
+    std.mem.writeInt(u256, out[32..64], bls_modulus, .big);
+    return out;
+}
+
+/// A point evaluation input for c-kzg's test vector
+/// `verify_kzg_proof_case_*_proof_3_3`, with the versioned hash computed from
+/// the commitment unless `hash` overrides it.
+fn pointEvaluationInput(proof_hex: []const u8, hash: ?[32]u8) ![192]u8 {
+    var input: [192]u8 = undefined;
+    _ = try std.fmt.hexToBytes(input[32..64], "5eb7004fe57383e6c88b99d839937fddf3f99279353aaf8d5c9a75f91ce33c62");
+    _ = try std.fmt.hexToBytes(input[64..96], "2c9ae4f1d6d08558d7027df9cc6b248c21290075d2c0df8a4084d02090b3fa14");
+    _ = try std.fmt.hexToBytes(input[96..144], "b49d88afcd7f6c61a8ea69eff5f609d2432b47e7e4cd50b02cdddb4e0c1460517e8df02e4e64dc55e3d8ca192d57193a");
+    _ = try std.fmt.hexToBytes(input[144..192], proof_hex);
+    if (hash) |h| {
+        input[0..32].* = h;
+    } else {
+        std.crypto.hash.sha2.Sha256.hash(input[96..144], input[0..32], .{});
+        input[0] = 0x01;
+    }
+    return input;
+}
+
+test "point evaluation: a correct proof returns the blob size and the BLS modulus for 50000 gas" {
+    const input = try pointEvaluationInput("b059c60125debbbf29d041bac20fd853951b64b5f31bfe2fa825e18ff49a259953e734b3d57119ae66f7bd79de3027f6", null);
+    const result = (try call(std.testing.allocator, 0x0a, &input, 60000, .cancun)).?;
+    defer std.testing.allocator.free(result.output);
+    try std.testing.expect(result.success);
+    try std.testing.expectEqual(@as(u64, 10000), result.gas_remaining);
+    try std.testing.expectEqual(field_elements_per_blob, std.mem.readInt(u256, result.output[0..32], .big));
+    try std.testing.expectEqual(bls_modulus, std.mem.readInt(u256, result.output[32..64], .big));
+}
+
+test "point evaluation: an incorrect proof, a wrong versioned hash or a wrong length fails and forfeits all gas" {
+    const wrong_proof = try pointEvaluationInput("a4cc8c419ade0cf043cbf30f43c8f7ee6da3ab8d2c15070f323e5a13a8178fe07c8f89686e5fd16565247b520028251b", null);
+    var bad_hash = try pointEvaluationInput("b059c60125debbbf29d041bac20fd853951b64b5f31bfe2fa825e18ff49a259953e734b3d57119ae66f7bd79de3027f6", null);
+    bad_hash[0] = 0x02; // a version other than KZG's 0x01
+    for ([_][]const u8{ &wrong_proof, &bad_hash, bad_hash[0..191] }) |input| {
+        const result = (try call(std.testing.allocator, 0x0a, input, 60000, .cancun)).?;
+        try std.testing.expect(!result.success);
+        try std.testing.expectEqual(@as(u64, 0), result.gas_remaining);
+    }
+}
+
+test "point evaluation is not a precompile before Cancun" {
+    try std.testing.expect(try call(std.testing.allocator, 0x0a, &.{}, 60000, .shanghai) == null);
 }
 
 fn sha256Output(allocator: std.mem.Allocator, input: []const u8) ![]const u8 {
@@ -339,6 +418,12 @@ var cached_secp: ?secp256k1.Secp256k1 = null;
 /// Creates the shared secp256k1 context now rather than on first use.
 pub fn initSecp() void {
     _ = secp();
+}
+
+/// Loads the KZG trusted setup now rather than on first use, for the same
+/// reason as `initSecp`: loading is not thread-safe, verifying is.
+pub fn initKzg() void {
+    Kzg.init();
 }
 
 fn secp() secp256k1.Secp256k1 {

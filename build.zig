@@ -62,6 +62,39 @@ pub fn build(b: *std.Build) void {
     lib_mod.linkLibrary(secp256k1_lib);
     lib_mod.link_libc = true;
 
+    // c-kzg-4844 over blst, for Cancun's point evaluation precompile
+    // (EIP-4844, 0x0a): KZG proof verification over BLS12-381, which zevm has
+    // no curve code for. The same pair revm and reth use. Vendored under
+    // `third_party/` (see each VERSION file), built the way c-kzg's own
+    // build.zig builds them.
+    const ckzg_lib = b.addLibrary(.{
+        .linkage = .static,
+        .name = "ckzg",
+        .root_module = b.createModule(.{ .target = target, .optimize = optimize }),
+    });
+    ckzg_lib.root_module.addIncludePath(b.path("third_party/c-kzg-4844/src"));
+    ckzg_lib.root_module.addIncludePath(b.path("third_party/blst/bindings"));
+    const blst_asm = switch (target.result.cpu.arch) {
+        .aarch64, .x86_64 => true,
+        else => false,
+    };
+    const ckzg_flags: []const []const u8 = if (blst_asm)
+        &.{ "-O2", "-ffreestanding", "-D__BLST_PORTABLE__" }
+    else
+        &.{ "-O2", "-ffreestanding", "-D__BLST_PORTABLE__", "-D__BLST_NO_ASM__" };
+    ckzg_lib.root_module.addCSourceFiles(.{
+        .files = &.{ "third_party/blst/src/server.c", "third_party/c-kzg-4844/src/ckzg.c" },
+        .flags = ckzg_flags,
+    });
+    if (blst_asm) ckzg_lib.root_module.addAssemblyFile(b.path("third_party/blst/build/assembly.S"));
+    ckzg_lib.root_module.link_libc = true;
+    b.installArtifact(ckzg_lib);
+
+    lib_mod.linkLibrary(ckzg_lib);
+    lib_mod.addIncludePath(b.path("third_party/c-kzg-4844/src"));
+    lib_mod.addIncludePath(b.path("third_party/blst/bindings"));
+    lib_mod.addAnonymousImport("kzg_trusted_setup", .{ .root_source_file = b.path("third_party/c-kzg-4844/src/trusted_setup.txt") });
+
     const lib = b.addLibrary(.{
         .linkage = .static,
         .name = "zevm",

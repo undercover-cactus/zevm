@@ -19,6 +19,7 @@ pub const OpCode = @import("OpCode.zig").OpCode;
 pub const Precompiles = @import("Precompiles.zig");
 pub const Secp256k1 = @import("Secp256k1.zig");
 pub const Bn128 = @import("Bn128.zig");
+pub const gas = @import("gas.zig");
 
 // Not `pub`: ffi.zig isn't meant to be used from Zig code, but its
 // `export fn`s only make it into the compiled library if reachable here.
