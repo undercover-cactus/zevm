@@ -70,6 +70,8 @@ const DecodedHeader = struct {
     /// 20th). Zero before that.
     excess_blob_gas: u64,
     parent_beacon_block_root: zevm.Hash,
+    /// The header's first field. EIP-2935 (Prague) stores it on chain.
+    parent_hash: zevm.Hash,
 };
 
 /// Frontier-era headers RLP-encode as a 15-field list (`parentHash,
@@ -92,6 +94,7 @@ fn decodeHeader(header: zevm.Rlp.Item) DecodedHeader {
         .gas_used = bytesToU64(header.list[10].string),
         .excess_blob_gas = if (header.list.len > 18) bytesToU64(header.list[18].string) else 0,
         .parent_beacon_block_root = if (header.list.len > 19) bytesToU256(header.list[19].string) else 0,
+        .parent_hash = bytesToU256(header.list[0].string),
     };
 }
 
@@ -190,12 +193,14 @@ fn txSender(allocator: std.mem.Allocator, secp: Secp256k1, tx_item: zevm.Rlp.Ite
 /// (`y_parity, r, s`), or null for a type this decoder does not know.
 /// EIP-1559 (type 2) splits EIP-2930's single `gas_price` into a tip cap and
 /// a fee cap, so everything after `nonce` sits one field later. EIP-4844
-/// (type 3) appends a blob fee cap and the blob versioned hashes.
+/// (type 3) appends a blob fee cap and the blob versioned hashes, EIP-7702
+/// (type 4) an authorization list.
 fn signedFieldCount(tx_type: u8) ?usize {
     return switch (tx_type) {
         0x01 => 8,
         0x02 => 9,
         0x03 => 11,
+        0x04 => 10,
         else => null,
     };
 }
@@ -257,14 +262,17 @@ fn parseTransaction(arena: std.mem.Allocator, tx_item: zevm.Rlp.Item, from: zevm
 /// split in two, so the fields after it are read one position later.
 /// EIP-4844 (type 3, Cancun): type 2's fields, then `max_fee_per_blob_gas,
 /// blob_versioned_hashes` before the signature.
+/// EIP-7702 (type 4, Prague): type 2's fields, then `authorization_list`, a
+/// list of `[chain_id, address, nonce, y_parity, r, s]`.
 fn parseTypedTransaction(arena: std.mem.Allocator, bytes: []const u8, from: zevm.Address) !zevm.Block.Entry {
     if (bytes.len == 0) return error.UnsupportedTransactionType;
     const signed_count = signedFieldCount(bytes[0]) orelse return error.UnsupportedTransactionType;
     const payload = try zevm.Rlp.decode(arena, bytes[1..]);
     const fields = payload.list;
     if (fields.len != signed_count + 3) return error.MalformedTransaction;
-    const fee_market = bytes[0] == 0x02 or bytes[0] == 0x03;
+    const fee_market = bytes[0] >= 0x02;
     const blob = bytes[0] == 0x03;
+    const set_code = bytes[0] == 0x04;
     const shift: usize = if (fee_market) 1 else 0;
 
     const access_list = fields[7 + shift].list;
@@ -279,6 +287,23 @@ fn parseTypedTransaction(arena: std.mem.Allocator, bytes: []const u8, from: zevm
     if (blob) {
         blob_hashes = try arena.alloc(u256, fields[10].list.len);
         for (fields[10].list, blob_hashes) |item, *out| out.* = bytesToU256(item.string);
+    }
+
+    var authorizations: []zevm.Authorization = &.{};
+    if (set_code) {
+        authorizations = try arena.alloc(zevm.Authorization, fields[9].list.len);
+        for (fields[9].list, authorizations) |item, *out| {
+            const a = item.list;
+            if (a.len != 6 or a[1].string.len != 20 or a[2].string.len > 8 or a[3].string.len > 1) return error.MalformedTransaction;
+            out.* = .{
+                .chain_id = bytesToU256(a[0].string),
+                .address = bytesToAddress(a[1].string),
+                .nonce = bytesToU64(a[2].string),
+                .y_parity = @intCast(bytesToU64(a[3].string)),
+                .r = bytesToU256(a[4].string),
+                .s = bytesToU256(a[5].string),
+            };
+        }
     }
 
     const to_bytes = fields[4 + shift].string;
@@ -300,6 +325,7 @@ fn parseTypedTransaction(arena: std.mem.Allocator, bytes: []const u8, from: zevm
             .max_priority_fee = if (fee_market) bytesToU256(fields[2].string) else null,
             .max_fee_per_blob_gas = if (blob) bytesToU256(fields[9].string) else null,
             .blob_versioned_hashes = blob_hashes,
+            .authorization_list = authorizations,
         },
     };
 }
@@ -383,7 +409,7 @@ fn prewarmBlock(allocator: std.mem.Allocator, p: *Prewarm, b: usize) !void {
         .difficulty = header.difficulty,
         .base_fee = header.base_fee,
         .fork = zevm.Fork.at(header.number),
-        .blob_base_fee = zevm.gas.blobBaseFee(header.excess_blob_gas),
+        .blob_base_fee = zevm.gas.blobBaseFee(header.excess_blob_gas, zevm.Fork.at(header.number)),
     };
     for (p.block_start[b]..p.block_start[b + 1]) |i| {
         if (p.stop.load(.monotonic)) return;
@@ -1275,6 +1301,7 @@ pub fn main(io: std.Io, args: []const []const u8) anyerror!void {
                     .recent_hashes = recent_hashes.items,
                     .excess_blob_gas = header.excess_blob_gas,
                     .parent_beacon_block_root = header.parent_beacon_block_root,
+                    .parent_hash = header.parent_hash,
                 }) catch |err| {
                     std.debug.print("block {d} failed: {s}\n", .{ header.number, @errorName(err) });
                     return err;

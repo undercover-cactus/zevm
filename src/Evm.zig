@@ -1,6 +1,6 @@
 //! Executes a decoded `Transaction` against a `State`.
 //!
-//! Frontier through Cancun are implemented (Muir, Arrow and Gray Glacier
+//! Frontier through Prague are implemented (Muir, Arrow and Gray Glacier
 //! only delayed the difficulty bomb and change nothing this executes).
 //! `processBlock` panics on any block from a later fork (see `Fork`) instead
 //! of silently applying stale rules.
@@ -22,6 +22,9 @@ const Fork = @import("Fork.zig").Fork;
 const DaoFork = @import("DaoFork.zig");
 const gas = @import("gas.zig");
 const Precompiles = @import("Precompiles.zig");
+const Rlp = @import("Rlp.zig");
+const Authorization = @import("Transaction.zig").Authorization;
+const keccak256 = @import("Hash.zig").keccak256;
 
 allocator: std.mem.Allocator,
 state: *State,
@@ -45,6 +48,13 @@ const beacon_roots_address: Address = 0x000F3df6D732807Ef1319fB7B8bB8522d0Beac02
 const system_address: Address = 0xfffffffffffffffffffffffffffffffffffffffe;
 /// Gas given to a system call. It does not count toward the block's gas.
 const system_call_gas: u64 = 30_000_000;
+/// EIP-2935 (Prague): the contract that keeps recent block hashes.
+const history_storage_address: Address = 0x0000F90827F1C53a10cb7A02335B175320002935;
+/// EIP-7002 and EIP-7251 (Prague): the queues of withdrawal and
+/// consolidation requests that validators submit from the execution layer,
+/// drained by a system call after each block's transactions.
+const withdrawal_request_address: Address = 0x00000961Ef480Eb55e80D19ad83579A64c007002;
+const consolidation_request_address: Address = 0x0000BBdDc7CE488642fb579F8B00f3a590007251;
 
 /// Miner reward for a block with no uncles: Frontier's flat 5 ETH, cut to
 /// 3 ETH by EIP-649 at Byzantium and again to 2 ETH by EIP-1234 at
@@ -156,6 +166,11 @@ pub fn executeTransaction(self: *Evm, tx: Transaction, from: Address) !Result {
         max_blob_fee = blob_gas * max_fee_per_blob_gas;
     }
 
+    // EIP-7623 (Prague): the gas limit must cover the calldata floor, which
+    // the gas used is raised to after execution.
+    const calldata_floor: u64 = if (self.block.fork.atLeast(.prague)) gas.calldataFloorCost(tx.data) else 0;
+    if (tx.gas_limit < calldata_floor) return error.GasLimitBelowCalldataFloor;
+
     const gas_fee = @as(u256, tx.gas_limit) * tx.gas_price;
     const upfront_cost = gas_fee + tx.value + max_blob_fee;
     const balance_before = self.state.getBalance(from);
@@ -185,8 +200,9 @@ pub fn executeTransaction(self: *Evm, tx: Transaction, from: Address) !Result {
     // reverted: it all precedes the checkpoint either of them takes.
     if (self.block.fork.atLeast(.berlin)) {
         _ = try self.state.warmAddress(from);
-        // Cancun added the point evaluation precompile at 0x0a.
-        const last_precompile: Address = if (self.block.fork.atLeast(.cancun)) 0x0a else 0x09;
+        // Cancun added the point evaluation precompile at 0x0a, Prague the
+        // BLS12-381 ones at 0x0b to 0x11.
+        const last_precompile: Address = if (self.block.fork.atLeast(.prague)) 0x11 else if (self.block.fork.atLeast(.cancun)) 0x0a else 0x09;
         var precompile: Address = 1;
         while (precompile <= last_precompile) : (precompile += 1) _ = try self.state.warmAddress(precompile);
         for (tx.access_list) |entry| {
@@ -198,10 +214,15 @@ pub fn executeTransaction(self: *Evm, tx: Transaction, from: Address) !Result {
     }
     const access_list_cost = gas.accessListCost(tx.access_list);
 
-    const result = if (tx.to) |to|
-        try self.call(tx.value, tx.data, access_list_cost, tx.gas_limit, from, to)
-    else
-        try self.create(tx.nonce, tx.value, tx.data, access_list_cost, tx.gas_limit, from);
+    var result = if (tx.to) |to| call: {
+        // EIP-7702 (Prague): every authorization costs intrinsic gas, valid
+        // or not, and the valid ones are applied now, after the sender's
+        // nonce moved and before the call's checkpoint.
+        const authorization_cost = gas.per_empty_account_7702 * @as(u64, tx.authorization_list.len);
+        const authorization_refund = try self.applyAuthorizations(tx.authorization_list);
+        break :call try self.call(tx.value, tx.data, access_list_cost + authorization_cost, authorization_refund, tx.gas_limit, from, to);
+    } else try self.create(tx.nonce, tx.value, tx.data, access_list_cost, tx.gas_limit, from);
+    result.gas_used = @max(result.gas_used, calldata_floor);
 
     // Refund unused gas, then pay the miner, via `creditBalance` (unjournaled,
     // like block rewards): a transaction's gas fee is never undone by a revert.
@@ -235,9 +256,9 @@ pub fn processBlock(self: *Evm, block: Block) !void {
     const fork = Fork.at(block.number);
     // Muir Glacier delayed the difficulty bomb and changed nothing this
     // executes, so Istanbul's rules carry through it unchanged.
-    if (fork.atLeast(.prague)) {
+    if (fork.atLeast(.osaka)) {
         std.debug.panic(
-            "block {d} is past Cancun (fork: {s}): this Evm only implements up to Cancun's rules",
+            "block {d} is past Prague (fork: {s}): this Evm only implements up to Prague's rules",
             .{ block.number, @tagName(fork) },
         );
     }
@@ -258,10 +279,13 @@ pub fn processBlock(self: *Evm, block: Block) !void {
         .chain_id = block.chain_id,
         .recent_hashes = block.recent_hashes,
         .fork = fork,
-        .blob_base_fee = if (fork.atLeast(.cancun)) gas.blobBaseFee(block.excess_blob_gas) else 0,
+        .blob_base_fee = if (fork.atLeast(.cancun)) gas.blobBaseFee(block.excess_blob_gas, fork) else 0,
     };
 
-    if (fork.atLeast(.cancun)) try self.storeBeaconRoot(block.parent_beacon_block_root);
+    // EIP-4788 (Cancun) and EIP-2935 (Prague): before any transaction, the
+    // parent beacon block root and the parent block hash are stored.
+    if (fork.atLeast(.cancun)) _ = try self.systemCall(beacon_roots_address, block.parent_beacon_block_root);
+    if (fork.atLeast(.prague)) _ = try self.systemCall(history_storage_address, block.parent_hash);
 
     self.block_gas_used = 0;
     for (block.transactions) |entry| {
@@ -279,6 +303,14 @@ pub fn processBlock(self: *Evm, block: Block) !void {
     if (fork.atLeast(.merge)) {
         for (block.withdrawals) |withdrawal| {
             if (withdrawal.amount != 0) try self.state.creditBalance(withdrawal.address, @as(u256, withdrawal.amount) * 1_000_000_000);
+        }
+        // EIP-7002 and EIP-7251 (Prague): then the request queues are
+        // drained. What they return goes into the header's requests hash,
+        // which this does not check, but draining changes their storage.
+        // Unlike the calls above these must succeed, or the block is invalid.
+        if (fork.atLeast(.prague)) {
+            if (!try self.systemCall(withdrawal_request_address, null)) return error.SystemCallFailed;
+            if (!try self.systemCall(consolidation_request_address, null)) return error.SystemCallFailed;
         }
         self.state.debugDumpBlockAccounts();
         return;
@@ -298,42 +330,105 @@ pub fn processBlock(self: *Evm, block: Block) !void {
     self.state.debugDumpBlockAccounts();
 }
 
-/// EIP-4788 (Cancun): before any of a block's transactions, the system
-/// address calls the beacon roots contract with the parent beacon block
-/// root, which it stores keyed by the block's timestamp. A system call: no
-/// sender account, no fee, no value, and its gas counts toward nothing. If
-/// the contract has not been deployed there is nothing to call.
-fn storeBeaconRoot(self: *Evm, root: Hash) !void {
-    const code = self.state.getCode(beacon_roots_address);
-    if (code.len == 0) return;
+/// A system call (EIP-4788 onwards): the system address calls `target`
+/// with `word` as calldata, or none if it is null. No sender account, no
+/// fee, no value, and its gas counts toward nothing. Whether it ran to a
+/// stop; a contract that has not been deployed yet counts as failing.
+fn systemCall(self: *Evm, target: Address, word: ?Hash) !bool {
+    const code = self.state.getCode(target);
+    if (code.len == 0) return false;
     var calldata: [32]u8 = undefined;
-    std.mem.writeInt(u256, &calldata, root, .big);
+    if (word) |w| std.mem.writeInt(u256, &calldata, w, .big);
     self.tx = .{ .origin = system_address, .gas_price = self.block.base_fee };
 
     const cp = self.state.checkpoint();
     var interp = try Interpreter.initCall(self.allocator, code, system_call_gas, .{
-        .address = beacon_roots_address,
+        .address = target,
         .caller = system_address,
         .value = 0,
-        .calldata = &calldata,
+        .calldata = if (word != null) &calldata else &.{},
         .tx = self.tx,
         .state = self.state,
         .block = self.block,
-        .jumpdest = try self.state.getJumpdest(beacon_roots_address),
+        .jumpdest = try self.state.getJumpdest(target),
     });
     defer interp.deinit();
     try interp.run();
-    if (interp.status != .stopped) self.state.revertTo(cp);
+    const ok = interp.status == .stopped;
+    if (!ok) self.state.revertTo(cp);
     self.state.finalizeTransaction();
+    return ok;
 }
 
-fn call(self: *Evm, value: u256, data: []const u8, access_list_cost: u64, gas_limit: u64, from: Address, to: Address) !Result {
+/// EIP-7702 (Prague): applies a set-code transaction's authorizations in
+/// order. One that fails a check is skipped, and a later one from the same
+/// authority overrides an earlier one. Returns the gas refunded for
+/// authorities that already existed, which applies even if the call then
+/// fails.
+fn applyAuthorizations(self: *Evm, authorizations: []const Authorization) !u64 {
+    var refund: u64 = 0;
+    for (authorizations) |auth| {
+        if (auth.chain_id != 0 and auth.chain_id != self.block.chain_id) continue;
+        if (auth.nonce == std.math.maxInt(u64)) continue;
+        const authority = try recoverAuthority(self.allocator, auth) orelse continue;
+        _ = try self.state.warmAddress(authority);
+        const code = self.state.getCode(authority);
+        if (code.len != 0 and Interpreter.delegatedAddress(code) == null) continue;
+        if (self.state.get(authority).nonce != auth.nonce) continue;
+        if (self.state.exists(authority)) refund += gas.per_empty_account_7702 - gas.per_auth_base_7702;
+        if (auth.address == 0) {
+            try self.state.setDelegation(authority, &.{});
+        } else {
+            var indicator: [23]u8 = undefined;
+            indicator[0..3].* = .{ 0xef, 0x01, 0x00 };
+            std.mem.writeInt(u160, indicator[3..23], auth.address, .big);
+            try self.state.setDelegation(authority, &indicator);
+        }
+        try self.state.setNonce(authority, auth.nonce + 1);
+    }
+    return refund;
+}
+
+/// The account that signed `auth`, or null for a signature that does not
+/// recover or whose `s` is in the upper half of the curve order (EIP-2).
+fn recoverAuthority(allocator: std.mem.Allocator, auth: Authorization) !?Address {
+    const half_curve_order: u256 = 0x7fffffffffffffffffffffffffffffff5d576e7357a4501ddfe92f46681b20a0;
+    if (auth.y_parity > 1 or auth.s > half_curve_order) return null;
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var address_bytes: [20]u8 = undefined;
+    std.mem.writeInt(u160, &address_bytes, auth.address, .big);
+    const payload = try Rlp.encodeList(a, &.{
+        try Rlp.encodeInt(a, auth.chain_id),
+        try Rlp.encodeBytes(a, &address_bytes),
+        try Rlp.encodeInt(a, auth.nonce),
+    });
+    const preimage = try a.alloc(u8, payload.len + 1);
+    preimage[0] = 0x05;
+    @memcpy(preimage[1..], payload);
+
+    var hash: [32]u8 = undefined;
+    std.mem.writeInt(u256, &hash, keccak256(preimage), .big);
+    var r: [32]u8 = undefined;
+    std.mem.writeInt(u256, &r, auth.r, .big);
+    var s: [32]u8 = undefined;
+    std.mem.writeInt(u256, &s, auth.s, .big);
+    const recovered = Precompiles.ecrecover(hash, 27 + auth.y_parity, r, s) orelse return null;
+    return std.mem.readInt(u160, &recovered, .big);
+}
+
+/// `extra_intrinsic` is what the access list and any EIP-7702
+/// authorizations add to the intrinsic cost, and `authorization_refund` the
+/// refund those authorizations earned.
+fn call(self: *Evm, value: u256, data: []const u8, extra_intrinsic: u64, authorization_refund: u64, gas_limit: u64, from: Address, to: Address) !Result {
     if (self.block.fork.atLeast(.berlin)) _ = try self.state.warmAddress(to);
     const cp = self.state.checkpoint();
 
     // The intrinsic cost is paid before any code runs; real Ethereum
     // forfeits the whole limit if gas_limit can't cover it.
-    const intrinsic = gas.intrinsicCost(data, self.block.fork) + access_list_cost;
+    const intrinsic = gas.intrinsicCost(data, self.block.fork) + extra_intrinsic;
     if (gas_limit < intrinsic) {
         self.state.revertTo(cp);
         return .{
@@ -347,6 +442,7 @@ fn call(self: *Evm, value: u256, data: []const u8, access_list_cost: u64, gas_li
     // gas fee is already reserved, so this fails like an immediate REVERT,
     // paying only the intrinsic cost. Always calls `transfer`, even for
     // value == 0, since it still has to touch `to` (see its own doc comment).
+    const execution_gas_limit = gas_limit - intrinsic;
     if (!try self.state.transfer(from, to, value)) {
         if (value > 1_000_000_000_000_000_000_000) {
             std.debug.print(
@@ -358,11 +454,9 @@ fn call(self: *Evm, value: u256, data: []const u8, access_list_cost: u64, gas_li
         return .{
             .status = .reverted,
             .return_data = try self.allocator.alloc(u8, 0),
-            .gas_used = intrinsic,
+            .gas_used = gasUsed(.reverted, execution_gas_limit, 0, authorization_refund, execution_gas_limit, intrinsic, self.block.fork),
         };
     }
-
-    const execution_gas_limit = gas_limit - intrinsic;
 
     // A transaction can target a precompile directly, same as `Interpreter.call`.
     if (try Precompiles.call(self.allocator, to, data, execution_gas_limit, self.block.fork)) |result| {
@@ -375,11 +469,21 @@ fn call(self: *Evm, value: u256, data: []const u8, access_list_cost: u64, gas_li
         return .{
             .status = status,
             .return_data = result.output,
-            .gas_used = gasUsed(status, result.gas_remaining, 0, execution_gas_limit, intrinsic, self.block.fork),
+            .gas_used = gasUsed(status, result.gas_remaining, 0, authorization_refund, execution_gas_limit, intrinsic, self.block.fork),
         };
     }
 
-    const code = self.state.getCode(to);
+    // EIP-7702 (Prague): a delegated destination runs the code its
+    // indicator points at, which starts warm.
+    var code_address = to;
+    var code = self.state.getCode(to);
+    if (self.block.fork.atLeast(.prague)) {
+        if (Interpreter.delegatedAddress(code)) |delegate| {
+            _ = try self.state.warmAddress(delegate);
+            code_address = delegate;
+            code = self.state.getCode(delegate);
+        }
+    }
 
     // A call to an address with no code is an immediate, trivial success.
     // Skipping straight to that result avoids constructing a full
@@ -392,7 +496,7 @@ fn call(self: *Evm, value: u256, data: []const u8, access_list_cost: u64, gas_li
         return .{
             .status = .stopped,
             .return_data = try self.allocator.alloc(u8, 0),
-            .gas_used = intrinsic,
+            .gas_used = gasUsed(.stopped, execution_gas_limit, 0, authorization_refund, execution_gas_limit, intrinsic, self.block.fork),
         };
     }
 
@@ -404,7 +508,7 @@ fn call(self: *Evm, value: u256, data: []const u8, access_list_cost: u64, gas_li
         .tx = self.tx,
         .state = self.state,
         .block = self.block,
-        .jumpdest = try self.state.getJumpdest(to),
+        .jumpdest = try self.state.getJumpdest(code_address),
     });
     defer interp.deinit();
     try interp.run();
@@ -415,29 +519,29 @@ fn call(self: *Evm, value: u256, data: []const u8, access_list_cost: u64, gas_li
     return .{
         .status = interp.status,
         .return_data = try self.allocator.dupe(u8, interp.return_data),
-        .gas_used = gasUsed(interp.status, interp.gas_remaining, interp.refund, execution_gas_limit, intrinsic, self.block.fork),
+        .gas_used = gasUsed(interp.status, interp.gas_remaining, interp.refund, authorization_refund, execution_gas_limit, intrinsic, self.block.fork),
     };
 }
 
 /// The gas actually charged: `intrinsic` plus what the interpreter spent,
 /// minus any refund. The refund cap applies to the total including
-/// intrinsic (matching real Ethereum, so padding calldata can't dodge it),
-/// and only applies on `.stopped`. Any other halt forfeits it. Exceptional
-/// halts (`.out_of_gas`, `.invalid_opcode`, `.invalid_jump`,
-/// `.stack_overflow`, `.stack_underflow`) forfeit the entire limit;
-/// `.reverted` is the exception that only spends what actually ran.
-fn gasUsed(status: Interpreter.Status, gas_remaining: u64, refund: i64, execution_gas_limit: u64, intrinsic: u64, fork: Fork) u64 {
-    switch (status) {
-        .out_of_gas, .invalid_opcode, .invalid_jump, .stack_overflow, .stack_underflow => return execution_gas_limit + intrinsic,
-        else => {},
-    }
-    const spent = intrinsic + (execution_gas_limit - gas_remaining);
-    if (status != .stopped) return spent;
+/// intrinsic (matching real Ethereum, so padding calldata can't dodge it).
+/// Exceptional halts (`.out_of_gas`, `.invalid_opcode`, `.invalid_jump`,
+/// `.stack_overflow`, `.stack_underflow`) spend the entire limit;
+/// `.reverted` only spends what actually ran. The execution's own `refund`
+/// only counts on `.stopped`, while `authorization_refund` (EIP-7702) was
+/// earned before execution began and counts whatever happens.
+fn gasUsed(status: Interpreter.Status, gas_remaining: u64, refund: i64, authorization_refund: u64, execution_gas_limit: u64, intrinsic: u64, fork: Fork) u64 {
+    const spent = switch (status) {
+        .out_of_gas, .invalid_opcode, .invalid_jump, .stack_overflow, .stack_underflow => execution_gas_limit + intrinsic,
+        else => intrinsic + (execution_gas_limit - gas_remaining),
+    };
     // A negative counter means more refund was taken back than granted,
     // which refunds nothing rather than charging extra.
-    if (refund <= 0) return spent;
+    const total_refund = @as(i64, @intCast(authorization_refund)) + (if (status == .stopped) refund else 0);
+    if (total_refund <= 0) return spent;
     const denominator = if (fork.atLeast(.london)) gas.max_refund_denominator_3529 else gas.max_refund_denominator;
-    return spent - @min(@as(u64, @intCast(refund)), spent / denominator);
+    return spent - @min(@as(u64, @intCast(total_refund)), spent / denominator);
 }
 
 fn create(self: *Evm, nonce: u64, value: u256, data: []const u8, access_list_cost: u64, gas_limit: u64, from: Address) !Result {
@@ -561,7 +665,7 @@ fn create(self: *Evm, nonce: u64, value: u256, data: []const u8, access_list_cos
         .status = status,
         .return_data = try self.allocator.dupe(u8, interp.return_data),
         .created_address = new_address,
-        .gas_used = gasUsed(status, interp.gas_remaining, interp.refund, gas_limit - intrinsic, intrinsic, self.block.fork),
+        .gas_used = gasUsed(status, interp.gas_remaining, interp.refund, 0, gas_limit - intrinsic, intrinsic, self.block.fork),
     };
 }
 
@@ -1723,10 +1827,10 @@ test "EIP-1559: a transaction that cannot cover the base fee is invalid" {
 
 test "EIP-3529 caps the refund at a fifth of gas used instead of a half" {
     // 21000 intrinsic + 50000 executed = 71000 spent, with a refund of 50000.
-    try std.testing.expectEqual(@as(u64, 71000 - 71000 / 2), gasUsed(.stopped, 50000, 50000, 100000, 21000, .berlin));
-    try std.testing.expectEqual(@as(u64, 71000 - 71000 / 5), gasUsed(.stopped, 50000, 50000, 100000, 21000, .london));
+    try std.testing.expectEqual(@as(u64, 71000 - 71000 / 2), gasUsed(.stopped, 50000, 50000, 0, 100000, 21000, .berlin));
+    try std.testing.expectEqual(@as(u64, 71000 - 71000 / 5), gasUsed(.stopped, 50000, 50000, 0, 100000, 21000, .london));
     // A refund under the cap is paid in full either way.
-    try std.testing.expectEqual(@as(u64, 71000 - 1000), gasUsed(.stopped, 50000, 1000, 100000, 21000, .london));
+    try std.testing.expectEqual(@as(u64, 71000 - 1000), gasUsed(.stopped, 50000, 1000, 0, 100000, 21000, .london));
 }
 
 test "EIP-3541: deployed code may not start with 0xEF from London on" {
@@ -1900,4 +2004,205 @@ test "from Cancun on, the point evaluation precompile starts warm" {
         used.* = result.gas_used;
     }
     try std.testing.expectEqual(gas.cold_account_access_2929 - gas.warm_storage_read_2929, gas_used[0] - gas_used[1]);
+}
+
+// libsecp256k1's signing half, only needed to produce test authorizations.
+extern fn secp256k1_context_create(flags: c_uint) ?*anyopaque;
+extern fn secp256k1_context_destroy(ctx: *anyopaque) void;
+extern fn secp256k1_ecdsa_sign_recoverable(ctx: *anyopaque, sig: *[65]u8, msghash32: *const [32]u8, seckey: *const [32]u8, noncefp: ?*const anyopaque, ndata: ?*const anyopaque) c_int;
+extern fn secp256k1_ecdsa_recoverable_signature_serialize_compact(ctx: *anyopaque, output64: *[64]u8, recid: *c_int, sig: *const [65]u8) c_int;
+
+/// A chain-1 authorization for `address` at `nonce` (below 0x80), signed with
+/// `key`, and the authority that signed it. The signed message is built by
+/// hand rather than with `Rlp`, so a mistake in `recoverAuthority`'s
+/// encoding recovers a different authority and the tests notice.
+fn signTestAuthorization(key: [32]u8, address: Address, nonce: u8) !struct { auth: Authorization, authority: Address } {
+    std.debug.assert(nonce < 0x80);
+    // 0x05 || rlp([1, address, nonce]): a 23-byte list payload.
+    var preimage: [25]u8 = undefined;
+    preimage[0] = 0x05;
+    preimage[1] = 0xc0 + 23;
+    preimage[2] = 0x01;
+    preimage[3] = 0x80 + 20;
+    std.mem.writeInt(u160, preimage[4..24], address, .big);
+    preimage[24] = if (nonce == 0) 0x80 else nonce;
+    var hash: [32]u8 = undefined;
+    std.mem.writeInt(u256, &hash, keccak256(&preimage), .big);
+
+    const ctx = secp256k1_context_create(1) orelse return error.ContextFailed;
+    defer secp256k1_context_destroy(ctx);
+    var sig: [65]u8 = undefined;
+    if (secp256k1_ecdsa_sign_recoverable(ctx, &sig, &hash, &key, null, null) != 1) return error.SignFailed;
+    var compact: [64]u8 = undefined;
+    var recid: c_int = undefined;
+    _ = secp256k1_ecdsa_recoverable_signature_serialize_compact(ctx, &compact, &recid, &sig);
+    const recovered = Precompiles.ecrecover(hash, 27 + @as(u8, @intCast(recid)), compact[0..32].*, compact[32..64].*) orelse return error.RecoverFailed;
+    return .{
+        .auth = .{
+            .chain_id = 1,
+            .address = address,
+            .nonce = nonce,
+            .y_parity = @intCast(recid),
+            .r = std.mem.readInt(u256, compact[0..32], .big),
+            .s = std.mem.readInt(u256, compact[32..64], .big),
+        },
+        .authority = std.mem.readInt(u160, &recovered, .big),
+    };
+}
+
+const test_key = [_]u8{0x11} ** 32;
+
+test "EIP-7702: a set-code transaction delegates its authority, and calling it runs the delegate's code" {
+    const OpCode = @import("OpCode.zig").OpCode;
+    // Stores 1 in slot 0 of whichever account runs it.
+    const delegate_code = [_]u8{ @intFromEnum(OpCode.PUSH1), 1, @intFromEnum(OpCode.PUSH0), @intFromEnum(OpCode.SSTORE), @intFromEnum(OpCode.STOP) };
+    var state = State.init(std.testing.allocator);
+    defer state.deinit();
+    try state.setCode(0xdd, &delegate_code);
+    const signed = try signTestAuthorization(test_key, 0xdd, 0);
+    // An authority that already exists earns back part of the authorization's cost.
+    try state.setBalance(signed.authority, 1);
+
+    var evm = Evm{ .allocator = std.testing.allocator, .state = &state, .block = .{ .fork = .prague } };
+    var tx = testTx();
+    tx.to = signed.authority;
+    tx.authorization_list = &.{signed.auth};
+    const result = try evm.executeTransaction(tx, 0x1);
+    defer std.testing.allocator.free(result.return_data);
+
+    try std.testing.expectEqual(Interpreter.Status.stopped, result.status);
+    var indicator: [23]u8 = undefined;
+    indicator[0..3].* = .{ 0xef, 0x01, 0x00 };
+    std.mem.writeInt(u160, indicator[3..23], 0xdd, .big);
+    try std.testing.expectEqualSlices(u8, &indicator, state.getCode(signed.authority));
+    try std.testing.expectEqual(@as(u64, 1), state.get(signed.authority).nonce);
+    try std.testing.expectEqual(@as(u256, 1), state.getStorage(signed.authority, 0));
+    try std.testing.expectEqual(@as(u256, 0), state.getStorage(0xdd, 0));
+    // Intrinsic 21000 + 25000 per authorization, then PUSH1 + PUSH0 + a cold
+    // zero-to-nonzero SSTORE, less the 12500 refund (under the 1/5 cap).
+    const spent: u64 = 21000 + 25000 + 3 + 2 + 22100;
+    try std.testing.expectEqual(spent - 12500, result.gas_used);
+}
+
+test "EIP-7702: authorizations that fail a check are skipped but still paid for" {
+    var state = State.init(std.testing.allocator);
+    defer state.deinit();
+    const wrong_nonce = try signTestAuthorization(test_key, 0xdd, 5);
+    var wrong_chain = wrong_nonce;
+    wrong_chain.auth.chain_id = 2;
+    wrong_chain.auth.nonce = 0;
+    try state.setBalance(wrong_nonce.authority, 1);
+
+    var evm = Evm{ .allocator = std.testing.allocator, .state = &state, .block = .{ .fork = .prague } };
+    var tx = testTx();
+    tx.to = wrong_nonce.authority;
+    tx.authorization_list = &.{ wrong_nonce.auth, wrong_chain.auth };
+    const result = try evm.executeTransaction(tx, 0x1);
+    defer std.testing.allocator.free(result.return_data);
+
+    try std.testing.expectEqual(@as(usize, 0), state.getCode(wrong_nonce.authority).len);
+    try std.testing.expectEqual(@as(u64, 0), state.get(wrong_nonce.authority).nonce);
+    try std.testing.expectEqual(@as(u64, 21000 + 2 * 25000), result.gas_used);
+}
+
+test "EIP-7702: an authorization for the zero address clears the delegation" {
+    var state = State.init(std.testing.allocator);
+    defer state.deinit();
+    const signed = try signTestAuthorization(test_key, 0, 0);
+    try state.setDelegation(signed.authority, &(.{ 0xef, 0x01, 0x00 } ++ [_]u8{0xdd} ** 20));
+
+    var evm = Evm{ .allocator = std.testing.allocator, .state = &state, .block = .{ .fork = .prague } };
+    var tx = testTx();
+    tx.to = 0xee;
+    tx.authorization_list = &.{signed.auth};
+    const result = try evm.executeTransaction(tx, 0x1);
+    defer std.testing.allocator.free(result.return_data);
+
+    try std.testing.expectEqual(@as(usize, 0), state.getCode(signed.authority).len);
+    try std.testing.expectEqual(@as(u64, 1), state.get(signed.authority).nonce);
+}
+
+test "EIP-7702: CALL to a delegated account runs the delegate's code and pays to load it" {
+    const OpCode = @import("OpCode.zig").OpCode;
+    const delegate_code = [_]u8{ @intFromEnum(OpCode.PUSH1), 1, @intFromEnum(OpCode.PUSH0), @intFromEnum(OpCode.SSTORE), @intFromEnum(OpCode.STOP) };
+    const authority: Address = 0xaa;
+    // CALL(gas, authority, 0, 0, 0, 0, 0).
+    const caller_code = [_]u8{@intFromEnum(OpCode.PUSH0)} ** 5 ++ [_]u8{ @intFromEnum(OpCode.PUSH1), 0xaa, @intFromEnum(OpCode.GAS), @intFromEnum(OpCode.CALL), @intFromEnum(OpCode.STOP) };
+    const indicator = [_]u8{ 0xef, 0x01, 0x00 } ++ [_]u8{0} ** 19 ++ [_]u8{0xdd};
+
+    var gas_used: [2]u64 = undefined;
+    for ([_]bool{ true, false }, &gas_used) |delegated, *used| {
+        var state = State.init(std.testing.allocator);
+        defer state.deinit();
+        try state.setCode(0xcc, &caller_code);
+        try state.setCode(0xdd, &delegate_code);
+        if (delegated) try state.setDelegation(authority, &indicator) else try state.setCode(authority, &delegate_code);
+        var evm = Evm{ .allocator = std.testing.allocator, .state = &state, .block = .{ .fork = .prague } };
+        var tx = testTx();
+        tx.to = 0xcc;
+        const result = try evm.executeTransaction(tx, 0x1);
+        defer std.testing.allocator.free(result.return_data);
+        try std.testing.expectEqual(@as(u256, 1), state.getStorage(authority, 0));
+        used.* = result.gas_used;
+    }
+    // The same code either way; the delegated call also loads 0xdd, cold.
+    try std.testing.expectEqual(gas.cold_account_access_2929, gas_used[0] - gas_used[1]);
+}
+
+test "EIP-7623: from Prague on, a transaction pays at least the calldata floor" {
+    const data = [_]u8{1} ** 1000;
+    var gas_used: [2]u64 = undefined;
+    for ([_]Fork{ .cancun, .prague }, &gas_used) |fork, *used| {
+        var state = State.init(std.testing.allocator);
+        defer state.deinit();
+        var evm = Evm{ .allocator = std.testing.allocator, .state = &state, .block = .{ .fork = fork } };
+        var tx = testTx();
+        tx.to = 0xdd;
+        tx.data = &data;
+        const result = try evm.executeTransaction(tx, 0x1);
+        defer std.testing.allocator.free(result.return_data);
+        used.* = result.gas_used;
+    }
+    try std.testing.expectEqual(@as(u64, 21000 + 16 * 1000), gas_used[0]);
+    try std.testing.expectEqual(@as(u64, 21000 + 10 * 4 * 1000), gas_used[1]);
+
+    // A gas limit that covers the old intrinsic cost but not the floor is invalid.
+    var state = State.init(std.testing.allocator);
+    defer state.deinit();
+    var evm = Evm{ .allocator = std.testing.allocator, .state = &state, .block = .{ .fork = .prague } };
+    var tx = testTx();
+    tx.to = 0xdd;
+    tx.data = &data;
+    tx.gas_limit = 60_000;
+    try std.testing.expectError(error.GasLimitBelowCalldataFloor, evm.executeTransaction(tx, 0x1));
+}
+
+test "Prague's system calls: the parent hash before the transactions, the request queues after" {
+    const OpCode = @import("OpCode.zig").OpCode;
+    // Stores the calldata word in slot 0 and the caller in slot 1.
+    const code = [_]u8{
+        @intFromEnum(OpCode.PUSH0),  @intFromEnum(OpCode.CALLDATALOAD), @intFromEnum(OpCode.PUSH0),
+        @intFromEnum(OpCode.SSTORE), @intFromEnum(OpCode.CALLER),       @intFromEnum(OpCode.PUSH1),
+        1,                           @intFromEnum(OpCode.SSTORE),       @intFromEnum(OpCode.STOP),
+    };
+    var state = State.init(std.testing.allocator);
+    defer state.deinit();
+    for ([_]Address{ history_storage_address, withdrawal_request_address, consolidation_request_address }) |address| {
+        try state.setCode(address, &code);
+    }
+    var evm = Evm{ .allocator = std.testing.allocator, .state = &state };
+    try evm.processBlock(.{ .number = 22_431_084, .miner = 0xaa, .transactions = &.{}, .parent_hash = 0xabcd });
+    try std.testing.expectEqual(@as(u256, 0xabcd), state.getStorage(history_storage_address, 0));
+    for ([_]Address{ history_storage_address, withdrawal_request_address, consolidation_request_address }) |address| {
+        try std.testing.expectEqual(@as(u256, system_address), state.getStorage(address, 1));
+    }
+    // The request queues are called with no calldata.
+    try std.testing.expectEqual(@as(u256, 0), state.getStorage(withdrawal_request_address, 0));
+    try std.testing.expectEqual(@as(u64, 0), evm.block_gas_used);
+
+    // Unlike the history contract, a missing request contract invalidates the block.
+    var bare = State.init(std.testing.allocator);
+    defer bare.deinit();
+    var bare_evm = Evm{ .allocator = std.testing.allocator, .state = &bare };
+    try std.testing.expectError(error.SystemCallFailed, bare_evm.processBlock(.{ .number = 22_431_084, .miner = 0xaa, .transactions = &.{} }));
 }

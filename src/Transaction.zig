@@ -1,7 +1,7 @@
 //! A decoded Ethereum transaction: Legacy, EIP-2930's access-list type
 //! (type 1, Berlin), EIP-1559's fee-market type (type 2, London) or
-//! EIP-4844's blob type (type 3, Cancun). EIP-7702 authorizations are not
-//! supported.
+//! EIP-4844's blob type (type 3, Cancun) or EIP-7702's set-code type (type 4,
+//! Prague).
 
 const Address = @import("Address.zig").Address;
 
@@ -10,6 +10,20 @@ const Address = @import("Address.zig").Address;
 pub const AccessListEntry = struct {
     address: Address,
     storage_keys: []const u256,
+};
+
+/// One EIP-7702 authorization: the account that signed it (the authority)
+/// asks to run `address`'s code as its own. The authority is not stored but
+/// recovered from the signature over `keccak(0x05 || rlp([chain_id, address,
+/// nonce]))`, and an authorization that fails any check is skipped rather
+/// than invalidating the transaction.
+pub const Authorization = struct {
+    chain_id: u256,
+    address: Address,
+    nonce: u64,
+    y_parity: u8,
+    r: u256,
+    s: u256,
 };
 
 pub const Transaction = struct {
@@ -46,4 +60,7 @@ pub const Transaction = struct {
     /// EIP-4844: one versioned hash per blob the transaction carries, what
     /// `BLOBHASH` reads. The blobs themselves never reach execution.
     blob_versioned_hashes: []const u256 = &.{},
+    /// EIP-7702 (type 4): code delegations to apply before the call runs.
+    /// Empty for every other type.
+    authorization_list: []const Authorization = &.{},
 };

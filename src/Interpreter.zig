@@ -763,6 +763,15 @@ fn accountAccessCost(self: *Interpreter, state: *State, address: Address, pre_be
     return if (try state.warmAddress(address)) gas.warm_storage_read_2929 else gas.cold_account_access_2929;
 }
 
+/// EIP-7702 (Prague): the address a delegation indicator (`0xef0100 ||
+/// address`) points at, or null for any other code. Only the first hop is
+/// followed: an indicator pointing at another indicator runs that code as
+/// is, and `0xef` is an invalid opcode.
+pub fn delegatedAddress(code: []const u8) ?Address {
+    if (code.len != 23 or !std.mem.eql(u8, code[0..3], &.{ 0xef, 0x01, 0x00 })) return null;
+    return std.mem.readInt(u160, code[3..23], .big);
+}
+
 fn chargeGas(self: *Interpreter, amount: u64) bool {
     if (self.gas_remaining < amount) {
         self.status = .out_of_gas;
@@ -1278,6 +1287,17 @@ fn call(self: *Interpreter, kind: CallKind) !void {
     else
         kind == .call and !state.exists(target);
     if (is_new_account) cost += gas.call_new_account;
+    // EIP-7702 (Prague): a delegated target runs the code its indicator
+    // points at, and loading that code is one more account access, priced
+    // and warmed like the target's own. Charged with the rest, before the
+    // 63/64 cap is worked out.
+    var code_address = target;
+    if (self.block.fork.atLeast(.prague)) {
+        if (delegatedAddress(state.getCode(target))) |delegate| {
+            cost += try self.accountAccessCost(state, delegate, 0);
+            code_address = delegate;
+        }
+    }
     // DEBUG: era1-replay divergence hunt scaffolding from an earlier
     // investigation, left in place per user request. `debug_is_new_account_enabled`
     // gates this — flip it to `true` (and retarget the two hardcoded
@@ -1378,7 +1398,9 @@ fn call(self: *Interpreter, kind: CallKind) !void {
 
     // A precompile has no bytecode to interpret; `state.getCode` would just
     // return empty, so it's checked first, before creating a child `Interpreter`.
-    const target_code = state.getCode(target);
+    // A delegation to a precompile runs its (empty) code, not the precompile:
+    // only `target` itself is checked for being one.
+    const target_code = state.getCode(code_address);
 
     // The address the callee executes *as*: DELEGATECALL/CALLCODE run
     // target's code but keep this frame's own address/storage, so from
@@ -1413,7 +1435,7 @@ fn call(self: *Interpreter, kind: CallKind) !void {
             .depth = self.depth + 1,
             .state = state,
             .block = self.block,
-            .jumpdest = try state.getJumpdest(target),
+            .jumpdest = try state.getJumpdest(code_address),
         });
         defer child.deinit();
         try child.run();

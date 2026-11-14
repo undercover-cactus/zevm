@@ -136,11 +136,15 @@ pub const transient_storage: u64 = warm_storage_read_2929;
 pub const blob_gas_per_blob: u64 = 1 << 17;
 const min_blob_base_fee: u256 = 1;
 const blob_base_fee_update_fraction: u256 = 3_338_477;
+/// EIP-7691 (Prague) raised the blob target and limit, and with them the
+/// update fraction, so the fee still moves about as fast per block.
+const blob_base_fee_update_fraction_7691: u256 = 5_007_716;
 
 /// EIP-4844: the blob base fee, `min_blob_base_fee * e^(excess_blob_gas /
 /// update_fraction)`, approximated by the EIP's integer Taylor series.
-pub fn blobBaseFee(excess_blob_gas: u64) u256 {
-    return fakeExponential(min_blob_base_fee, excess_blob_gas, blob_base_fee_update_fraction);
+pub fn blobBaseFee(excess_blob_gas: u64, fork: Fork) u256 {
+    const fraction = if (fork.atLeast(.prague)) blob_base_fee_update_fraction_7691 else blob_base_fee_update_fraction;
+    return fakeExponential(min_blob_base_fee, excess_blob_gas, fraction);
 }
 
 /// EIP-4844's `fake_exponential`: `factor * e^(numerator / denominator)`,
@@ -165,8 +169,13 @@ test "fakeExponential matches EIP-4844's reference values" {
 }
 
 test "blobBaseFee is 1 wei with no excess blob gas" {
-    try std.testing.expectEqual(@as(u256, 1), blobBaseFee(0));
-    try std.testing.expectEqual(@as(u256, 10203769476395), blobBaseFee(100_000_000));
+    try std.testing.expectEqual(@as(u256, 1), blobBaseFee(0, .cancun));
+    try std.testing.expectEqual(@as(u256, 10203769476395), blobBaseFee(100_000_000, .cancun));
+}
+
+test "blobBaseFee uses EIP-7691's update fraction from Prague" {
+    try std.testing.expectEqual(fakeExponential(1, 100_000_000, 5_007_716), blobBaseFee(100_000_000, .prague));
+    try std.testing.expect(blobBaseFee(100_000_000, .prague) < blobBaseFee(100_000_000, .cancun));
 }
 
 /// EIP-2930 (Berlin). Intrinsic gas per entry in a transaction's access
@@ -196,6 +205,24 @@ pub fn intrinsicCost(data: []const u8, fork: Fork) u64 {
     for (data) |byte| cost += if (byte == 0) tx_data_zero else nonzero;
     return cost;
 }
+
+/// EIP-7623 (Prague): a transaction pays at least this for its calldata,
+/// however little execution it does: `tx_base` plus 10 gas per token, where
+/// a zero byte is one token and any other byte four. Checked against the gas
+/// limit up front and applied to the gas used afterwards.
+pub fn calldataFloorCost(data: []const u8) u64 {
+    var tokens: u64 = 0;
+    for (data) |byte| tokens += if (byte == 0) 1 else 4;
+    return tx_base + total_cost_floor_per_token_7623 * tokens;
+}
+const total_cost_floor_per_token_7623: u64 = 10;
+
+/// EIP-7702 (Prague). Intrinsic gas per authorization in a set-code
+/// transaction, paid whether or not the authorization turns out valid.
+pub const per_empty_account_7702: u64 = 25000;
+/// What an authorization costs when its authority already exists: the
+/// difference from `per_empty_account_7702` is refunded.
+pub const per_auth_base_7702: u64 = 12500;
 
 /// Intrinsic gas for an EIP-2930 access list. Duplicates are charged for:
 /// the EIP prices the list as written, not the set it describes.
@@ -281,4 +308,9 @@ test "memoryExpansionCost charges only the delta for further growth" {
     const first = memoryExpansionCost(0, 0, 32);
     const total = memoryExpansionCost(0, 0, 64);
     try std.testing.expectEqual(total - first, memoryExpansionCost(32, 32, 32));
+}
+
+test "EIP-7623: the calldata floor is 10 gas per token, four tokens per nonzero byte" {
+    try std.testing.expectEqual(@as(u64, 21000), calldataFloorCost(&.{}));
+    try std.testing.expectEqual(@as(u64, 21000 + 10 * (1 + 4)), calldataFloorCost(&.{ 0, 7 }));
 }

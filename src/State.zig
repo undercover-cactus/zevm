@@ -657,6 +657,19 @@ pub fn setCode(self: *State, address: Address, code: []const u8) !void {
     try self.journal.append(self.allocator, .{ .code = address });
 }
 
+/// EIP-7702 (Prague): replaces `address`'s code with a delegation indicator,
+/// or clears it when `code` is empty. Unlike `setCode` this overwrites, and
+/// like `creditBalance` it is not journaled: authorizations are applied
+/// before a transaction's checkpoint and survive any revert, so nothing
+/// ever rolls back past them.
+pub fn setDelegation(self: *State, address: Address, code: []const u8) !void {
+    self.debugRecord(address);
+    const account = try self.materialiseMaybeJournaled(address, false);
+    if (self.ownsCode(account.code)) self.allocator.free(account.code);
+    account.code = if (code.len == 0) &.{} else try self.allocator.dupe(u8, code);
+    self.invalidateJumpdest(address);
+}
+
 /// `address`'s cached `JUMPDEST` analysis (see `Account.jumpdest`), for a
 /// `CALL`'s target to hand `Interpreter.initCall` instead of re-scanning
 /// its bytecode. Only meaningful once `getCode(address).len != 0` is

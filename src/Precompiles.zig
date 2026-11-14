@@ -15,6 +15,7 @@ const secp256k1 = @import("Secp256k1.zig");
 const bn128 = @import("Bn128.zig");
 const Fork = @import("Fork.zig").Fork;
 const Kzg = @import("Kzg.zig");
+const Bls12381 = @import("Bls12381.zig");
 
 const Kind = enum {
     ecrecover,
@@ -27,6 +28,13 @@ const Kind = enum {
     ecpairing,
     blake2f,
     point_evaluation,
+    bls12_g1add,
+    bls12_g1msm,
+    bls12_g2add,
+    bls12_g2msm,
+    bls12_pairing_check,
+    bls12_map_fp_to_g1,
+    bls12_map_fp2_to_g2,
 
     /// Addresses 5-8 (Byzantium's MODEXP/ECADD/ECMUL/ECPAIRING) only
     /// resolve to a precompile from Byzantium on; before that, real
@@ -45,6 +53,13 @@ const Kind = enum {
             8 => if (byzantium) .ecpairing else null,
             9 => if (fork.atLeast(.istanbul)) .blake2f else null,
             0x0a => if (fork.atLeast(.cancun)) .point_evaluation else null,
+            0x0b => if (fork.atLeast(.prague)) .bls12_g1add else null,
+            0x0c => if (fork.atLeast(.prague)) .bls12_g1msm else null,
+            0x0d => if (fork.atLeast(.prague)) .bls12_g2add else null,
+            0x0e => if (fork.atLeast(.prague)) .bls12_g2msm else null,
+            0x0f => if (fork.atLeast(.prague)) .bls12_pairing_check else null,
+            0x10 => if (fork.atLeast(.prague)) .bls12_map_fp_to_g1 else null,
+            0x11 => if (fork.atLeast(.prague)) .bls12_map_fp2_to_g2 else null,
             else => null,
         };
     }
@@ -78,6 +93,15 @@ const Kind = enum {
             .blake2f => if (input.len == 213) std.mem.readInt(u32, input[0..4], .big) else 0,
             // EIP-4844: flat, whatever the input.
             .point_evaluation => 50000,
+            // EIP-2537: flat for the single operations, priced per pair
+            // (with a volume discount for the MSMs) otherwise.
+            .bls12_g1add => Bls12381.g1_add_gas,
+            .bls12_g1msm => Bls12381.g1MsmGas(input.len),
+            .bls12_g2add => Bls12381.g2_add_gas,
+            .bls12_g2msm => Bls12381.g2MsmGas(input.len),
+            .bls12_pairing_check => Bls12381.pairingGas(input.len),
+            .bls12_map_fp_to_g1 => Bls12381.map_fp_to_g1_gas,
+            .bls12_map_fp2_to_g2 => Bls12381.map_fp2_to_g2_gas,
         };
     }
 };
@@ -296,8 +320,25 @@ pub fn call(allocator: std.mem.Allocator, address: Address, input: []const u8, g
             error.InvalidInput => return .{ .success = false, .gas_remaining = 0, .output = &.{} },
             else => |e| return e,
         },
+        .bls12_g1add, .bls12_g1msm, .bls12_g2add, .bls12_g2msm, .bls12_pairing_check, .bls12_map_fp_to_g1, .bls12_map_fp2_to_g2 => blsOutput(kind, allocator, input) catch |err| switch (err) {
+            error.InvalidInput => return .{ .success = false, .gas_remaining = 0, .output = &.{} },
+            else => |e| return e,
+        },
     };
     return .{ .success = true, .gas_remaining = gas_limit - cost, .output = output };
+}
+
+fn blsOutput(kind: Kind, allocator: std.mem.Allocator, input: []const u8) ![]const u8 {
+    return switch (kind) {
+        .bls12_g1add => Bls12381.g1Add(allocator, input),
+        .bls12_g1msm => Bls12381.g1Msm(allocator, input),
+        .bls12_g2add => Bls12381.g2Add(allocator, input),
+        .bls12_g2msm => Bls12381.g2Msm(allocator, input),
+        .bls12_pairing_check => Bls12381.pairing(allocator, input),
+        .bls12_map_fp_to_g1 => Bls12381.mapFpToG1(allocator, input),
+        .bls12_map_fp2_to_g2 => Bls12381.mapFp2ToG2(allocator, input),
+        else => unreachable,
+    };
 }
 
 /// The BLS12-381 scalar field's modulus, which the point evaluation

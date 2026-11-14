@@ -8,6 +8,7 @@ pub const Rlp = @import("Rlp.zig");
 pub const Trie = @import("Trie.zig");
 pub const Transaction = @import("Transaction.zig").Transaction;
 pub const AccessListEntry = @import("Transaction.zig").AccessListEntry;
+pub const Authorization = @import("Transaction.zig").Authorization;
 pub const Block = @import("Block.zig").Block;
 pub const Fork = @import("Fork.zig").Fork;
 pub const Evm = @import("Evm.zig");
@@ -34,6 +35,8 @@ test {
     std.testing.refAllDecls(@import("Address.zig"));
     std.testing.refAllDecls(@import("Hash.zig"));
     std.testing.refAllDecls(@import("Fork.zig"));
-    // `Ripemd160.zig` isn't re-exported (internal detail of Precompiles.zig).
+    // `Ripemd160.zig` and `Bls12381.zig` aren't re-exported (internal details
+    // of Precompiles.zig).
     std.testing.refAllDecls(@import("Ripemd160.zig"));
+    std.testing.refAllDecls(@import("Bls12381.zig"));
 }

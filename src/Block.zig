@@ -21,6 +21,9 @@ pub const Block = struct {
     base_fee: u256 = 0,
     chain_id: u256 = 1,
     recent_hashes: []const Hash = &.{},
+    /// EIP-2935 (Prague): the parent's hash, written into the history
+    /// storage contract before the block's transactions.
+    parent_hash: Hash = 0,
     /// EIP-4844 (Cancun): the header's `excess_blob_gas`, which sets the
     /// block's blob base fee. 0 before Cancun.
     excess_blob_gas: u64 = 0,
