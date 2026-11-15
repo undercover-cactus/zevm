@@ -1,4 +1,4 @@
-//! The EVM opcode set, as of Cancun. Values not yet enabled by a given fork
+//! The EVM opcode set, as of Osaka. Values not yet enabled by a given fork
 //! (e.g. `PUSH0` before Shanghai, `TLOAD` before Cancun) are still listed here;
 //! which ones are actually valid to execute is a per-fork ruleset concern for
 //! the interpreter, not something this enum encodes.
@@ -35,6 +35,7 @@ pub const OpCode = enum(u8) {
     SHL = 0x1b,
     SHR = 0x1c,
     SAR = 0x1d,
+    CLZ = 0x1e,
 
     KECCAK256 = 0x20,
 

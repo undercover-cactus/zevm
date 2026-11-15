@@ -35,6 +35,7 @@ const Kind = enum {
     bls12_pairing_check,
     bls12_map_fp_to_g1,
     bls12_map_fp2_to_g2,
+    p256verify,
 
     /// Addresses 5-8 (Byzantium's MODEXP/ECADD/ECMUL/ECPAIRING) only
     /// resolve to a precompile from Byzantium on; before that, real
@@ -60,6 +61,7 @@ const Kind = enum {
             0x0f => if (fork.atLeast(.prague)) .bls12_pairing_check else null,
             0x10 => if (fork.atLeast(.prague)) .bls12_map_fp_to_g1 else null,
             0x11 => if (fork.atLeast(.prague)) .bls12_map_fp2_to_g2 else null,
+            0x100 => if (fork.atLeast(.osaka)) .p256verify else null,
             else => null,
         };
     }
@@ -102,6 +104,8 @@ const Kind = enum {
             .bls12_pairing_check => Bls12381.pairingGas(input.len),
             .bls12_map_fp_to_g1 => Bls12381.map_fp_to_g1_gas,
             .bls12_map_fp2_to_g2 => Bls12381.map_fp2_to_g2_gas,
+            // EIP-7951: flat, whatever the input.
+            .p256verify => 6900,
         };
     }
 };
@@ -324,8 +328,50 @@ pub fn call(allocator: std.mem.Allocator, address: Address, input: []const u8, g
             error.InvalidInput => return .{ .success = false, .gas_remaining = 0, .output = &.{} },
             else => |e| return e,
         },
+        .p256verify => try p256VerifyOutput(allocator, input),
     };
     return .{ .success = true, .gas_remaining = gas_limit - cost, .output = output };
+}
+
+/// EIP-7951 (Osaka): 32 bytes ending in 1 if `input` is a valid secp256r1
+/// signature, nothing otherwise. A bad signature or malformed input is not
+/// a failed call: the 6900 gas is spent and the call succeeds.
+fn p256VerifyOutput(allocator: std.mem.Allocator, input: []const u8) ![]const u8 {
+    if (!p256Verify(input)) return allocator.alloc(u8, 0);
+    const out = try allocator.alloc(u8, 32);
+    @memset(out, 0);
+    out[31] = 1;
+    return out;
+}
+
+/// `h || r || s || qx || qy`, 32 bytes each. ECDSA verification: with
+/// `h / s` and `r / s` taken mod n, the x coordinate of `(h / s)*G + (r / s)*Q`,
+/// reduced mod n, must equal `r`. `h` need not be below n.
+fn p256Verify(input: []const u8) bool {
+    const P256 = std.crypto.ecc.P256;
+    const Scalar = P256.scalar.Scalar;
+    const n: u256 = P256.scalar.field_order;
+    if (input.len != 160) return false;
+    const r = std.mem.readInt(u256, input[32..64], .big);
+    const s = std.mem.readInt(u256, input[64..96], .big);
+    if (r == 0 or r >= n or s == 0 or s >= n) return false;
+    // Rejects a coordinate at or above p and a point off the curve. (0, 0)
+    // parses as the point at infinity, which is refused separately.
+    const q = P256.fromSerializedAffineCoordinates(input[96..128].*, input[128..160].*, .big) catch return false;
+    q.rejectIdentity() catch return false;
+
+    var h_wide = [_]u8{0} ** 48;
+    @memcpy(h_wide[16..], input[0..32]);
+    const h = Scalar.fromBytes48(h_wide, .big);
+    const s_inv = (Scalar.fromBytes(input[64..96].*, .big) catch return false).invert();
+    const r_scalar = Scalar.fromBytes(input[32..64].*, .big) catch return false;
+    const h_over_s = h.mul(s_inv).toBytes(.big);
+    const r_over_s = r_scalar.mul(s_inv).toBytes(.big);
+    // Fails on the point at infinity, which the EIP also rejects.
+    const point = P256.mulDoubleBasePublic(P256.basePoint, h_over_s, q, r_over_s, .big) catch return false;
+    var x = std.mem.readInt(u256, &point.affineCoordinates().x.toBytes(.big), .big);
+    if (x >= n) x -= n;
+    return x == r;
 }
 
 fn blsOutput(kind: Kind, allocator: std.mem.Allocator, input: []const u8) ![]const u8 {
@@ -546,16 +592,29 @@ fn bitLength(x: u256) u32 {
     return if (x == 0) 0 else 256 - @clz(x);
 }
 
-/// `ADJUSTED_EXPONENT_LENGTH` from EIP-198, verbatim.
-fn iterationsCount(exp_length: u256, exp_head: u256) u512 {
+/// EIP-7883 (Osaka): a floor of 16, and twice EIP-2565's square once the
+/// longer operand passes 32 bytes.
+fn mulComplexity7883(x: u512) u512 {
+    if (x <= 32) return 16;
+    const words = (x + 7) / 8;
+    return 2 * words * words;
+}
+
+/// `ADJUSTED_EXPONENT_LENGTH` from EIP-198, verbatim, except that
+/// `per_extra_byte` is 8 there and 16 from EIP-7883 (Osaka).
+fn iterationsCount(exp_length: u256, exp_head: u256, per_extra_byte: u512) u512 {
     const head_bits: u512 = bitLength(exp_head);
     const head_part: u512 = if (head_bits > 0) head_bits - 1 else 0;
     const adjusted: u512 = if (exp_length < 32)
         head_part
     else
-        8 * (@as(u512, @intCast(exp_length)) - 32) + head_part;
+        per_extra_byte * (@as(u512, @intCast(exp_length)) - 32) + head_part;
     return @max(adjusted, 1);
 }
+
+/// EIP-7823 (Osaka): no length may pass 1024 bytes, or the call fails and
+/// forfeits all gas.
+const modexp_length_limit_7823: u256 = 1024;
 
 /// The three 32-byte length fields plus whatever's needed to locate the
 /// exponent's first 32 bytes (for the gas formula) — computed once and
@@ -608,13 +667,19 @@ const ModexpLayout = struct {
 fn modexpGasCost(input: []const u8, fork: Fork) u64 {
     const layout = ModexpLayout.parse(input);
     if (layout.too_large) return std.math.maxInt(u64);
+    if (fork.atLeast(.osaka) and (layout.base_length > modexp_length_limit_7823 or
+        layout.exp_length > modexp_length_limit_7823 or
+        layout.modulus_length > modexp_length_limit_7823)) return std.math.maxInt(u64);
 
     const max_length: u512 = @max(layout.base_length, layout.modulus_length);
-    const iters = iterationsCount(layout.exp_length, layout.exp_head);
+    const iters = iterationsCount(layout.exp_length, layout.exp_head, if (fork.atLeast(.osaka)) 16 else 8);
     // EIP-2565 (Berlin) swaps the complexity curve, divides by 3 instead of
     // 20, and puts a 200 floor under the result. The iteration count is
-    // unchanged.
-    const cost_wide: u512 = if (fork.atLeast(.berlin))
+    // unchanged. EIP-7883 (Osaka) swaps the curve again, drops the division
+    // and raises the floor to 500.
+    const cost_wide: u512 = if (fork.atLeast(.osaka))
+        @max(500, mulComplexity7883(max_length) * iters)
+    else if (fork.atLeast(.berlin))
         @max(200, (mulComplexity2565(max_length) * iters) / 3)
     else
         (mulComplexity(max_length) * iters) / 20;
@@ -1134,4 +1199,113 @@ test "EIP-2565 puts a 200 floor under MODEXP and reprices it at Berlin" {
     try std.testing.expectEqual(@as(u64, 64 * 255 / 3), modexpGasCost(&big, .berlin));
     // EIP-198 for the same input: mult_complexity(64) = 64^2, / 20.
     try std.testing.expectEqual(@as(u64, 64 * 64 * 255 / 20), modexpGasCost(&big, .istanbul));
+}
+
+test "EIP-7883 reprices MODEXP at Osaka" {
+    // One-byte operands: complexity 16, 1 iteration, under the 500 floor.
+    var input = [_]u8{0} ** (96 + 3);
+    input[31] = 1;
+    input[63] = 1;
+    input[95] = 1;
+    input[96] = 3;
+    input[97] = 1;
+    input[98] = 5;
+    try std.testing.expectEqual(@as(u64, 500), modexpGasCost(&input, .osaka));
+
+    // 64-byte operands: 2 * ceil(64 / 8)^2 = 128, times 255 iterations, no
+    // division.
+    var big = [_]u8{0} ** (96 + 64 + 32 + 64);
+    big[31] = 64;
+    big[63] = 32;
+    big[95] = 64;
+    big[96 + 64] = 0x80;
+    try std.testing.expectEqual(@as(u64, 128 * 255), modexpGasCost(&big, .osaka));
+
+    // A 40-byte exponent whose first byte has its top bit set: 16 per byte
+    // past 32 plus 255, against Berlin's 8 per byte.
+    var long_exp = [_]u8{0} ** (96 + 1 + 40 + 1);
+    long_exp[31] = 1;
+    long_exp[63] = 40;
+    long_exp[95] = 1;
+    long_exp[97] = 0x80;
+    try std.testing.expectEqual(@as(u64, 16 * (16 * 8 + 255)), modexpGasCost(&long_exp, .osaka));
+    try std.testing.expectEqual(@as(u64, 200), modexpGasCost(&long_exp, .berlin));
+}
+
+test "EIP-7823: a MODEXP length over 1024 bytes is unaffordable from Osaka" {
+    var input = [_]u8{0} ** 96;
+    std.mem.writeInt(u256, input[0..32], 1025, .big);
+    input[63] = 1;
+    input[95] = 1;
+    try std.testing.expectEqual(std.math.maxInt(u64), modexpGasCost(&input, .osaka));
+    try std.testing.expect(modexpGasCost(&input, .prague) < std.math.maxInt(u64));
+    std.mem.writeInt(u256, input[0..32], 1024, .big);
+    try std.testing.expect(modexpGasCost(&input, .osaka) < std.math.maxInt(u64));
+}
+
+/// A P256VERIFY input for a signature made with std's ECDSA-P256-SHA256
+/// under a fixed seed, so the precompile is checked against an independent
+/// signer.
+fn p256TestInput() ![160]u8 {
+    const Ecdsa = std.crypto.sign.ecdsa.EcdsaP256Sha256;
+    const kp = try Ecdsa.KeyPair.generateDeterministic([_]u8{0x42} ** Ecdsa.KeyPair.seed_length);
+    const msg = "zevm p256verify";
+    const sig = try kp.sign(msg, null);
+    var input: [160]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(msg, input[0..32], .{});
+    input[32..96].* = sig.toBytes();
+    input[96..160].* = kp.public_key.toUncompressedSec1()[1..65].*;
+    return input;
+}
+
+fn expectP256(input: []const u8, valid: bool) !void {
+    const result = (try call(std.testing.allocator, 0x100, input, 10000, .osaka)).?;
+    defer std.testing.allocator.free(result.output);
+    // Valid or not, the call succeeds and costs 6900.
+    try std.testing.expect(result.success);
+    try std.testing.expectEqual(@as(u64, 10000 - 6900), result.gas_remaining);
+    if (valid) {
+        try std.testing.expectEqual(@as(usize, 32), result.output.len);
+        try std.testing.expectEqual(@as(u256, 1), std.mem.readInt(u256, result.output[0..32], .big));
+    } else {
+        try std.testing.expectEqual(@as(usize, 0), result.output.len);
+    }
+}
+
+test "EIP-7951: P256VERIFY accepts a valid signature and rejects a tampered one" {
+    const input = try p256TestInput();
+    try expectP256(&input, true);
+    var wrong_hash = input;
+    wrong_hash[0] ^= 1;
+    try expectP256(&wrong_hash, false);
+    var wrong_r = input;
+    wrong_r[63] ^= 1;
+    try expectP256(&wrong_r, false);
+}
+
+test "EIP-7951: P256VERIFY returns nothing for each malformed input" {
+    const n: u256 = std.crypto.ecc.P256.scalar.field_order;
+    const p: u256 = 0xffffffff00000001000000000000000000000000ffffffffffffffffffffffff;
+    const input = try p256TestInput();
+    try expectP256(input[0..159], false);
+    var zero_r = input;
+    @memset(zero_r[32..64], 0);
+    try expectP256(&zero_r, false);
+    var big_s = input;
+    std.mem.writeInt(u256, big_s[64..96], n, .big);
+    try expectP256(&big_s, false);
+    var big_qx = input;
+    std.mem.writeInt(u256, big_qx[96..128], p, .big);
+    try expectP256(&big_qx, false);
+    var off_curve = input;
+    off_curve[159] ^= 1;
+    try expectP256(&off_curve, false);
+    var infinity = input;
+    @memset(infinity[96..160], 0);
+    try expectP256(&infinity, false);
+}
+
+test "EIP-7951: 0x100 is not a precompile before Osaka" {
+    const input = try p256TestInput();
+    try std.testing.expectEqual(@as(?Result, null), try call(std.testing.allocator, 0x100, &input, 10000, .prague));
 }

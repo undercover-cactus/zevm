@@ -409,7 +409,7 @@ fn prewarmBlock(allocator: std.mem.Allocator, p: *Prewarm, b: usize) !void {
         .difficulty = header.difficulty,
         .base_fee = header.base_fee,
         .fork = zevm.Fork.at(header.number),
-        .blob_base_fee = zevm.gas.blobBaseFee(header.excess_blob_gas, zevm.Fork.at(header.number)),
+        .blob_base_fee = zevm.gas.blobBaseFee(header.excess_blob_gas, zevm.Fork.at(header.number), header.timestamp),
     };
     for (p.block_start[b]..p.block_start[b + 1]) |i| {
         if (p.stop.load(.monotonic)) return;

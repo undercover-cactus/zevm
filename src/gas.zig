@@ -139,13 +139,31 @@ const blob_base_fee_update_fraction: u256 = 3_338_477;
 /// EIP-7691 (Prague) raised the blob target and limit, and with them the
 /// update fraction, so the fee still moves about as fast per block.
 const blob_base_fee_update_fraction_7691: u256 = 5_007_716;
+/// EIP-7892 blob-parameter-only forks after Osaka, which raise the blob
+/// target and limit again. They activate by timestamp, not block number,
+/// and only the update fraction matters here: the target shapes the
+/// header's `excess_blob_gas`, which is read rather than recomputed.
+const bpo1_time: u64 = 1_765_290_071;
+const blob_base_fee_update_fraction_bpo1: u256 = 8_346_193;
+const bpo2_time: u64 = 1_767_747_671;
+const blob_base_fee_update_fraction_bpo2: u256 = 11_684_671;
 
 /// EIP-4844: the blob base fee, `min_blob_base_fee * e^(excess_blob_gas /
 /// update_fraction)`, approximated by the EIP's integer Taylor series.
-pub fn blobBaseFee(excess_blob_gas: u64, fork: Fork) u256 {
-    const fraction = if (fork.atLeast(.prague)) blob_base_fee_update_fraction_7691 else blob_base_fee_update_fraction;
+pub fn blobBaseFee(excess_blob_gas: u64, fork: Fork, timestamp: u64) u256 {
+    const fraction = if (fork.atLeast(.osaka) and timestamp >= bpo2_time)
+        blob_base_fee_update_fraction_bpo2
+    else if (fork.atLeast(.osaka) and timestamp >= bpo1_time)
+        blob_base_fee_update_fraction_bpo1
+    else if (fork.atLeast(.prague))
+        blob_base_fee_update_fraction_7691
+    else
+        blob_base_fee_update_fraction;
     return fakeExponential(min_blob_base_fee, excess_blob_gas, fraction);
 }
+
+/// EIP-7825 (Osaka): the most gas one transaction may ask for.
+pub const max_tx_gas_7825: u64 = 1 << 24;
 
 /// EIP-4844's `fake_exponential`: `factor * e^(numerator / denominator)`,
 /// summed term by term until a term rounds to zero. Exactly the EIP's
@@ -169,13 +187,21 @@ test "fakeExponential matches EIP-4844's reference values" {
 }
 
 test "blobBaseFee is 1 wei with no excess blob gas" {
-    try std.testing.expectEqual(@as(u256, 1), blobBaseFee(0, .cancun));
-    try std.testing.expectEqual(@as(u256, 10203769476395), blobBaseFee(100_000_000, .cancun));
+    try std.testing.expectEqual(@as(u256, 1), blobBaseFee(0, .cancun, 0));
+    try std.testing.expectEqual(@as(u256, 10203769476395), blobBaseFee(100_000_000, .cancun, 0));
 }
 
 test "blobBaseFee uses EIP-7691's update fraction from Prague" {
-    try std.testing.expectEqual(fakeExponential(1, 100_000_000, 5_007_716), blobBaseFee(100_000_000, .prague));
-    try std.testing.expect(blobBaseFee(100_000_000, .prague) < blobBaseFee(100_000_000, .cancun));
+    try std.testing.expectEqual(fakeExponential(1, 100_000_000, 5_007_716), blobBaseFee(100_000_000, .prague, 0));
+    try std.testing.expect(blobBaseFee(100_000_000, .prague, 0) < blobBaseFee(100_000_000, .cancun, 0));
+}
+
+test "blobBaseFee follows the BPO1 and BPO2 update fractions by timestamp" {
+    // Osaka itself keeps Prague's fraction.
+    try std.testing.expectEqual(fakeExponential(1, 100_000_000, 5_007_716), blobBaseFee(100_000_000, .osaka, bpo1_time - 1));
+    try std.testing.expectEqual(fakeExponential(1, 100_000_000, 8_346_193), blobBaseFee(100_000_000, .osaka, bpo1_time));
+    try std.testing.expectEqual(fakeExponential(1, 100_000_000, 8_346_193), blobBaseFee(100_000_000, .osaka, bpo2_time - 1));
+    try std.testing.expectEqual(fakeExponential(1, 100_000_000, 11_684_671), blobBaseFee(100_000_000, .osaka, bpo2_time));
 }
 
 /// EIP-2930 (Berlin). Intrinsic gas per entry in a transaction's access

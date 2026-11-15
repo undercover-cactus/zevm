@@ -395,6 +395,14 @@ fn step(self: *Interpreter) !void {
                 self.binaryOp(gas.verylow, sar);
             }
         },
+        .CLZ => {
+            // EIP-7939: not available before Osaka. Costs 5, like MUL.
+            if (!self.block.fork.atLeast(.osaka)) {
+                self.status = .invalid_opcode;
+            } else {
+                self.unaryOp(gas.low, clz);
+            }
+        },
 
         .KECCAK256 => try self.keccak256Opcode(),
 
@@ -2117,6 +2125,10 @@ fn shr(shift_amount: u256, value: u256) u256 {
     if (shift_amount >= 256) return 0;
     return value >> @as(u8, @intCast(shift_amount));
 }
+/// EIP-7939: the number of zero bits above the highest set bit, 256 for 0.
+fn clz(value: u256) u256 {
+    return @clz(value);
+}
 fn sar(shift_amount: u256, value: u256) u256 {
     const vi: i256 = @bitCast(value);
     if (shift_amount >= 256) return if (vi < 0) std.math.maxInt(u256) else 0;
@@ -2304,6 +2316,39 @@ test "SAR sign-extends when shifting a negative value" {
 }
 test "SAR by 256 or more of a negative value saturates to all ones" {
     try expectBinaryOpFork(.SAR, 256, min_i256_as_u256, max_u256, .constantinople);
+}
+
+/// Runs `PUSH32 value, CLZ, STOP` under Osaka and returns the result and
+/// the gas spent.
+fn runClz(value: u256) !struct { result: u256, gas_used: u64 } {
+    var code: std.ArrayList(u8) = .empty;
+    defer code.deinit(std.testing.allocator);
+    try appendPush32(&code, value);
+    try code.append(std.testing.allocator, @intFromEnum(OpCode.CLZ));
+    try code.append(std.testing.allocator, @intFromEnum(OpCode.STOP));
+    var interp = try Interpreter.initCall(std.testing.allocator, code.items, 1_000_000, .{ .block = .{ .fork = .osaka } });
+    defer interp.deinit();
+    try interp.run();
+    try std.testing.expectEqual(Status.stopped, interp.status);
+    return .{ .result = try interp.stack.pop(), .gas_used = 1_000_000 - interp.gas_remaining };
+}
+
+test "EIP-7939: CLZ counts leading zero bits, 256 for zero, and costs 5" {
+    try std.testing.expectEqual(@as(u256, 256), (try runClz(0)).result);
+    try std.testing.expectEqual(@as(u256, 255), (try runClz(1)).result);
+    try std.testing.expectEqual(@as(u256, 0), (try runClz(max_u256)).result);
+    try std.testing.expectEqual(@as(u256, 0), (try runClz(@as(u256, 1) << 255)).result);
+    try std.testing.expectEqual(@as(u256, 128), (try runClz(@as(u256, 1) << 127)).result);
+    // PUSH32 is 3.
+    try std.testing.expectEqual(@as(u64, 3 + 5), (try runClz(1)).gas_used);
+}
+
+test "CLZ is invalid before Osaka" {
+    const code = [_]u8{ @intFromEnum(OpCode.PUSH1), 1, @intFromEnum(OpCode.CLZ) };
+    var interp = try Interpreter.initCall(std.testing.allocator, &code, 1_000_000, .{ .block = .{ .fork = .prague } });
+    defer interp.deinit();
+    try interp.run();
+    try std.testing.expectEqual(Status.invalid_opcode, interp.status);
 }
 
 test "PUSH0 pushes zero" {

@@ -1,6 +1,6 @@
 //! Executes a decoded `Transaction` against a `State`.
 //!
-//! Frontier through Prague are implemented (Muir, Arrow and Gray Glacier
+//! Frontier through Osaka are implemented (Muir, Arrow and Gray Glacier
 //! only delayed the difficulty bomb and change nothing this executes).
 //! `processBlock` panics on any block from a later fork (see `Fork`) instead
 //! of silently applying stale rules.
@@ -171,6 +171,10 @@ pub fn executeTransaction(self: *Evm, tx: Transaction, from: Address) !Result {
     const calldata_floor: u64 = if (self.block.fork.atLeast(.prague)) gas.calldataFloorCost(tx.data) else 0;
     if (tx.gas_limit < calldata_floor) return error.GasLimitBelowCalldataFloor;
 
+    // EIP-7825 (Osaka): no transaction may ask for more than 2^24 gas,
+    // however high the block's limit.
+    if (self.block.fork.atLeast(.osaka) and tx.gas_limit > gas.max_tx_gas_7825) return error.GasLimitAboveCap;
+
     const gas_fee = @as(u256, tx.gas_limit) * tx.gas_price;
     const upfront_cost = gas_fee + tx.value + max_blob_fee;
     const balance_before = self.state.getBalance(from);
@@ -205,6 +209,8 @@ pub fn executeTransaction(self: *Evm, tx: Transaction, from: Address) !Result {
         const last_precompile: Address = if (self.block.fork.atLeast(.prague)) 0x11 else if (self.block.fork.atLeast(.cancun)) 0x0a else 0x09;
         var precompile: Address = 1;
         while (precompile <= last_precompile) : (precompile += 1) _ = try self.state.warmAddress(precompile);
+        // Osaka's P256VERIFY sits apart from the rest, at 0x100.
+        if (self.block.fork.atLeast(.osaka)) _ = try self.state.warmAddress(0x100);
         for (tx.access_list) |entry| {
             _ = try self.state.warmAddress(entry.address);
             for (entry.storage_keys) |key| _ = try self.state.warmSlot(entry.address, key);
@@ -256,12 +262,6 @@ pub fn processBlock(self: *Evm, block: Block) !void {
     const fork = Fork.at(block.number);
     // Muir Glacier delayed the difficulty bomb and changed nothing this
     // executes, so Istanbul's rules carry through it unchanged.
-    if (fork.atLeast(.osaka)) {
-        std.debug.panic(
-            "block {d} is past Prague (fork: {s}): this Evm only implements up to Prague's rules",
-            .{ block.number, @tagName(fork) },
-        );
-    }
 
     // The DAO fork wasn't an EVM/gas rule change: at exactly this block, an
     // irregular state transition hardcoded into every client moves all
@@ -279,7 +279,7 @@ pub fn processBlock(self: *Evm, block: Block) !void {
         .chain_id = block.chain_id,
         .recent_hashes = block.recent_hashes,
         .fork = fork,
-        .blob_base_fee = if (fork.atLeast(.cancun)) gas.blobBaseFee(block.excess_blob_gas, fork) else 0,
+        .blob_base_fee = if (fork.atLeast(.cancun)) gas.blobBaseFee(block.excess_blob_gas, fork, block.timestamp) else 0,
     };
 
     // EIP-4788 (Cancun) and EIP-2935 (Prague): before any transaction, the
@@ -2175,6 +2175,45 @@ test "EIP-7623: from Prague on, a transaction pays at least the calldata floor" 
     tx.data = &data;
     tx.gas_limit = 60_000;
     try std.testing.expectError(error.GasLimitBelowCalldataFloor, evm.executeTransaction(tx, 0x1));
+}
+
+test "EIP-7825: from Osaka a transaction may not ask for more than 2^24 gas" {
+    var state = State.init(std.testing.allocator);
+    defer state.deinit();
+    var tx = testTx();
+    tx.to = 0xdd;
+    tx.gas_limit = (1 << 24) + 1;
+    var evm = Evm{ .allocator = std.testing.allocator, .state = &state, .block = .{ .fork = .osaka } };
+    try std.testing.expectError(error.GasLimitAboveCap, evm.executeTransaction(tx, 0x1));
+
+    tx.gas_limit = 1 << 24;
+    const at_cap = try evm.executeTransaction(tx, 0x1);
+    defer std.testing.allocator.free(at_cap.return_data);
+    evm.block.fork = .prague;
+    tx.nonce = 1;
+    tx.gas_limit = (1 << 24) + 1;
+    const before_osaka = try evm.executeTransaction(tx, 0x1);
+    defer std.testing.allocator.free(before_osaka.return_data);
+}
+
+test "P256VERIFY's address 0x100 starts warm from Osaka" {
+    const OpCode = @import("OpCode.zig").OpCode;
+    const code = [_]u8{ @intFromEnum(OpCode.PUSH2), 0x01, 0x00, @intFromEnum(OpCode.BALANCE), @intFromEnum(OpCode.STOP) };
+    var gas_used: [2]u64 = undefined;
+    for ([_]Fork{ .prague, .osaka }, &gas_used) |fork, *used| {
+        var state = State.init(std.testing.allocator);
+        defer state.deinit();
+        try state.setCode(0xdd, &code);
+        var evm = Evm{ .allocator = std.testing.allocator, .state = &state, .block = .{ .fork = fork } };
+        var tx = testTx();
+        tx.to = 0xdd;
+        const result = try evm.executeTransaction(tx, 0x1);
+        defer std.testing.allocator.free(result.return_data);
+        used.* = result.gas_used;
+    }
+    // PUSH2, then BALANCE: cold (2600) before Osaka, warm (100) from it.
+    try std.testing.expectEqual(@as(u64, 21000 + 3 + 2600), gas_used[0]);
+    try std.testing.expectEqual(@as(u64, 21000 + 3 + 100), gas_used[1]);
 }
 
 test "Prague's system calls: the parent hash before the transactions, the request queues after" {
