@@ -4,6 +4,10 @@
 
 An implementation of the Ethereum Virtual Machine in Zig. Currently under heavy development.
 
+## Mainnet replay
+
+zevm has replayed Ethereum mainnet from genesis to block 24,518,655 (Frontier through Osaka) in about 58 hours, with every chunk's state root matching mainnet.
+
 ## Requirements
 
 - Zig `0.16.0` — see [ziglang.org/download](https://ziglang.org/download/) for installation instructions.
